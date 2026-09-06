@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.DS_Store
+preview_debug.json
+preview_debug-*.json
+injection_log.json
