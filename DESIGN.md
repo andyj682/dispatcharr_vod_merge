@@ -204,8 +204,43 @@ both. It also means the sweep writes `detailed_info` itself rather than
 delegating, which matters because the core task throws before its relation save
 on exactly the colliding rows.
 
-Both defects are reported upstream. Once a movie has been merged the core task
-becomes safe again, because the id it would set is already set.
+Once a movie has been merged the core task becomes safe again, because the id it
+would set is already set.
+
+### And we now stop it happening at all
+
+Avoiding the path is not enough, because *anything* can reach it — a UI movie
+open, an XC `get_vod_info`, a client that fetches detail in bulk. So as of 1.1.0
+the plugin also **replaces `handle_movie_id_conflicts`** with the direction the
+caller already implements: repoint the relation onto the existing row and
+`return existing_movie, True`.
+
+Deliberately minimal — it does **not** call core's `merge_movie_data`. Three
+reasons. The canonical is by construction the better-populated row. The orphan's
+listing-derived content is already on the relation. And `merge_movie_data` writes
+ids: `tmdb_id` and `imdb_id` are both `unique=True`, and its
+`elif source_movie.imdb_id: target_movie.imdb_id = source_movie.imdb_id` branch
+saves the target while the source still holds that same unique value — a third
+collision, separate from the two defects above. A single FK update writes no ids,
+so no uniqueness constraint is reachable and the whole `IntegrityError` class
+disappears rather than being handled.
+
+Two properties that differ from the rest of the plugin, both on purpose:
+
+- **It is not gated by `dry_run`.** Dry run means "do not inject"; letting it
+  disable a protective patch would mean dry run permits the data loss.
+- **It fails closed.** The injection path fails open, degrading to "no merging".
+  This one takes no action on error rather than falling through to core's
+  destructive version — the benign outcome is for core's caller to set the id
+  itself, which it does when we return `False`.
+
+Note also that it matters in a different place: both callers of
+`refresh_movie_advanced_data` are **inline**, so this patch is exercised in the
+uWSGI request workers, while the batch wrappers are exercised in the Celery
+children. Install happens at import either way, but the verification differs.
+
+Both defects are also reported upstream; the local patch means we are not waiting
+on that.
 
 ## Manual approvals
 

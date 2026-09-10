@@ -785,6 +785,67 @@ class ModuleStateTests(unittest.TestCase):
             self.assertTrue(hasattr(patch, name), name)
 
 
+class DecideConflictTests(unittest.TestCase):
+    """The protection against core's destructive movie merge.
+
+    Core keeps the movie being refreshed and DELETES the pre-existing one. On
+    this path the movie being refreshed is the freshly-minted orphan, so that
+    destroys the canonical. We repoint the relation instead. The decision is
+    pure; the caller does the queries.
+    """
+
+    def test_no_holder_is_a_noop(self):
+        # Nothing else claims the id: core just sets it, which is benign, so we
+        # must NOT interfere.
+        self.assertEqual(patch.decide_conflict(5, None, None, True),
+                         (patch.PROTECT_NOOP, None))
+
+    def test_holder_is_the_current_row_is_a_noop(self):
+        self.assertEqual(patch.decide_conflict(5, 5, None, True),
+                         (patch.PROTECT_SAME, None))
+
+    def test_another_row_holds_it_repoints(self):
+        self.assertEqual(patch.decide_conflict(5, 9, None, True),
+                         (patch.PROTECT_REPOINT, 9))
+
+    def test_tmdb_holder_wins_over_imdb_holder(self):
+        # Matches core's stated preference for the TMDB match.
+        self.assertEqual(patch.decide_conflict(5, 9, 7, True),
+                         (patch.PROTECT_REPOINT, 9))
+
+    def test_imdb_holder_used_when_no_tmdb_holder(self):
+        self.assertEqual(patch.decide_conflict(5, None, 7, True),
+                         (patch.PROTECT_REPOINT, 7))
+
+    def test_imdb_holder_that_is_current_row_is_same(self):
+        self.assertEqual(patch.decide_conflict(5, None, 5, True),
+                         (patch.PROTECT_SAME, None))
+
+    def test_without_a_relation_we_do_nothing_rather_than_delete(self):
+        # `relation` is an unused parameter in core's version, so it could be
+        # absent. Core would delete the canonical here; doing nothing is safer.
+        self.assertEqual(patch.decide_conflict(5, 9, None, False),
+                         (patch.PROTECT_NOOP, None))
+
+    def test_never_returns_a_delete_action(self):
+        # There is deliberately no destructive outcome in the vocabulary.
+        actions = {patch.PROTECT_NOOP, patch.PROTECT_SAME, patch.PROTECT_REPOINT}
+        for args in ((5, None, None, True), (5, 5, None, True), (5, 9, None, True),
+                     (5, 9, 7, True), (5, None, 7, True), (5, 9, None, False)):
+            self.assertIn(patch.decide_conflict(*args)[0], actions)
+
+    def test_repoint_target_is_never_the_current_row(self):
+        for tmdb_holder, imdb_holder in ((5, None), (None, 5), (5, 5)):
+            action, target = patch.decide_conflict(5, tmdb_holder, imdb_holder, True)
+            self.assertNotEqual(target, 5)
+            self.assertEqual(action, patch.PROTECT_SAME)
+
+    def test_protection_defaults_on_and_is_not_tied_to_dry_run(self):
+        self.assertIs(patch.DEFAULT_PROTECT_MERGES, True)
+        # dry_run is about injection; it must not disable the protection.
+        self.assertNotIn("protect", patch.DRY_RUN)
+
+
 class TrimMatchesTests(unittest.TestCase):
     """The status actions write the FULL report to a file and send a trimmed copy
     back in the API response. Trimming the file too would make the message's

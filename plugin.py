@@ -109,7 +109,7 @@ def _format_log(data, limit=60):
 class Plugin:
     # UI title only; "Dispatcharr" is redundant inside the Dispatcharr UI.
     name = "VOD Merge"
-    version = "1.0.0"
+    version = "1.1.0"
     description = (
         "Durably merges duplicate VOD titles from providers that omit TMDB ids, "
         "by matching metadata like poster artwork and plot text to a title you "
@@ -148,6 +148,24 @@ class Plugin:
             "type": "boolean",
             "default": False,
             "help_text": "",
+        },
+        {
+            "id": "protect_merges",
+            "label": "Prevent destructive movie merges",
+            "type": "boolean",
+            "default": True,
+            "help_text": (
+                "Fixes a Dispatcharr bug, independently of any merging this "
+                "plugin does. When you open a movie whose provider detail "
+                "carries a TMDB id belonging to another entry, Dispatcharr "
+                "merges them the wrong way round: it keeps the newer duplicate "
+                "and DELETES the established entry, which inherits the "
+                "provider's raw name and a new id. With this on, the duplicate "
+                "is folded into the established entry instead. Leave it on "
+                "unless your Dispatcharr version has fixed this upstream. Not "
+                "affected by 'Dry run' -- that would mean dry run permits the "
+                "data loss."
+            ),
         },
         {
             "id": "allowed_accounts",
@@ -395,6 +413,12 @@ class Plugin:
                     f"(reflects ONE worker; check logs for all pids -- the scan "
                     f"runs in a Celery child). "
                     f"dry_run={cfg['dry_run']}, "
+                    f"merge_series={cfg['merge_series']}, "
+                    f"merge_movies={cfg['merge_movies']}, "
+                    # Reported separately because it is invisible when working:
+                    # nothing bad happening looks exactly like never firing.
+                    f"protect_merges={cfg['protect_merges']}"
+                    f"{'' if _patch._orig_handle_movie_id_conflicts else ' (NOT INSTALLED in this worker)'}, "
                     f"series_accounts={sorted(cfg['accounts']) or '<all>'}, "
                     f"movie_accounts={sorted(cfg['movie_accounts']) or '<all>'}, "
                     f"denylist={len(cfg['denylist'])}, "

@@ -152,8 +152,14 @@ child**, not the web worker:
 docker logs dispatcharr 2>&1 | grep VOD-MERGE
 ```
 
-You want `installed series + movie batch wrappers in pid=N` for a Celery pid.
-A `wrapper active in pid=N` line appears the first time a scan reaches it.
+You want `installed series + movie batch wrappers ... in pid=N` for a Celery
+pid, and a `wrapper active in pid=N` line appears the first time a scan reaches
+it.
+
+The same log line reports `+ destructive-merge protection` when that patch
+installed. **Look for that one in a web-worker pid too**, not just a Celery
+child: the merge protection matters in the uWSGI request workers, because both
+callers of the affected function are inline calls rather than queued tasks.
 
 **Also grep for failures explicitly**, e.g. `movie injection failed`. The
 wrapper's outermost handler is deliberately broad so a fault can never break
@@ -171,6 +177,7 @@ the other. Listed in the order the UI shows them.
 | **Dry run (report only)** | on | Reports what would merge, injects nothing. Meant for first setup — **not a pause switch**, see below. |
 | **Merge series** | on | Merge duplicate series. |
 | **Merge movies** | off | Merge duplicate movies. Off by default so an upgrade never starts merging movies on its own. |
+| **Prevent destructive movie merges** | on | Fixes an upstream Dispatcharr bug; independent of this plugin's own merging. See [Protecting against a destructive core merge](#protecting-against-a-destructive-core-merge). Not affected by dry run. |
 | **Limit series merging to accounts** | *(empty = all)* | Account names to merge series **from**. The canonical can live on any account. |
 | **Limit movie merging to accounts** | *(empty = all)* | The movie equivalent, **independent of the series list**. Also bounds which accounts the detail sweep looks up, so scope and sweep stay in step. |
 | **Tag movies no other providers have** | off | Lets the detail tier *create* a newly tagged movie rather than only merging into an existing one. Changes those movies' Dispatcharr ids now, and they revert if it is turned off. |
@@ -460,6 +467,46 @@ re-fetching.
 Fetching the payload ourselves and letting the *scan* do the merging avoids both
 problems entirely. Once a movie has been merged the core task becomes safe again,
 because the id it would set is already set.
+
+## Protecting against a destructive core merge
+
+This is a **bug fix, not a feature**, and it applies whether or not you use any
+of the merging above. It is on by default.
+
+When an on-demand movie refresh finds a TMDB id in the provider's detail that
+already belongs to a different `Movie` row, Dispatcharr's
+`handle_movie_id_conflicts` keeps the movie being refreshed and **deletes** the
+pre-existing one, describing this as preserving "the user's selection".
+
+On that path it is backwards. The movie being refreshed is the freshly-minted
+duplicate — the listing carried no id, so it keyed by `name+year`, and
+`lookup_by_name_year` only matches rows with *both* ids null, so it cannot see
+the id-bearing canonical. The row deleted is therefore the established one,
+holding most of the relations, the better name, and the UUID your other tools
+have already indexed. The survivor inherits the provider's raw listing name and a
+new id.
+
+It fires on any UI movie open, or any XC `get_vod_info`, for an affected title —
+so a client that fetches movie detail in bulk can trigger it at scale,
+unattended. It can also abort part-way, leaving a relation that re-fetches and
+re-fails indefinitely.
+
+**With this setting on**, the duplicate's relation is repointed onto the
+canonical and nothing is deleted. That is the direction Dispatcharr's own caller
+already implements — it has a branch for exactly this case which is unreachable
+only because the function never signals it.
+
+The trade, stated plainly: the row you were viewing becomes relation-less and is
+pruned by a later scan, so that one page may look slightly stale until you
+reload. A transiently stale page is clearly preferable to permanently losing the
+canonical, but it is a real difference rather than a free win.
+
+Prevented merges appear in the injection log with their own action, so you can
+review them as a group. **Show status** reports whether the protection is active
+in that worker, which matters because a working protection is invisible — nothing
+bad happening looks exactly like it never firing.
+
+Turn it off only if your Dispatcharr version has fixed this upstream.
 
 ## Known limits
 

@@ -205,6 +205,7 @@ TIER_POSTER = "poster"
 TIER_PLOT = "plot"
 TIER_MANUAL = "manual"
 TIER_DETAIL = "detail"   # movies: the tmdb the provider put in its own detail
+TIER_PROTECT = "protect"  # not a match at all -- a prevented destructive merge
 
 # Decision outcomes (also the audit-log `action` values).
 INJECT = "inject"
@@ -216,6 +217,7 @@ NO_CANONICAL = "no_canonical"    # movies: id known, but no existing row holds i
 AMBIGUOUS = "ambiguous"          # signal hit a key claimed by >1 show
 VARIANT = "variant"
 DENIED = "denied"
+PROTECTED = "protected"          # a destructive core merge was prevented
 
 # Values providers use to mean "no id" (mirrors the core cleaning in tasks.py).
 _BLANK_IDS = ("", "0", "none", "null")
@@ -227,6 +229,7 @@ _BLANK_IDS = ("", "0", "none", "null")
 
 _ACTIVE = False
 _orig_process_series_batch = None
+_orig_handle_movie_id_conflicts = None
 _orig_process_movie_batch = None
 _PATCH_TAG = "_vodmerge_patched"
 
@@ -365,6 +368,11 @@ def _load_config(force: bool = False) -> dict:
         "index_ttl": _as_int(settings.get("index_ttl_seconds"), DEFAULT_INDEX_TTL_SECONDS),
         "sweep_limit": _as_int(settings.get("sweep_limit"), DEFAULT_SWEEP_LIMIT),
         "sweep_delay_ms": _as_int(settings.get("sweep_delay_ms"), DEFAULT_SWEEP_DELAY_MS),
+        # NOT gated by dry_run on purpose: dry_run means "do not inject", and
+        # letting it disable a PROTECTIVE patch would make dry run permit the
+        # very data loss this exists to stop.
+        "protect_merges": _as_bool(
+            settings.get("protect_merges"), DEFAULT_PROTECT_MERGES),
         "merge_series": _as_bool(settings.get("merge_series"), DEFAULT_MERGE_SERIES),
         "merge_movies": _as_bool(settings.get("merge_movies"), DEFAULT_MERGE_MOVIES),
         "scheduled_sweep": _as_bool(
@@ -1674,6 +1682,144 @@ def trim_matches(report, cap: int = RESPONSE_MATCH_CAP):
     return trimmed
 
 
+# --------------------------------------------------------------------------- #
+# Protection: core's destructive movie merge
+# --------------------------------------------------------------------------- #
+# `handle_movie_id_conflicts` (apps/vod/tasks.py) runs when an on-demand
+# `refresh_movie_advanced_data` finds a tmdb in the provider's detail that
+# already belongs to a DIFFERENT Movie row. Its policy is to keep the movie being
+# refreshed and DELETE the pre-existing one, which is backwards on this path: the
+# movie being refreshed is the freshly-minted orphan (the listing had no id, so
+# it keyed by name+year and `lookup_by_name_year` cannot see the tmdb-bearing
+# canonical), while the row it deletes is the canonical holding most of the
+# relations, the better name, and the uuid downstream tools have indexed.
+#
+# It can also abort part-way. To dodge the partial unique index it first nulls
+# the canonical's tmdb in a standalone write with no surrounding transaction; if
+# any id-less row already occupies that (name, year) -- which is exactly the
+# duplicate being healed whenever the names match -- Postgres rejects it, the
+# error is swallowed into a return string, and `detailed_fetched` never flips, so
+# the relation re-fetches and re-fails forever.
+#
+# We replace it with the direction the CALLER already implements: repoint the
+# relation onto the existing row and return True. `refresh_movie_advanced_data`
+# has an `if relation_updated:` branch for exactly this, unreachable today only
+# because the function returns False on every path.
+#
+# DELIBERATELY MINIMAL -- we do NOT call core's `merge_movie_data`. Three
+# reasons. The canonical is by construction the better-populated row, so there is
+# little to copy up. The orphan's listing-derived content is already stored on
+# the relation itself. And `merge_movie_data` writes ids: `tmdb_id`/`imdb_id` are
+# BOTH `unique=True`, and its
+# `elif source_movie.imdb_id: target_movie.imdb_id = source_movie.imdb_id`
+# branch saves the target while the source still holds that same unique imdb --
+# a collision of its own, separate from the two defects above. A single FK update
+# writes no ids at all, so no uniqueness constraint is reachable and the whole
+# IntegrityError class disappears rather than being handled.
+#
+# Note `relation` is an UNUSED parameter in core's version; ours needs it, so a
+# missing one degrades to "do nothing" rather than to core's deletion.
+
+PROTECT_NOOP = "noop"          # nothing conflicts -- let core proceed untouched
+PROTECT_SAME = "same"          # the holder IS the current row; core no-ops too
+PROTECT_REPOINT = "repoint"    # another row holds it -- repoint, do not delete
+
+DEFAULT_PROTECT_MERGES = True  # a data-loss bug; on unless deliberately disabled
+
+
+def decide_conflict(current_id, tmdb_holder_id, imdb_holder_id, has_relation):
+    """Pure: what to do about an id conflict. Returns (action, target_id).
+
+    Mirrors core's preference for the TMDB match over the IMDB one. Pure so the
+    decision is testable without a database; the caller does the queries.
+    """
+    holder = tmdb_holder_id if tmdb_holder_id is not None else imdb_holder_id
+    if holder is None:
+        return PROTECT_NOOP, None
+    if holder == current_id:
+        return PROTECT_SAME, None
+    if not has_relation:
+        # No relation to repoint. Core would delete the canonical here; doing
+        # nothing is strictly safer, and the next refresh retries.
+        return PROTECT_NOOP, None
+    return PROTECT_REPOINT, holder
+
+
+def patched_handle_movie_id_conflicts(current_movie, relation,
+                                      tmdb_id_to_set, imdb_id_to_set):
+    """Non-destructive replacement for core's `handle_movie_id_conflicts`."""
+    from django.db import transaction
+    from apps.vod.models import Movie
+
+    try:
+        cfg = _load_config()
+        if not cfg["protect_merges"]:
+            if _orig_handle_movie_id_conflicts is not None:
+                return _orig_handle_movie_id_conflicts(
+                    current_movie, relation, tmdb_id_to_set, imdb_id_to_set)
+            return current_movie, False
+
+        def holder(field, value):
+            if not value:
+                return None
+            row = Movie.objects.filter(**{field: value}).values("id").first()
+            return row["id"] if row else None
+
+        action, target_id = decide_conflict(
+            getattr(current_movie, "id", None),
+            holder("tmdb_id", tmdb_id_to_set),
+            holder("imdb_id", imdb_id_to_set),
+            getattr(relation, "id", None) is not None,
+        )
+
+        if action != PROTECT_REPOINT:
+            return current_movie, False
+
+        target = Movie.objects.filter(id=target_id).first()
+        if target is None:                       # raced away; let core's caller
+            return current_movie, False          # try again next refresh
+
+        with transaction.atomic():
+            relation.movie = target
+            relation.save(update_fields=["movie"])
+
+        logger.info(
+            "[VOD-MERGE] prevented destructive merge: kept canonical movie %s "
+            "%r, repointed relation %s off orphan movie %s %r",
+            target.id, target.name, relation.id,
+            getattr(current_movie, "id", None),
+            getattr(current_movie, "name", None),
+        )
+        try:
+            _append_log([{
+                "ts": time.time(),
+                "action": PROTECTED,
+                "tier": TIER_PROTECT,
+                "kind": "movie",
+                "account": getattr(
+                    getattr(relation, "m3u_account", None), "name", None),
+                "stream_id": str(getattr(relation, "stream_id", "") or "") or None,
+                "name": getattr(current_movie, "name", None),
+                "tmdb_id": tmdb_id_to_set or imdb_id_to_set,
+                "previous_movie_id": getattr(current_movie, "id", None),
+                "canonical_id": target.id,
+                "canonical_uuid": str(target.uuid) if getattr(target, "uuid", None) else None,
+                "creates_new_row": False,
+            }])
+        except Exception:
+            logger.exception("[VOD-MERGE] could not log a prevented merge")
+
+        return target, True
+
+    except Exception:
+        # Fail CLOSED on this one, unlike the injection path: returning
+        # (current, False) makes core set the id itself, which is the benign
+        # branch. Never fall through to core's destructive version on error.
+        logger.exception(
+            "[VOD-MERGE] merge protection failed; taking no action")
+        return current_movie, False
+
+
 def _plugin_file(name: str) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
 
@@ -1738,7 +1884,8 @@ def install(manage_schedule=None) -> bool:
     None -> only touch it in the master process at import, so a restart
     re-establishes it without every worker racing on the same row.
     """
-    global _orig_process_series_batch, _orig_process_movie_batch, _ACTIVE
+    global _orig_process_series_batch, _orig_process_movie_batch
+    global _orig_handle_movie_id_conflicts, _ACTIVE
 
     try:
         from apps.vod import tasks as vod_tasks
@@ -1758,9 +1905,28 @@ def install(manage_schedule=None) -> bool:
         original = _wrap(vod_tasks, "process_movie_batch", patched_process_movie_batch)
         if original is not None:
             _orig_process_movie_batch = original
+
+        # Separate from the batch wrappers, and separately reported: this one
+        # matters in the uWSGI REQUEST workers (both callers of
+        # refresh_movie_advanced_data are inline), whereas the batch wrappers
+        # matter in the Celery children that run the scan. Absent = no
+        # protection rather than broken merging, so it must not fail install.
+        protect = False
+        if hasattr(vod_tasks, "handle_movie_id_conflicts"):
+            original = _wrap(vod_tasks, "handle_movie_id_conflicts",
+                             patched_handle_movie_id_conflicts)
+            if original is not None:
+                _orig_handle_movie_id_conflicts = original
+            protect = True
+        else:
+            logger.warning(
+                "[VOD-MERGE] tasks.handle_movie_id_conflicts missing -- merge "
+                "protection NOT installed (upstream may have changed it)")
+
         _ACTIVE = True
         logger.info(
-            "[VOD-MERGE] installed series + movie batch wrappers in pid=%s", os.getpid()
+            "[VOD-MERGE] installed series + movie batch wrappers%s in pid=%s",
+            " + destructive-merge protection" if protect else "", os.getpid(),
         )
     except Exception as exc:
         logger.exception("[VOD-MERGE] install failed: %s", exc)
@@ -1789,6 +1955,7 @@ def uninstall() -> bool:
     try:
         from apps.vod import tasks as vod_tasks
         for attr, original in (
+            ("handle_movie_id_conflicts", _orig_handle_movie_id_conflicts),
             ("process_series_batch", _orig_process_series_batch),
             ("process_movie_batch", _orig_process_movie_batch),
         ):

@@ -7,6 +7,64 @@ Everything through 0.8.3 landed during initial development against a single
 large live library; the entries below record *why* each change was needed, since
 several were driven by failures that were invisible from the outside.
 
+## 1.1.0 — 2026-09-06
+
+**Added — protection against a destructive Dispatcharr movie merge**
+
+- **New setting `Prevent destructive movie merges`, default ON.** This fixes an
+  upstream bug and is independent of any merging this plugin does.
+
+  When an on-demand movie refresh finds a TMDB id in the provider's detail that
+  already belongs to a different `Movie` row, core's
+  `handle_movie_id_conflicts` keeps the movie being refreshed and **deletes** the
+  pre-existing one. On that path the movie being refreshed is the freshly-minted
+  duplicate — the listing had no id, so it keyed by name+year, and
+  `lookup_by_name_year` cannot see the id-bearing canonical — so the row deleted
+  is the established one holding most of the relations, the better name, and the
+  UUID downstream tools have indexed. It fires on any UI movie open or XC
+  `get_vod_info` for an affected title.
+
+  It can also abort part-way: to dodge a partial unique index it first nulls the
+  canonical's `tmdb_id` in a standalone write with no transaction, and if any
+  id-less row already occupies that `(name, year)` Postgres rejects it, the error
+  is swallowed into a return string, and `detailed_fetched` never flips — so the
+  relation re-fetches and re-fails indefinitely.
+
+  With this on, the duplicate's relation is repointed onto the canonical instead
+  and nothing is deleted. That is the direction **core's own caller already
+  implements** — `refresh_movie_advanced_data` has an `if relation_updated:`
+  branch for exactly this, unreachable today only because the function returns
+  `False` on every path.
+
+- **Deliberately minimal: it does not call core's `merge_movie_data`.** The
+  canonical is by construction the better-populated row, the duplicate's
+  listing-derived content is already stored on the relation, and
+  `merge_movie_data` writes ids — `tmdb_id` and `imdb_id` are both `unique=True`,
+  and its `elif source_movie.imdb_id:` branch saves the target while the source
+  still holds that same unique value, a third collision separate from the two
+  defects above. A single foreign-key update writes no ids at all, so no
+  uniqueness constraint is reachable and the `IntegrityError` class disappears
+  rather than being handled.
+
+- **Not gated by `Dry run`**, on purpose: dry run means "do not inject", and
+  letting it disable a protective patch would mean dry run permits the data loss.
+
+- Fails **closed**: any error takes no action rather than falling through to
+  core's destructive version. A missing `handle_movie_id_conflicts` (if upstream
+  changes it) logs a warning and leaves the rest of the plugin working.
+
+- Prevented merges are logged with their own action and tier so they can be
+  reviewed as a class, and `Show status` reports whether the protection is
+  installed in that worker — necessary because a working protection is invisible:
+  nothing bad happening looks identical to it never firing.
+
+**Note on verifying the install**
+
+This patch matters in the **uWSGI request workers**, not the Celery children —
+both callers of `refresh_movie_advanced_data` are inline calls despite its
+`@shared_task` decorator. The batch wrappers are the opposite. The install log
+line now reports both, so check for it in a web-worker pid as well.
+
 ## 1.0.0 — 2026-09-06
 
 First release. Movies reach parity with series, the settings and actions are
