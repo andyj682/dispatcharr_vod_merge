@@ -178,6 +178,7 @@ the other. Listed in the order the UI shows them.
 | **Merge series** | on | Merge duplicate series. |
 | **Merge movies** | off | Merge duplicate movies. Off by default so an upgrade never starts merging movies on its own. |
 | **Prevent destructive movie merges** | on | Fixes an upstream Dispatcharr bug; independent of this plugin's own merging. See [Protecting against a destructive core merge](#protecting-against-a-destructive-core-merge). Not affected by dry run. |
+| **Preserve essential movie detail** | on | Puts back the TMDB id, video and audio details when a Dispatcharr detail fetch drops them. Also an upstream fix rather than a merging change. See [Preserving detail a refresh drops](#preserving-detail-a-refresh-drops). Not affected by dry run. |
 | **Limit series merging to accounts** | *(empty = all)* | Account names to merge series **from**. The canonical can live on any account. |
 | **Limit movie merging to accounts** | *(empty = all)* | The movie equivalent, **independent of the series list**. Also bounds which accounts the detail sweep looks up, so scope and sweep stay in step. |
 | **Tag movies no other providers have** | off | Lets the detail tier *create* a newly tagged movie rather than only merging into an existing one. Changes those movies' Dispatcharr ids now, and they revert if it is turned off. |
@@ -508,6 +509,53 @@ bad happening looks exactly like it never firing.
 
 Turn it off only if your Dispatcharr version has fixed this upstream.
 
+## Preserving detail a refresh drops
+
+A second upstream fix, unrelated to merging, controlled by **Preserve essential
+movie detail** (on by default).
+
+Every time Dispatcharr fetches a movie's detail it **replaces** what it stored
+last time rather than merging into it. Providers are not consistent between
+calls: one that returned a full stream description on Monday can return a plot
+summary and nothing else on Tuesday, and the second response silently erases the
+first. Nothing reports it, and the loss only shows up later as a title that
+stopped ranking correctly or stopped merging.
+
+Three keys are worth more than the payload they arrive in, so they are put back
+if a fetch drops them:
+
+- **`tmdb_id`** — the provider's own id, this plugin's strongest movie signal. If
+  it disappears, a duplicate this plugin could have merged becomes unmergeable
+  again, silently.
+- **`video`** — measured resolution and codec, as opposed to whatever the stream
+  name claims.
+- **`audio`** — codec and channel count. This one has no fallback anywhere
+  downstream: absent means "no opinion", so losing it does not weaken a quality
+  comparison, it removes one side of it entirely.
+
+**A value the provider actually sent always wins.** This only refills a hole; it
+never puts stale data back over a real answer. Restored keys go to the injection
+log with their own action, and **Show status** reports whether the guard is live
+in that worker.
+
+### What the sweep records, and what it leaves alone
+
+Dispatcharr marks a relation whose detail it has fetched with two fields,
+`detailed_fetched` and `last_advanced_refresh`. Between them they are the only
+record anywhere that a **client** asked for that movie. Versions before 1.2.0
+set both from the detail sweep, which destroyed the distinction: every relation
+the sweep touched looked like one somebody had requested.
+
+Since 1.2.0 the sweep records its own timestamp under its own key in the
+relation's `custom_properties` and leaves Dispatcharr's fields alone. The rule
+behind it is that **a sweep must not write the field it reads**.
+
+If you ran the sweep on an earlier version, its marks are still there and are
+**harmless**. Dispatcharr's 24-hour skip only considers them fresh for a day,
+so they suppress nothing after that, and anything reading the record sensibly
+reads it as "asked for recently" — a window those old timestamps have already
+fallen out of. There is no cleanup step to run.
+
 ## Known limits
 
 **The plot tier does much less for movies than for series.** It is a backup
@@ -623,7 +671,7 @@ next version bump.
 py -3 test_logic.py
 ```
 
-125 tests, no Django, no database, no Docker — the decision logic is pure.
+152 tests, no Django, no database, no Docker — the decision logic is pure.
 Covers both real-world failure modes that cost debugging time: the size-segment
 URL with no filename, and a placeholder asset shared across many titles.
 

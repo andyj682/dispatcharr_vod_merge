@@ -242,6 +242,77 @@ children. Install happens at import either way, but the verification differs.
 Both defects are also reported upstream; the local patch means we are not waiting
 on that.
 
+### The patch has to go in more than one namespace
+
+`refresh_movie_advanced_data` is referenced from two places, and they bind it
+differently. `apps/output/views.py` imports it *inside* the function, so the
+name is resolved at call time and replacing the module attribute reaches it.
+`apps/vod/api_views.py` imports it at module scope and keeps its own reference
+to whatever the attribute pointed at when that module was first imported.
+
+Patching `apps.vod.tasks` alone therefore reaches the second caller only when
+`api_views` is imported *after* the plugin. At boot it is, because the URLconf
+loads lazily — but not when the plugin is enabled without a restart, and that
+is precisely the case where someone is about to click on a movie to see whether
+it worked. So both namespaces are patched (the second only when already
+imported — importing it ourselves during startup would drag the API layer in
+early) and both are restored on disable.
+
+The 1.1.0 protection needs none of this: `handle_movie_id_conflicts` is
+resolved as a module global inside `tasks.py` itself, so it is covered whoever
+calls it.
+
+## Two writers, one field
+
+As of 1.2.0 the plugin observes a rule that took a while to state properly:
+**a sweep must not write the field it reads.**
+
+Dispatcharr records that a movie's detail was fetched with two fields on the
+relation, `detailed_fetched` and `last_advanced_refresh`. Between them they are
+the only record anywhere that a **client** asked for that movie. The detail
+sweep used to set both, which destroyed the distinction — every relation the
+sweep touched became indistinguishable from one somebody had requested — and
+also suppressed real work, because `refresh_movie_advanced_data` skips when
+those two say the data is fresh. The sweep set them without calling that
+function, so a client asking an hour later got the early return instead of a
+fetch.
+
+The sweep now writes a timestamp under its own `vod_merge` key and leaves
+core's fields alone. It can afford to because **its mechanism differs from the
+mechanism that records the signal**: the sweep fetches detail itself rather
+than delegating to the function that stamps the fields. Where that separation
+does not exist the property is unobtainable — a series episode sweep's action
+*is* the function that writes the field, so doing its job necessarily destroys
+the signal, which is why that problem needs an explicit watchlist and a
+hand-written TTL. Here the timestamp is a TTL for free, and stays one only as
+long as we keep our hands off it.
+
+Storing our key on the **relation** rather than the `Movie` row is deliberate:
+`process_movie_batch` merges relation `custom_properties`
+(`{**existing_rel_cp, 'basic_data': ...}`) rather than replacing them, so our
+key survives every scan by the same mechanism that keeps `detailed_info` alive.
+
+### The same boundary, from the other side
+
+The inverse problem is that core's detail write *replaces* `detailed_info`
+wholesale, so a thinner payload erases a richer one. Here core is the hazard
+rather than the signal, and the fix is to repair after it: keep a snapshot,
+call the original, and refill only the essential keys — `tmdb_id`, `video`,
+`audio` — that the new payload left absent or blank. A value the provider
+actually sent always wins, so this can only ever restore a hole.
+
+Two details worth recording. `clean_custom_properties` drops `None`, `''` and
+`[]` but **not** `{}`, so an empty `video` block reaches storage looking like
+data and has to be treated as absent. And the guard **fails open**, unlike the
+merge protection above: there is nothing destructive to fall through to, and a
+fault in a repair step must not cost a user the fetch they are waiting on.
+
+The write is a read-modify-write of the relation's `custom_properties`, the
+same pattern core itself uses, so a concurrent writer on the same relation
+could in principle be clobbered. The window is one query wide, the two writers
+would have to be refreshing the same movie simultaneously, and the outcome is a
+restored key rather than a lost row — not worth transaction machinery.
+
 ## Manual approvals
 
 Some entries are unreachable by every signal: a provider can ship a title as a

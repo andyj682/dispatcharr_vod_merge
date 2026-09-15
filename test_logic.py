@@ -884,6 +884,152 @@ class TrimMatchesTests(unittest.TestCase):
             self.assertIs(patch.trim_matches(r, cap=10), r)
 
 
+class RestoreEssentialTests(unittest.TestCase):
+    """A core detail refresh REPLACES `detailed_info` wholesale, so a payload
+    that arrives thinner than the last one erases the difference. The guard
+    refills only the essential keys, and only where the new payload left a
+    hole."""
+
+    VIDEO = {"width": 3840, "height": 2160, "codec_name": "hevc"}
+    AUDIO = {"codec_name": "ac3", "channels": 6}
+
+    def test_dropped_keys_are_restored(self):
+        old = {"tmdb_id": "12345", "video": self.VIDEO, "audio": self.AUDIO}
+        new = {"plot": "A blurb.", "genre": "Drama"}
+        got, restored = patch.restore_essential(old, new)
+        self.assertEqual(sorted(restored), ["audio", "tmdb_id", "video"])
+        self.assertEqual(got["video"], self.VIDEO)
+        self.assertEqual(got["audio"], self.AUDIO)
+        self.assertEqual(got["tmdb_id"], "12345")
+        # Everything the new payload DID carry survives untouched.
+        self.assertEqual(got["plot"], "A blurb.")
+        self.assertEqual(got["genre"], "Drama")
+
+    def test_provider_value_wins_over_the_stored_one(self):
+        # The point of the refresh is to take the provider's word for it. The
+        # guard must never reinstate stale data over a real answer.
+        old = {"tmdb_id": "111", "video": self.VIDEO}
+        new = {"tmdb_id": "222", "video": {"width": 1920, "height": 1080}}
+        got, restored = patch.restore_essential(old, new)
+        self.assertEqual(restored, [])
+        self.assertEqual(got["tmdb_id"], "222")
+        self.assertEqual(got["video"]["width"], 1920)
+
+    def test_partial_drop_restores_only_the_missing_key(self):
+        old = {"tmdb_id": "12345", "video": self.VIDEO, "audio": self.AUDIO}
+        new = {"tmdb_id": "12345", "video": self.VIDEO}
+        got, restored = patch.restore_essential(old, new)
+        self.assertEqual(restored, ["audio"])
+        self.assertEqual(got["audio"], self.AUDIO)
+
+    def test_empty_dict_counts_as_dropped(self):
+        # clean_custom_properties strips None/''/[] but NOT {}, so an empty
+        # video block reaches storage looking like real data. If it were
+        # treated as present the hole would never be refilled.
+        old = {"video": self.VIDEO, "audio": self.AUDIO}
+        new = {"video": {}, "audio": None}
+        got, restored = patch.restore_essential(old, new)
+        self.assertEqual(sorted(restored), ["audio", "video"])
+        self.assertEqual(got["video"], self.VIDEO)
+
+    def test_placeholder_ids_count_as_dropped(self):
+        for placeholder in ("", "0", "none", "null"):
+            got, restored = patch.restore_essential(
+                {"tmdb_id": "12345"}, {"tmdb_id": placeholder})
+            self.assertEqual(restored, ["tmdb_id"], placeholder)
+            self.assertEqual(got["tmdb_id"], "12345", placeholder)
+
+    def test_a_placeholder_is_not_worth_restoring_either(self):
+        # Symmetry: a stored "0" is not data, so its absence is not a loss.
+        got, restored = patch.restore_essential({"tmdb_id": "0"}, {"plot": "x"})
+        self.assertEqual(restored, [])
+        self.assertNotIn("tmdb_id", got)
+
+    def test_nothing_stored_means_nothing_to_do(self):
+        # The bulk case: a relation fetched for the first time. No prior
+        # payload, so the guard is a no-op and costs nothing.
+        new = {"plot": "A blurb."}
+        got, restored = patch.restore_essential(None, new)
+        self.assertEqual(restored, [])
+        self.assertEqual(got, new)
+        self.assertEqual(patch.restore_essential({}, new), (new, []))
+
+    def test_identical_payload_restores_nothing(self):
+        # What core's 24h skip looks like from here: before == after.
+        same = {"tmdb_id": "12345", "video": self.VIDEO, "audio": self.AUDIO}
+        got, restored = patch.restore_essential(same, dict(same))
+        self.assertEqual(restored, [])
+        self.assertEqual(got, same)
+
+    def test_non_essential_keys_are_never_restored(self):
+        # Deliberately narrow: plot, genre and the rest are core's to manage,
+        # and refilling them would fight the refresh rather than repair it.
+        old = {"plot": "The old blurb.", "genre": "Drama", "rating": "7"}
+        got, restored = patch.restore_essential(old, {"plot": ""})
+        self.assertEqual(restored, [])
+        self.assertNotIn("genre", got)
+
+    def test_input_is_not_mutated(self):
+        old = {"tmdb_id": "12345", "video": self.VIDEO}
+        new = {"plot": "A blurb."}
+        patch.restore_essential(old, new)
+        self.assertEqual(new, {"plot": "A blurb."})
+        self.assertEqual(sorted(old), ["tmdb_id", "video"])
+
+    def test_junk_types_do_not_raise(self):
+        # `detailed_info` is provider-shaped JSON; a list or a string there is
+        # not impossible, and the guard runs on a user-facing request path.
+        for junk in ([], "text", 7, None):
+            got, restored = patch.restore_essential(junk, {"plot": "x"})
+            self.assertEqual(restored, [])
+            got, restored = patch.restore_essential({"video": self.VIDEO}, junk)
+            self.assertEqual(restored, ["video"])
+
+
+class SweepWritesOnlyItsOwnKeysTests(unittest.TestCase):
+    """The sweep must not write core's `detailed_fetched` /
+    `last_advanced_refresh`. Those two fields are the only record of a CLIENT
+    asking for a movie's detail, and writing them makes every relation we
+    swept look like one someone requested. Pinned here because the mistake is
+    silent and easy to reintroduce while editing the sweep."""
+
+    def test_sweep_does_not_write_cores_fields(self):
+        import inspect
+        src = inspect.getsource(patch.sweep_movies_impl)
+        self.assertNotIn('"detailed_fetched"', src)
+        self.assertNotIn("last_advanced_refresh = ", src)
+
+    def test_sweep_stamps_our_namespaced_key_instead(self):
+        import inspect
+        src = inspect.getsource(patch.sweep_movies_impl)
+        self.assertIn("_stamp_own", src)
+
+    def test_stamp_merges_rather_than_overwrites(self):
+        # A later pass (an ffprobe stamp) must not erase an earlier one.
+        props = {"basic_data": {"name": "Example Film"},
+                 patch.OWN_PROPS_KEY: {"detail_at": "2026-01-01T00:00:00"}}
+        patch._stamp_own(props, probe_at="2026-02-02T00:00:00")
+        self.assertEqual(props[patch.OWN_PROPS_KEY], {
+            "detail_at": "2026-01-01T00:00:00",
+            "probe_at": "2026-02-02T00:00:00",
+        })
+        self.assertIn("basic_data", props)
+
+    def test_stamp_survives_a_missing_or_junk_key(self):
+        for existing in ({}, {patch.OWN_PROPS_KEY: None},
+                         {patch.OWN_PROPS_KEY: "junk"}):
+            props = dict(existing)
+            patch._stamp_own(props, detail_at="now")
+            self.assertEqual(props[patch.OWN_PROPS_KEY], {"detail_at": "now"})
+
+    def test_resumability_does_not_depend_on_the_dropped_flag(self):
+        # The sweep skips on stored detail, never on detailed_fetched, which
+        # is why dropping the flag costs nothing here.
+        import inspect
+        src = inspect.getsource(patch.sweep_movies_impl)
+        self.assertIn('props.get("detailed_info")', src)
+
+
 class ManifestParityTests(unittest.TestCase):
     """plugin.json and the Plugin class both declare the UI, so they must agree.
 
@@ -948,6 +1094,17 @@ class ManifestParityTests(unittest.TestCase):
         self.assertIs(by_id["merge_series"]["default"], True)
         self.assertIs(by_id["merge_movies"]["default"], False)
         self.assertIs(by_id["dry_run"]["default"], True)
+
+    def test_the_two_protective_settings_default_on(self):
+        # Both fix upstream data loss rather than changing this plugin's
+        # behaviour, so an install that ignores them is still protected. And
+        # neither may be gated by dry_run -- that would make dry run permit
+        # the loss it exists to avoid.
+        self.assertIs(patch.DEFAULT_PROTECT_MERGES, True)
+        self.assertIs(patch.DEFAULT_PRESERVE_DETAIL, True)
+        by_id = {f["id"]: f for f in self.cls.fields}
+        self.assertIs(by_id["protect_merges"]["default"], True)
+        self.assertIs(by_id["preserve_detail"]["default"], True)
 
     def test_actions_match(self):
         ja = {a["id"]: a for a in self.man["actions"]}

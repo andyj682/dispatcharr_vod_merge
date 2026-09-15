@@ -206,6 +206,7 @@ TIER_PLOT = "plot"
 TIER_MANUAL = "manual"
 TIER_DETAIL = "detail"   # movies: the tmdb the provider put in its own detail
 TIER_PROTECT = "protect"  # not a match at all -- a prevented destructive merge
+TIER_PRESERVE = "preserve"  # nor this -- essential detail a core write dropped
 
 # Decision outcomes (also the audit-log `action` values).
 INJECT = "inject"
@@ -218,6 +219,7 @@ AMBIGUOUS = "ambiguous"          # signal hit a key claimed by >1 show
 VARIANT = "variant"
 DENIED = "denied"
 PROTECTED = "protected"          # a destructive core merge was prevented
+PRESERVED = "preserved"          # detail a core refresh dropped was put back
 
 # Values providers use to mean "no id" (mirrors the core cleaning in tasks.py).
 _BLANK_IDS = ("", "0", "none", "null")
@@ -231,6 +233,7 @@ _ACTIVE = False
 _orig_process_series_batch = None
 _orig_handle_movie_id_conflicts = None
 _orig_process_movie_batch = None
+_orig_refresh_movie_advanced_data = None
 _PATCH_TAG = "_vodmerge_patched"
 
 _pid_logged = set()
@@ -373,6 +376,10 @@ def _load_config(force: bool = False) -> dict:
         # very data loss this exists to stop.
         "protect_merges": _as_bool(
             settings.get("protect_merges"), DEFAULT_PROTECT_MERGES),
+        # Same reasoning: this one prevents data LOSS too, so dry_run must not
+        # be able to switch it off either.
+        "preserve_detail": _as_bool(
+            settings.get("preserve_detail"), DEFAULT_PRESERVE_DETAIL),
         "merge_series": _as_bool(settings.get("merge_series"), DEFAULT_MERGE_SERIES),
         "merge_movies": _as_bool(settings.get("merge_movies"), DEFAULT_MERGE_MOVIES),
         "scheduled_sweep": _as_bool(
@@ -999,6 +1006,54 @@ def preview_impl(limit: int = 0) -> dict:
 # is every candidate here. Running it across a few thousand relations would
 # rewrite the library. This writes `detailed_info` itself instead.
 
+# --------------------------------------------------------------------------- #
+# Our own corner of `custom_properties`
+# --------------------------------------------------------------------------- #
+# Until 1.2.0 the sweep stamped core's `detailed_fetched` + `last_advanced_refresh`
+# to record that it had fetched a relation. That was a mistake, and not merely an
+# untidy one.
+#
+# Those two fields are the ONLY record of "a client asked Dispatcharr for this
+# movie's detail". Nothing else in core carries that signal, and it is the signal
+# a future enrichment pass needs in order to know which titles anyone actually
+# wants. Writing them ourselves poisons it at the source: every relation we swept
+# looks like a relation someone requested.
+#
+# It also suppressed real work. `refresh_movie_advanced_data` skips when
+# `detailed_fetched` is set and `last_advanced_refresh` is inside 24h, and the
+# sweep set both WITHOUT calling that function -- so a client asking an hour
+# after a sweep got core's early return instead of a fetch. Harmless only while
+# our sweep happens to fetch the same endpoint and store the same payload; it
+# stops being harmless the moment either side changes.
+#
+# The general rule, which is why this is a named section rather than a one-line
+# fix: A SWEEP MUST NOT WRITE THE FIELD IT READS. Our movie sweep can obey it
+# because its mechanism (a detail fetch we perform, and later an ffprobe) is
+# distinct from the mechanism that records the signal (core's own refresh). The
+# series case cannot -- there the sweep's action IS the function that writes the
+# field -- which is exactly why the episode sweep needed an explicit watchlist
+# and a hand-rolled TTL. Here the timestamp is inherently a TTL, for free, and
+# only for as long as we keep our hands off it.
+#
+# So: we write ONE key, namespaced, and never touch core's. `process_movie_batch`
+# merges relation `custom_properties` rather than replacing it
+# (`{**existing_rel_cp, 'basic_data': ...}`, verified in v0.30.0), so this
+# survives every scan by the same mechanism that keeps `detailed_info` alive.
+
+OWN_PROPS_KEY = "vod_merge"
+
+
+def _stamp_own(props, **fields):
+    """Record our own bookkeeping under `OWN_PROPS_KEY`, merging with whatever
+    is already there so separate passes (detail now, ffprobe later) accumulate
+    rather than overwrite. Mutates and returns `props`."""
+    existing = props.get(OWN_PROPS_KEY)
+    own = dict(existing) if isinstance(existing, dict) else {}
+    own.update(fields)
+    props[OWN_PROPS_KEY] = own
+    return props
+
+
 def _clean_props(value):
     """Use core's cleaner when available so the stored shape matches what core
     would have written; fall back to storing the payload as-is."""
@@ -1144,11 +1199,14 @@ def sweep_movies_impl(limit=None, delay=None, refetch=False) -> dict:
     """Fetch `get_vod_info` for id-less movie relations and store the detail.
 
     Read-only against Dispatcharr's merge logic: it writes `detailed_info` /
-    `movie_data` / `detailed_fetched` onto the relation and nothing else. No
-    Movie row is created, deleted, renamed or repointed here.
+    `movie_data` and our OWN namespaced key onto the relation and nothing else.
+    No Movie row is created, deleted, renamed or repointed here, and since
+    1.2.0 no field of core's is written either -- see `OWN_PROPS_KEY`.
 
     Resumable -- it always picks up relations that still have no detail, so
-    running it repeatedly walks the backlog. Returns a summary.
+    running it repeatedly walks the backlog. Resumability keys on
+    `detailed_info`, never on `detailed_fetched`, which is why dropping the
+    latter costs nothing here. Returns a summary.
     """
     from django.utils import timezone
     from core.xtream_codes import Client as XtreamCodesClient
@@ -1239,11 +1297,10 @@ def sweep_movies_impl(limit=None, delay=None, refetch=False) -> dict:
                 cleaned_movie = _clean_props(movie_data) if isinstance(movie_data, dict) else None
                 if cleaned_movie:
                     props["movie_data"] = cleaned_movie
-                props["detailed_fetched"] = True
+                _stamp_own(props, detail_at=timezone.now().isoformat())
                 rel.custom_properties = props
-                rel.last_advanced_refresh = timezone.now()
                 try:
-                    rel.save(update_fields=["custom_properties", "last_advanced_refresh"])
+                    rel.save(update_fields=["custom_properties"])
                 except Exception:
                     stats["errors"] += 1
                     per_account[name]["errors"] += 1
@@ -1820,6 +1877,228 @@ def patched_handle_movie_id_conflicts(current_movie, relation,
         return current_movie, False
 
 
+# --------------------------------------------------------------------------- #
+# Protection: essential detail dropped by a core refresh
+# --------------------------------------------------------------------------- #
+# `refresh_movie_advanced_data` stores the provider's detail payload with
+# `relation_custom_props['detailed_info'] = cleaned_info` -- a WHOLE-DICT
+# replacement of that sub-payload (v0.30.0 apps/vod/tasks.py:2361). Other
+# top-level keys survive, ours included, because it mutates the surrounding
+# dict; but everything previously inside `detailed_info` is gone unless the new
+# payload repeats it.
+#
+# Providers are not consistent between calls. One that returned a full ffprobe
+# block on Monday can return plot and genre only on Tuesday, and the second
+# response silently erases the first. Three keys are worth more than the
+# payload they arrive in:
+#
+#   tmdb_id  -- the detail tier's entire signal. Lose it and a movie this
+#               plugin could have merged goes back to unmergeable, with no
+#               error anywhere.
+#   video    -- resolution and codec, the ground truth for quality ranking.
+#   audio    -- codec and channel count, which has no fallback at all
+#               downstream: absent means "no opinion", so a dropped audio
+#               block does not degrade a comparison, it silently removes one.
+#
+# We therefore let core write whatever it likes and then put back only the
+# essential keys its write DROPPED. The provider still wins wherever it
+# supplied a value -- this never overwrites real data with older data, it only
+# refills a hole.
+#
+# Note this is the mirror image of the reason we stopped writing core's fields
+# above. There, core's field is the signal and we must not touch it. Here,
+# core's write is the hazard and we repair after it. Both follow from the same
+# rule about not confusing the two writers.
+#
+# Cost is near zero in the case that motivated it: a relation with no stored
+# detail has nothing to lose, so a bulk pass over fresh relations pays one
+# extra SELECT each and never writes.
+
+ESSENTIAL_DETAIL_KEYS = ("tmdb_id", "video", "audio")
+
+DEFAULT_PRESERVE_DETAIL = True
+
+
+def _is_blank_detail_value(value) -> bool:
+    """Blank in the sense core's own cleaner uses -- plus the empty dict.
+
+    `clean_custom_properties` drops None, '' and [], so those never reach
+    storage. It does NOT drop `{}`, so an empty `video` block survives the
+    clean and lands looking like data. Treat it as absent too, or the guard
+    would consider a hole already filled.
+    """
+    if value is None or value == "" or value == [] or value == {}:
+        return True
+    if isinstance(value, list) and all(v is None or v == "" for v in value):
+        return True
+    return False
+
+
+def _is_blank_essential(key, value) -> bool:
+    if _is_blank_detail_value(value):
+        return True
+    # Providers spell "no id" several ways; the detail tier already knows them.
+    return key == "tmdb_id" and str(value).strip().lower() in _BLANK_IDS
+
+
+def restore_essential(old_detail, new_detail):
+    """Carry essential keys a fresh detail payload dropped back over it.
+
+    Returns `(detail, restored_keys)`. Pure, so the policy is testable with no
+    database: the caller does the reads and the write.
+    """
+    old = old_detail if isinstance(old_detail, dict) else {}
+    new = new_detail if isinstance(new_detail, dict) else {}
+    if not old:
+        return new, []
+
+    merged = dict(new)
+    restored = []
+    for key in ESSENTIAL_DETAIL_KEYS:
+        was = old.get(key)
+        if _is_blank_essential(key, was):
+            continue                      # nothing worth keeping to begin with
+        if not _is_blank_essential(key, merged.get(key)):
+            continue                      # the provider supplied one; it wins
+        merged[key] = was
+        restored.append(key)
+    return merged, restored
+
+
+def _read_stored_detail(relation_id):
+    """The relation's current `detailed_info`, or None.
+
+    A separate query, so the dict returned here is a separate object from the
+    one core loads and mutates -- no aliasing, no copy needed.
+    """
+    from apps.vod.models import M3UMovieRelation
+
+    props = (
+        M3UMovieRelation.objects.filter(id=relation_id)
+        .values_list("custom_properties", flat=True).first()
+    )
+    detail = (props or {}).get("detailed_info")
+    return detail if isinstance(detail, dict) else None
+
+
+def _restore_dropped_detail(relation_id, before) -> list:
+    """Put back any essential key core's write dropped. Returns what it put."""
+    from apps.vod.models import M3UMovieRelation
+
+    if not before:
+        return []
+
+    rel = (
+        M3UMovieRelation.objects.filter(id=relation_id)
+        .select_related("m3u_account", "movie").first()
+    )
+    if rel is None:
+        return []
+
+    props = rel.custom_properties or {}
+    after = props.get("detailed_info")
+    if not isinstance(after, dict):
+        # Core skipped, or its payload was empty and it left ours in place.
+        return []
+
+    merged, restored = restore_essential(before, after)
+    if not restored:
+        return []
+
+    props["detailed_info"] = merged
+    rel.custom_properties = props
+    rel.save(update_fields=["custom_properties"])
+
+    logger.info(
+        "[VOD-MERGE] restored detail dropped by a core refresh: rel=%s keys=%s",
+        relation_id, restored,
+    )
+    try:
+        _append_log([{
+            "ts": time.time(),
+            "action": PRESERVED,
+            "tier": TIER_PRESERVE,
+            "kind": "movie",
+            "account": getattr(
+                getattr(rel, "m3u_account", None), "name", None),
+            "stream_id": str(getattr(rel, "stream_id", "") or "") or None,
+            "name": getattr(getattr(rel, "movie", None), "name", None),
+            "tmdb_id": merged.get("tmdb_id"),
+            "restored": restored,
+            "creates_new_row": False,
+        }])
+    except Exception:
+        logger.exception("[VOD-MERGE] could not log a restored detail payload")
+    return restored
+
+
+def patched_refresh_movie_advanced_data(m3u_movie_relation_id,
+                                        force_refresh=False):
+    """Run core's refresh, then repair the essential keys its write dropped.
+
+    Fails OPEN, and deliberately not like `patched_handle_movie_id_conflicts`.
+    That one fails closed because the thing it replaces is destructive, so
+    falling through would do the damage. Here there is nothing destructive to
+    fall through to: core's refresh is a feature a user is waiting on, and a
+    fault in our guard must not cost them the fetch. The original is called
+    exactly once whatever happens, and its return value is passed back
+    untouched.
+    """
+    original = _orig_refresh_movie_advanced_data
+    if original is None:                 # not installed; nothing to delegate to
+        return None
+
+    before = None
+    guard = False
+    try:
+        guard = _load_config()["preserve_detail"]
+        if guard:
+            before = _read_stored_detail(m3u_movie_relation_id)
+    except Exception:
+        logger.exception(
+            "[VOD-MERGE] could not snapshot detail for rel=%s; the refresh "
+            "proceeds unguarded", m3u_movie_relation_id)
+        guard = False
+
+    result = original(m3u_movie_relation_id, force_refresh=force_refresh)
+
+    if guard and before:
+        try:
+            _restore_dropped_detail(m3u_movie_relation_id, before)
+        except Exception:
+            logger.exception(
+                "[VOD-MERGE] could not restore dropped detail for rel=%s",
+                m3u_movie_relation_id)
+    return result
+
+
+def _refresh_binding_sites():
+    """Every module namespace holding its own reference to core's refresh.
+
+    Module-attribute patching only reaches a caller that looks the name up at
+    CALL time. `apps/output/views.py` imports it inside the function, so it
+    does. `apps/vod/api_views.py` imports it at module level, binding whatever
+    the attribute pointed at when api_views was first imported -- so patching
+    `apps.vod.tasks` alone reaches that caller only when api_views is imported
+    after us. At boot it is, because the URLconf loads lazily; on an
+    enable-without-restart it is not, and the UI movie-open path would keep
+    calling the unguarded original.
+
+    So patch both. api_views is only touched when already imported: importing
+    it ourselves during startup would drag the whole API layer in early, for a
+    module that is about to be imported anyway.
+    """
+    import sys
+    from apps.vod import tasks as vod_tasks
+
+    sites = [vod_tasks]
+    api_views = sys.modules.get("apps.vod.api_views")
+    if api_views is not None and hasattr(api_views,
+                                         "refresh_movie_advanced_data"):
+        sites.append(api_views)
+    return sites
+
+
 def _plugin_file(name: str) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
 
@@ -1885,7 +2164,8 @@ def install(manage_schedule=None) -> bool:
     re-establishes it without every worker racing on the same row.
     """
     global _orig_process_series_batch, _orig_process_movie_batch
-    global _orig_handle_movie_id_conflicts, _ACTIVE
+    global _orig_handle_movie_id_conflicts, _orig_refresh_movie_advanced_data
+    global _ACTIVE
 
     try:
         from apps.vod import tasks as vod_tasks
@@ -1923,10 +2203,30 @@ def install(manage_schedule=None) -> bool:
                 "[VOD-MERGE] tasks.handle_movie_id_conflicts missing -- merge "
                 "protection NOT installed (upstream may have changed it)")
 
+        # Same treatment, and the same reason it must not fail the install:
+        # absent = detail is unguarded, not = merging is broken. Patched in
+        # every namespace that binds it, which is more than one.
+        preserve = 0
+        if hasattr(vod_tasks, "refresh_movie_advanced_data"):
+            for site in _refresh_binding_sites():
+                original = _wrap(site, "refresh_movie_advanced_data",
+                                 patched_refresh_movie_advanced_data)
+                if original is not None:
+                    _orig_refresh_movie_advanced_data = original
+                preserve += 1
+        else:
+            logger.warning(
+                "[VOD-MERGE] tasks.refresh_movie_advanced_data missing -- "
+                "detail preservation NOT installed (upstream may have "
+                "changed it)")
+
         _ACTIVE = True
         logger.info(
-            "[VOD-MERGE] installed series + movie batch wrappers%s in pid=%s",
-            " + destructive-merge protection" if protect else "", os.getpid(),
+            "[VOD-MERGE] installed series + movie batch wrappers%s%s in pid=%s",
+            " + destructive-merge protection" if protect else "",
+            " + detail preservation (%d binding site%s)" % (
+                preserve, "" if preserve == 1 else "s") if preserve else "",
+            os.getpid(),
         )
     except Exception as exc:
         logger.exception("[VOD-MERGE] install failed: %s", exc)
@@ -1963,6 +2263,16 @@ def uninstall() -> bool:
                 getattr(vod_tasks, attr, None), _PATCH_TAG, False
             ):
                 setattr(vod_tasks, attr, original)
+
+        # This one can be bound in more than one namespace, so it is restored
+        # per site rather than on `vod_tasks` alone -- otherwise the UI
+        # movie-open path would keep calling our wrapper after a disable.
+        if _orig_refresh_movie_advanced_data is not None:
+            for site in _refresh_binding_sites():
+                if getattr(getattr(site, "refresh_movie_advanced_data", None),
+                           _PATCH_TAG, False):
+                    setattr(site, "refresh_movie_advanced_data",
+                            _orig_refresh_movie_advanced_data)
     except Exception as exc:
         logger.debug("[VOD-MERGE] uninstall patch error: %s", exc)
     invalidate_index_cache()

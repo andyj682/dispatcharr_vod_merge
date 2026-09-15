@@ -7,6 +7,98 @@ Everything through 0.8.3 landed during initial development against a single
 large live library; the entries below record *why* each change was needed, since
 several were driven by failures that were invisible from the outside.
 
+## 1.2.0 — 2026-09-10
+
+Two changes, both about the boundary between what this plugin writes and what
+Dispatcharr writes. Neither alters how anything is merged.
+
+**Changed — the detail sweep no longer writes Dispatcharr's fields**
+
+- The sweep used to mark each relation it fetched with core's `detailed_fetched`
+  and `last_advanced_refresh`. It now records a timestamp under its own
+  `vod_merge` key in the relation's `custom_properties` and leaves core's fields
+  alone.
+
+  Those two fields are the **only** record anywhere in Dispatcharr that a client
+  asked for a particular movie's detail. Writing them ourselves destroyed that
+  distinction: every relation the sweep touched became indistinguishable from
+  one somebody actually requested.
+
+  It also suppressed real work. `refresh_movie_advanced_data` skips when
+  `detailed_fetched` is set and `last_advanced_refresh` is inside 24 hours, and
+  the sweep set both **without calling that function** — so a client asking an
+  hour after a sweep got the early return instead of a fetch. That was harmless
+  only for as long as the sweep happened to call the same endpoint and store the
+  same payload.
+
+  The general rule, which is why this was worth a release: **a sweep must not
+  write the field it reads.** This one can obey it because its mechanism is
+  distinct from the mechanism that records the signal.
+
+- **Consequence, and it is deliberate:** a relation the sweep has fetched no
+  longer looks "already fetched" to Dispatcharr, so opening that movie triggers
+  a real provider fetch where previously it did not. The provider's answer is
+  the better one, and the sweep's own resumability was never based on that flag
+  — it skips relations that already have stored detail — so nothing re-fetches
+  in bulk.
+
+- **Marks left by earlier versions are harmless and there is nothing to run.**
+  Dispatcharr's 24-hour skip stops treating them as fresh after a day, so they
+  suppress no work, and any sensible reading of the record is "asked for
+  recently" — a window those timestamps have already left. Only a query of the
+  form "has this *ever* been fetched" still sees them.
+
+**Added — `Preserve essential movie detail`, default ON**
+
+- Every time Dispatcharr fetches a movie's detail it **replaces** the stored
+  payload wholesale. Providers are not consistent between calls, so one that
+  returned a full stream description last time and a plot summary this time
+  silently erases the difference.
+
+  Three keys are worth more than the payload that carries them, and are now put
+  back if a fetch drops them: **`tmdb_id`**, this plugin's strongest movie
+  signal, whose loss quietly makes a mergeable duplicate unmergeable again;
+  **`video`**, the measured resolution and codec; and **`audio`**, which has no
+  fallback at all downstream — absent means "no opinion", so losing it does not
+  degrade a quality comparison, it removes one side of it.
+
+  A value the provider actually sent always wins. This only refills a hole, and
+  never reinstates stale data over a real answer.
+
+- Costs nothing in the case it was built for: a relation with no stored detail
+  has nothing to lose, so a bulk pass over fresh relations pays one extra query
+  each and writes nothing.
+
+- Restored keys are written to the audit log with their own action and tier, and
+  `Show status` reports whether the guard is live in that worker — the same
+  reasoning as the 1.1.0 protection: it is invisible when it is working.
+
+- **Not gated by `Dry run`**, and **fails open** — the opposite of the 1.1.0
+  protection, on purpose. That one fails closed because what it replaces is
+  destructive. Here there is nothing destructive to fall through to: core's
+  refresh is a feature someone is waiting on, and a fault in the guard must not
+  cost them the fetch.
+
+**Changed — settings help text**
+
+- `Prevent destructive movie merges` and `Preserve essential movie detail` both
+  have much shorter help text. The previous wording explained the upstream bug
+  in full, which belongs in this file and the README rather than in a settings
+  panel. Behaviour is unchanged.
+
+**Note on patching**
+
+`refresh_movie_advanced_data` is referenced from two places and they bind it
+differently: `apps/output/views.py` imports it inside the function, so it
+resolves at call time, while `apps/vod/api_views.py` imports it at module level
+and keeps its own reference. Patching only `apps.vod.tasks` reaches the second
+caller when that module is imported after the plugin, which is true at boot but
+**not** when the plugin is enabled without a restart. Both namespaces are now
+patched, and both restored on disable. (The 1.1.0 protection is unaffected —
+`handle_movie_id_conflicts` is resolved inside `tasks.py` itself.)
+
+152 offline tests, up from 135.
+
 ## 1.1.0 — 2026-09-06
 
 **Added — protection against a destructive Dispatcharr movie merge**

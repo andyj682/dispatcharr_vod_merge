@@ -109,7 +109,7 @@ def _format_log(data, limit=60):
 class Plugin:
     # UI title only; "Dispatcharr" is redundant inside the Dispatcharr UI.
     name = "VOD Merge"
-    version = "1.1.0"
+    version = "1.2.0"
     description = (
         "Durably merges duplicate VOD titles from providers that omit TMDB ids, "
         "by matching metadata like poster artwork and plot text to a title you "
@@ -155,16 +155,23 @@ class Plugin:
             "type": "boolean",
             "default": True,
             "help_text": (
-                "Fixes a Dispatcharr bug, independently of any merging this "
-                "plugin does. When you open a movie whose provider detail "
-                "carries a TMDB id belonging to another entry, Dispatcharr "
-                "merges them the wrong way round: it keeps the newer duplicate "
-                "and DELETES the established entry, which inherits the "
-                "provider's raw name and a new id. With this on, the duplicate "
-                "is folded into the established entry instead. Leave it on "
-                "unless your Dispatcharr version has fixed this upstream. Not "
-                "affected by 'Dry run' -- that would mean dry run permits the "
-                "data loss."
+                "Ensures duplicate movies are merged into established entries "
+                "instead of the other way around, fixing an existing "
+                "Dispatcharr bug. Applies even in \"dry run\" mode."
+            ),
+        },
+        {
+            "id": "preserve_detail",
+            "label": "Preserve essential movie detail",
+            "type": "boolean",
+            "default": True,
+            "help_text": (
+                "Preserves TMDB id and video and audio details for a library "
+                "item even if a provider returns less detail on one call than "
+                "it did on the last. Dispatcharr's default allows empty data "
+                "to overwrite existing data. A value the provider actually "
+                "sent always wins -- this only refills what went missing. "
+                "Applies even in \"dry run\" mode."
             ),
         },
         {
@@ -419,6 +426,9 @@ class Plugin:
                     # nothing bad happening looks exactly like never firing.
                     f"protect_merges={cfg['protect_merges']}"
                     f"{'' if _patch._orig_handle_movie_id_conflicts else ' (NOT INSTALLED in this worker)'}, "
+                    # Invisible when working, for the same reason.
+                    f"preserve_detail={cfg['preserve_detail']}"
+                    f"{'' if _patch._orig_refresh_movie_advanced_data else ' (NOT INSTALLED in this worker)'}, "
                     f"series_accounts={sorted(cfg['accounts']) or '<all>'}, "
                     f"movie_accounts={sorted(cfg['movie_accounts']) or '<all>'}, "
                     f"denylist={len(cfg['denylist'])}, "
