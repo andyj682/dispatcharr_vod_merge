@@ -109,7 +109,7 @@ def _format_log(data, limit=60):
 class Plugin:
     # UI title only; "Dispatcharr" is redundant inside the Dispatcharr UI.
     name = "VOD Merge"
-    version = "1.2.0"
+    version = "1.2.1"
     description = (
         "Durably merges duplicate VOD titles from providers that omit TMDB ids, "
         "by matching metadata like poster artwork and plot text to a title you "

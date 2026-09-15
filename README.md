@@ -10,7 +10,7 @@ whose type is not XC, because the signals are read from the XC listing payload
 and no other provider type exposes an equivalent. On an install with no XC
 accounts the plugin loads, reports cleanly, and does nothing.
 
-Validated against Dispatcharr 0.30.0.
+Validated against Dispatcharr 0.30.0 and 0.31.0.
 
 ## The problem
 
@@ -150,11 +150,23 @@ child**, not the web worker:
 
 ```bash
 docker logs dispatcharr 2>&1 | grep VOD-MERGE
+# Dispatcharr 0.31.0+ also files the container's output here, and rotates it:
+docker exec dispatcharr grep VOD-MERGE /data/logs/dispatcharr.log /data/logs/dispatcharr.log.1
 ```
 
 You want `installed series + movie batch wrappers ... in pid=N` for a Celery
 pid, and a `wrapper active in pid=N` line appears the first time a scan reaches
 it.
+
+**This check only works from 1.2.1 onwards.** Before that, plugin log records
+were discarded in Celery prefork children — the process the scan runs in — so
+those two lines could never appear there no matter how well the plugin was
+working. If you are reading an older log, their absence tells you nothing. See
+the 1.2.1 entry in [CHANGELOG.md](CHANGELOG.md).
+
+Timestamps are worth a caution when correlating: a line emitted inside a request
+or a Celery task carries your local zone with an offset, while one from a bare
+`manage.py shell` falls back to UTC without one.
 
 The same log line reports `+ destructive-merge protection` when that patch
 installed. **Look for that one in a web-worker pid too**, not just a Celery
@@ -671,7 +683,7 @@ next version bump.
 py -3 test_logic.py
 ```
 
-152 tests, no Django, no database, no Docker — the decision logic is pure.
+164 tests, no Django, no database, no Docker — the decision logic is pure.
 Covers both real-world failure modes that cost debugging time: the size-segment
 URL with no filename, and a placeholder asset shared across many titles.
 

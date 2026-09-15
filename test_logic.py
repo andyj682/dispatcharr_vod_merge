@@ -14,6 +14,7 @@ the plot-tier matches that no name scheme could reach (a French-titled canonical
 one truncated with an ellipsis).
 """
 
+import logging
 import re
 import unittest
 
@@ -882,6 +883,225 @@ class TrimMatchesTests(unittest.TestCase):
     def test_survives_reports_with_no_matches_key(self):
         for r in ({}, {"tally": {}}, {"matches": None}, {"matches": "nope"}):
             self.assertIs(patch.trim_matches(r, cap=10), r)
+
+
+class SignatureParityTests(unittest.TestCase):
+    """Every wrapper must accept what core passes AND forward it.
+
+    A signature mismatch raises during argument BINDING -- before the function
+    body, so before any `_ACTIVE` check and before the wrapper's own
+    `try/except`. Fail-open design does not cover it, and the plugin's own
+    enable setting cannot either. It is the one upstream change that turns
+    "quietly stopped helping" into a hard failure; a sibling plugin took a total
+    VOD-playback outage that way when a hooked function gained a keyword.
+
+    These tests deliberately encode NO parameter list, so they survive the next
+    added argument as well as this one. Accepting without forwarding is the
+    subtler bug -- it silently drops something core was relying on -- so each
+    case asserts the extras arrived at the original.
+    """
+
+    def setUp(self):
+        self.seen = []
+        self._saved = {}
+        for name in ("_orig_process_series_batch", "_orig_process_movie_batch",
+                     "_orig_handle_movie_id_conflicts",
+                     "_orig_refresh_movie_advanced_data"):
+            self._saved[name] = getattr(patch, name)
+        self._saved["is_enabled"] = patch.is_enabled
+        self._saved["_load_config"] = patch._load_config
+        # Keep the wrappers on their delegate-only paths: this suite is about
+        # argument plumbing, not injection or protection behaviour.
+        patch.is_enabled = lambda: False
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        for name, value in self._saved.items():
+            setattr(patch, name, value)
+
+    def _spy(self, retval=None):
+        def fake(*a, **kw):
+            self.seen.append((a, kw))
+            return retval
+        return fake
+
+    def test_series_batch_accepts_and_forwards(self):
+        patch._orig_process_series_batch = self._spy("ok")
+        result = patch.patched_process_series_batch(
+            "acct", [], {}, {}, "scan_start", "extra_positional",
+            future_kwarg="x",
+        )
+        self.assertEqual(result, "ok")
+        (args, kwargs), = self.seen
+        self.assertIn("extra_positional", args)
+        self.assertEqual(kwargs.get("future_kwarg"), "x")
+
+    def test_movie_batch_accepts_and_forwards(self):
+        patch._orig_process_movie_batch = self._spy("ok")
+        result = patch.patched_process_movie_batch(
+            "acct", [], {}, {}, "scan_start", "extra_positional",
+            future_kwarg="x",
+        )
+        self.assertEqual(result, "ok")
+        (args, kwargs), = self.seen
+        self.assertIn("extra_positional", args)
+        self.assertEqual(kwargs.get("future_kwarg"), "x")
+
+    def test_refresh_movie_advanced_data_accepts_and_forwards(self):
+        patch._orig_refresh_movie_advanced_data = self._spy("done")
+        patch._load_config = lambda force=False: {"preserve_detail": False}
+        result = patch.patched_refresh_movie_advanced_data(
+            123, True, "extra_positional", future_kwarg="x",
+        )
+        self.assertEqual(result, "done")
+        (args, kwargs), = self.seen
+        # force_refresh must stay positional so a new third parameter lands in
+        # the right slot rather than colliding with it.
+        self.assertEqual(args[0], 123)
+        self.assertEqual(args[1], True)
+        self.assertIn("extra_positional", args)
+        self.assertEqual(kwargs.get("future_kwarg"), "x")
+
+    def test_handle_movie_id_conflicts_forwards_when_delegating(self):
+        # With protection off this wrapper delegates, and must pass extras on.
+        patch._orig_handle_movie_id_conflicts = self._spy(("movie", True))
+        patch._load_config = lambda force=False: {"protect_merges": False}
+        result = patch.patched_handle_movie_id_conflicts(
+            "cur", "rel", "tmdb", "imdb", "extra_positional", future_kwarg="x",
+        )
+        self.assertEqual(result, ("movie", True))
+        (args, kwargs), = self.seen
+        self.assertIn("extra_positional", args)
+        self.assertEqual(kwargs.get("future_kwarg"), "x")
+
+    def test_unexpected_args_are_reported_once_per_shape(self):
+        # Forwarding stops the crash; it does not make us correct. An unhandled
+        # new parameter must leave a trace rather than vanish.
+        patch._extra_logged.clear()
+        self.addCleanup(patch._extra_logged.clear)
+        with self.assertLogs("plugins.dispatcharr_vod_merge", level="WARNING") as cm:
+            patch._note_unexpected_args("some_hook", ("a",), {"b": 1})
+        self.assertTrue(any("does not know" in m for m in cm.output))
+
+        # Same shape again: silent, because these are hot paths.
+        patch._note_unexpected_args("some_hook", ("a",), {"b": 1})
+        self.assertEqual(len(patch._extra_logged), 1)
+
+    def test_every_wrapper_accepts_extra_args(self):
+        """Structural, so it covers wrappers that do not exist yet.
+
+        The per-wrapper tests above each name a function; this one asserts the
+        rule itself, so a NEW wrapper added without `*args, **kwargs` fails the
+        suite even though nobody wrote a test for it.
+        """
+        import ast
+        import inspect
+        import os
+
+        source = os.path.join(
+            os.path.dirname(os.path.abspath(inspect.getfile(patch))), "patch.py"
+        )
+        with open(source, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+
+        wrappers = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name.startswith("patched_")
+        ]
+        self.assertTrue(wrappers, "no wrappers found -- test is not testing anything")
+
+        unhardened = [
+            node.name for node in wrappers
+            if node.args.vararg is None or node.args.kwarg is None
+        ]
+        self.assertEqual(
+            unhardened, [],
+            "these wrappers would raise TypeError at argument binding if "
+            "Dispatcharr adds a parameter, which fails ahead of every guard "
+            "they have: %s" % unhardened,
+        )
+
+    def test_no_report_when_core_passes_nothing_new(self):
+        patch._extra_logged.clear()
+        self.addCleanup(patch._extra_logged.clear)
+        patch._note_unexpected_args("some_hook", (), {})
+        self.assertEqual(patch._extra_logged, set())
+
+
+class LogLevelAdoptionTests(unittest.TestCase):
+    """The plugin's logger must carry its own level.
+
+    Plugin loggers have no entry in Dispatcharr's logging config, so without
+    this they inherit root -- and billiard leaves root at WARNING in Celery
+    prefork children, which is exactly where the VOD scan runs. The result was
+    that every scan-time line this plugin emits was discarded at the logger,
+    making a working wrapper indistinguishable from an absent one. Pinned
+    because the failure is invisible by construction.
+    """
+
+    def setUp(self):
+        self.plugin_logger = logging.getLogger("plugins.dispatcharr_vod_merge")
+        self.apps_logger = logging.getLogger("apps")
+        self._plugin_level = self.plugin_logger.level
+        self._apps_level = self.apps_logger.level
+        self.addCleanup(self.plugin_logger.setLevel, self._plugin_level)
+        self.addCleanup(self.apps_logger.setLevel, self._apps_level)
+
+    def test_module_logger_does_not_inherit_root(self):
+        # As imported, patch.py must already have given it a level.
+        self.assertNotEqual(patch.logger.level, logging.NOTSET)
+
+    def test_adopts_the_apps_logger_level(self):
+        # Respects DISPATCHARR_LOG_LEVEL rather than forcing INFO: `apps` keeps
+        # its configured level in prefork children, which is why its records
+        # survive where ours did not.
+        self.apps_logger.setLevel(logging.DEBUG)
+        self.plugin_logger.setLevel(logging.NOTSET)
+        patch._adopt_log_level()
+        self.assertEqual(self.plugin_logger.level, logging.DEBUG)
+
+    def test_does_not_override_a_level_already_set(self):
+        # A caller or test that deliberately silences this logger keeps control.
+        self.plugin_logger.setLevel(logging.CRITICAL)
+        patch._adopt_log_level()
+        self.assertEqual(self.plugin_logger.level, logging.CRITICAL)
+
+    def test_info_survives_a_warning_root(self):
+        # The exact production condition: root at WARNING, our logger with a
+        # level of its own, handler on root. The record must still be emitted.
+        root = logging.getLogger()
+        prev_root_level = root.level
+        self.addCleanup(root.setLevel, prev_root_level)
+        root.setLevel(logging.WARNING)
+
+        seen = []
+
+        class Capture(logging.Handler):
+            def emit(self, record):
+                seen.append(record.getMessage())
+
+        handler = Capture(level=0)
+        root.addHandler(handler)
+        self.addCleanup(root.removeHandler, handler)
+
+        self.apps_logger.setLevel(logging.INFO)
+        self.plugin_logger.setLevel(logging.NOTSET)
+        patch._adopt_log_level()
+        self.plugin_logger.info("scan-time line")
+
+        self.assertIn("scan-time line", seen)
+
+    def test_inheriting_root_would_have_dropped_it(self):
+        # The negative control: without a level of its own the record is
+        # discarded at the logger, which is the bug this guards.
+        root = logging.getLogger()
+        prev_root_level = root.level
+        self.addCleanup(root.setLevel, prev_root_level)
+        root.setLevel(logging.WARNING)
+
+        self.plugin_logger.setLevel(logging.NOTSET)
+        self.assertFalse(self.plugin_logger.isEnabledFor(logging.INFO))
 
 
 class RestoreEssentialTests(unittest.TestCase):

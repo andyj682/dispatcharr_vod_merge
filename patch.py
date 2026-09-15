@@ -103,6 +103,45 @@ import logging
 
 logger = logging.getLogger("plugins.dispatcharr_vod_merge")
 
+
+def _adopt_log_level() -> None:
+    """Give this logger a level of its own instead of inheriting root's.
+
+    Dispatcharr's logging config names every logger it cares about --
+    `apps`, `celery`, `core.tasks` and so on -- and gives each an explicit
+    handler with `propagate: False`. Plugin loggers are not in that list, so
+    they carry no level and inherit whatever root happens to be set to.
+
+    That is fine in the web workers, where root sits at the configured level.
+    It is NOT fine in a Celery PREFORK CHILD: billiard reconfigures root in
+    each forked child and leaves it at WARNING, so every `logger.info()` from
+    a plugin is discarded at the logger, before any handler sees it. The VOD
+    scan runs in exactly that process, which meant this plugin's scan-time
+    output -- the install line, the wrapper-active line, the per-batch tally --
+    was invisible precisely where it mattered, while core's own `apps.*` lines
+    came through fine. The wrappers were running; only the evidence was gone.
+
+    Measured on Dispatcharr 0.31.0: root level 20 in uWSGI, daphne and the
+    prefork parent, but 30 in the prefork children, whose root handler
+    identifies itself with billiard's SUBDEBUG level name.
+
+    We adopt the level of the `apps` logger rather than forcing INFO, so
+    `DISPATCHARR_LOG_LEVEL` is still respected -- `apps` keeps its explicitly
+    configured level in the children, which is why its records survive. Only
+    set it if nothing has set one already, so a caller (or a test) that
+    deliberately silences this logger keeps control.
+    """
+    try:
+        if logger.level != logging.NOTSET:
+            return
+        reference = logging.getLogger("apps").getEffectiveLevel()
+        logger.setLevel(reference or logging.INFO)
+    except Exception:  # never let logging setup break the import
+        pass
+
+
+_adopt_log_level()
+
 try:
     from celery import shared_task
 except Exception:  # pragma: no cover - celery is always present at runtime
@@ -254,6 +293,48 @@ _mix_cache_ts = 0.0
 # --------------------------------------------------------------------------- #
 # Small helpers
 # --------------------------------------------------------------------------- #
+
+_extra_logged = set()
+
+
+def _note_unexpected_args(where: str, args, kwargs) -> None:
+    """Report, once per shape, that core passed something this version predates.
+
+    Every wrapper here ends `*args, **kwargs` and forwards them, so a new
+    upstream parameter cannot break argument binding. That matters more than it
+    sounds: a signature mismatch raises BEFORE the function body, so it lands
+    ahead of any `_ACTIVE` check and ahead of our own `try/except` -- it is the
+    one upstream change that turns "this plugin quietly stopped helping" into a
+    hard failure. A sibling plugin took exactly that outage when a hooked
+    function gained a keyword argument.
+
+    But forwarding only buys us the crash. It does not make us CORRECT. If the
+    new parameter carries meaning -- the release that caused that outage added a
+    per-user permission allowlist -- then a wrapper that replaces core's work, or
+    post-processes it, may now be silently dropping a constraint core was
+    enforcing. Nothing useful can be decided automatically, so leave a trace
+    instead of failing silently.
+
+    Deduped by (site, arity, keyword names) because these are hot paths, and
+    logged at WARNING so it survives a worker whose root logger sits above INFO.
+    """
+    try:
+        if not args and not kwargs:
+            return
+        key = (where, len(args), tuple(sorted(kwargs)))
+        if key in _extra_logged:
+            return
+        _extra_logged.add(key)
+        logger.warning(
+            "[VOD-MERGE] %s got arguments this plugin version does not know "
+            "about (%d positional, keywords=%s). They were forwarded to core "
+            "unchanged. If they carry meaning this wrapper may need to HONOUR "
+            "them -- check the Dispatcharr release notes.",
+            where, len(args), sorted(kwargs) or "none",
+        )
+    except Exception:
+        pass
+
 
 def _log_pid_once(where: str) -> None:
     """Log once per (pid, where) so you can confirm the patch reached BOTH the
@@ -885,13 +966,20 @@ def inject_batch(account, batch, categories=None, relations=None) -> dict:
     return tally
 
 
-def patched_process_series_batch(account, batch, categories, relations, scan_start_time=None):
+def patched_process_series_batch(account, batch, categories, relations,
+                                 scan_start_time=None, *args, **kwargs):
     """Wrapper: inject before the original computes the merge key.
 
     The original is called unconditionally, and injection is fully guarded -- a
     fault in this plugin must degrade to "no merging", never to a failed scan.
+
+    Signature-agnostic: anything core grows is accepted and forwarded rather
+    than raising during argument binding. Core still runs, so a new parameter is
+    honoured by core itself; the only risk is one that changes how core
+    INTERPRETS the batch we just mutated, which `_note_unexpected_args` surfaces.
     """
     _log_pid_once("series-batch wrapper active")
+    _note_unexpected_args("process_series_batch", args, kwargs)
     try:
         if is_enabled():
             tally = inject_batch(account, batch, categories, relations)
@@ -905,7 +993,7 @@ def patched_process_series_batch(account, batch, categories, relations, scan_sta
         logger.exception("[VOD-MERGE] injection failed; continuing unpatched")
 
     return _orig_process_series_batch(
-        account, batch, categories, relations, scan_start_time
+        account, batch, categories, relations, scan_start_time, *args, **kwargs
     )
 
 
@@ -1601,9 +1689,14 @@ def inject_movie_batch(account, batch, categories=None, relations=None) -> dict:
     return tally
 
 
-def patched_process_movie_batch(account, batch, categories, relations, scan_start_time=None):
-    """Wrapper: inject before the original computes the merge key."""
+def patched_process_movie_batch(account, batch, categories, relations,
+                                scan_start_time=None, *args, **kwargs):
+    """Wrapper: inject before the original computes the merge key.
+
+    Signature-agnostic for the same reasons as the series wrapper above.
+    """
     _log_pid_once("movie-batch wrapper active")
+    _note_unexpected_args("process_movie_batch", args, kwargs)
     try:
         if is_enabled():
             tally = inject_movie_batch(account, batch, categories, relations)
@@ -1617,7 +1710,7 @@ def patched_process_movie_batch(account, batch, categories, relations, scan_star
         logger.exception("[VOD-MERGE] movie injection failed; continuing unpatched")
 
     return _orig_process_movie_batch(
-        account, batch, categories, relations, scan_start_time
+        account, batch, categories, relations, scan_start_time, *args, **kwargs
     )
 
 
@@ -1803,18 +1896,40 @@ def decide_conflict(current_id, tmdb_holder_id, imdb_holder_id, has_relation):
 
 
 def patched_handle_movie_id_conflicts(current_movie, relation,
-                                      tmdb_id_to_set, imdb_id_to_set):
-    """Non-destructive replacement for core's `handle_movie_id_conflicts`."""
-    from django.db import transaction
-    from apps.vod.models import Movie
+                                      tmdb_id_to_set, imdb_id_to_set,
+                                      *args, **kwargs):
+    """Non-destructive replacement for core's `handle_movie_id_conflicts`.
+
+    This is the one wrapper here that REPLACES core rather than wrapping it:
+    when protection is on, the original never runs. So it carries the most
+    signature risk of the four -- any parameter core grows is one that NOTHING
+    honours unless this function is taught to.
+
+    ⚠ The instinct for a replace-shaped wrapper is "when in doubt, defer to
+    core". That is WRONG here, because core's behaviour on this path is the bug
+    we exist to prevent: deferring on an argument we do not recognise would
+    reinstate the destructive merge. So we keep protecting and log loudly
+    instead -- see `_note_unexpected_args`. The extras are still forwarded on
+    the one path that does delegate, below.
+    """
+    _note_unexpected_args("handle_movie_id_conflicts", args, kwargs)
 
     try:
         cfg = _load_config()
         if not cfg["protect_merges"]:
             if _orig_handle_movie_id_conflicts is not None:
                 return _orig_handle_movie_id_conflicts(
-                    current_movie, relation, tmdb_id_to_set, imdb_id_to_set)
+                    current_movie, relation, tmdb_id_to_set, imdb_id_to_set,
+                    *args, **kwargs)
             return current_movie, False
+
+        # Imported here rather than at the top of the function for two reasons:
+        # the delegate path above needs neither, and keeping them INSIDE the
+        # try means the fail-closed promise below actually covers them. An
+        # ImportError used to escape the very handler that exists to guarantee
+        # we never fall through to core's destructive version.
+        from django.db import transaction
+        from apps.vod.models import Movie
 
         def holder(field, value):
             if not value:
@@ -2033,7 +2148,7 @@ def _restore_dropped_detail(relation_id, before) -> list:
 
 
 def patched_refresh_movie_advanced_data(m3u_movie_relation_id,
-                                        force_refresh=False):
+                                        force_refresh=False, *args, **kwargs):
     """Run core's refresh, then repair the essential keys its write dropped.
 
     Fails OPEN, and deliberately not like `patched_handle_movie_id_conflicts`.
@@ -2043,10 +2158,20 @@ def patched_refresh_movie_advanced_data(m3u_movie_relation_id,
     fault in our guard must not cost them the fetch. The original is called
     exactly once whatever happens, and its return value is passed back
     untouched.
+
+    Signature risk sits in the middle of the four. Core still runs, so a new
+    parameter is honoured by core -- but this wrapper REPAIRS core's write
+    afterwards, and a parameter that made core deliberately write LESS (a
+    partial or lightweight refresh, say) would have us refilling keys core
+    meant to omit, fighting its intent rather than repairing an accident. We
+    cannot currently tell "the provider dropped this" from "core chose not to
+    write it", so `_note_unexpected_args` flags the case for a human.
     """
     original = _orig_refresh_movie_advanced_data
     if original is None:                 # not installed; nothing to delegate to
         return None
+
+    _note_unexpected_args("refresh_movie_advanced_data", args, kwargs)
 
     before = None
     guard = False
@@ -2060,7 +2185,10 @@ def patched_refresh_movie_advanced_data(m3u_movie_relation_id,
             "proceeds unguarded", m3u_movie_relation_id)
         guard = False
 
-    result = original(m3u_movie_relation_id, force_refresh=force_refresh)
+    # force_refresh passed POSITIONALLY on purpose: if core grows a third
+    # parameter, `*args` then lands in the right slot. Passing it by keyword
+    # ahead of `*args` would collide the moment a positional extra appeared.
+    result = original(m3u_movie_relation_id, force_refresh, *args, **kwargs)
 
     if guard and before:
         try:

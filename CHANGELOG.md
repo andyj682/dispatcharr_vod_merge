@@ -7,6 +7,80 @@ Everything through 0.8.3 landed during initial development against a single
 large live library; the entries below record *why* each change was needed, since
 several were driven by failures that were invisible from the outside.
 
+## 1.2.1 — 2026-09-15
+
+**Fixed — the plugin's scan-time logging was being discarded**
+
+- Nothing about merging changes. What changes is that you can now *see* it
+  happen.
+
+  Dispatcharr's logging configuration names every logger it manages — `apps`,
+  `celery`, `core.tasks` and so on — and gives each an explicit handler with
+  `propagate: False`. Plugin loggers are not in that list, so they carry no
+  level of their own and inherit whatever the root logger is set to.
+
+  That is harmless in the web workers, where root sits at the configured
+  level. It is not harmless in a Celery **prefork child**: billiard
+  reconfigures root there and leaves it at `WARNING`. The VOD scan runs in
+  exactly that process — so this plugin's install line, its wrapper-active
+  line and its per-batch injection tally were all discarded at the logger,
+  before any handler saw them, while Dispatcharr's own `apps.*` lines from the
+  same process came through normally.
+
+  The wrappers were running the whole time. Only the evidence was missing —
+  which made a working plugin indistinguishable from an absent one, and cost a
+  long and thoroughly misdirected investigation to establish.
+
+- The logger now takes its level from the `apps` logger rather than inheriting
+  root, so `DISPATCHARR_LOG_LEVEL` is still respected. A level set by anything
+  else — a test, or an operator silencing the plugin — is left alone.
+
+- Pinned by tests, including a negative control asserting that a logger
+  inheriting a `WARNING` root *would* have dropped the record. 157 offline
+  tests, up from 152.
+
+**If you upgrade and suddenly see new log lines from this plugin, that is the
+fix working** — those lines were always being emitted, just never recorded.
+
+**Hardened — wrappers survive a Dispatcharr signature change**
+
+- All four wrappers now end their signatures with `*args, **kwargs` and forward
+  them at every call site of the original.
+
+  This is not tidiness. A signature mismatch raises during **argument
+  binding** — before the function body, so before this plugin's own `_ACTIVE`
+  check and before its `try/except`. The fail-open design that protects every
+  other failure mode does not cover it, and neither does turning the plugin's
+  feature off, because the error precedes any setting lookup. Only disabling
+  the plugin outright recovers it. A sibling plugin took a total VOD-playback
+  outage this way when a hooked Dispatcharr function gained a keyword argument.
+
+- **Forwarding stops the crash; it does not make the wrapper correct.** If a new
+  parameter carries meaning — the release behind that outage added a per-user
+  permission allowlist — then a wrapper that replaces core's work, or
+  post-processes it, may silently drop a constraint core was enforcing. Nothing
+  useful can be decided automatically, so unrecognised arguments are now logged
+  once per shape, at `WARNING`, naming the hook.
+
+  Two of the four carry real risk and say so in their docstrings: the
+  destructive-merge protection *replaces* core, so any new parameter is one
+  nothing honours unless it is taught to — and for that one the usual instinct
+  of "when in doubt defer to core" is wrong, because core's behaviour on that
+  path is the bug. The detail-preservation wrapper repairs core's write
+  afterwards, so a parameter making core deliberately write *less* would have it
+  refilling keys core meant to omit.
+
+- Also fixed while in there: the destructive-merge protection imported
+  `django.db` and the `Movie` model *outside* its own `try`, so an `ImportError`
+  would have escaped the handler that exists to guarantee it never falls through
+  to core's destructive version. Those imports moved inside, and after the
+  delegate path, which needs neither.
+
+- Pinned by parity tests that encode **no parameter list**, so they survive the
+  next added argument too: each asserts an unknown argument is accepted *and*
+  observed arriving at the original. Accepting without forwarding is the subtler
+  bug. 164 offline tests, up from 152 in 1.2.0.
+
 ## 1.2.0 — 2026-09-10
 
 Two changes, both about the boundary between what this plugin writes and what
