@@ -191,6 +191,7 @@ the other. Listed in the order the UI shows them.
 | **Merge movies** | off | Merge duplicate movies. Off by default so an upgrade never starts merging movies on its own. |
 | **Prevent destructive movie merges** | on | Fixes an upstream Dispatcharr bug; independent of this plugin's own merging. See [Protecting against a destructive core merge](#protecting-against-a-destructive-core-merge). Not affected by dry run. |
 | **Preserve essential movie detail** | on | Puts back the TMDB id, video and audio details when a Dispatcharr detail fetch drops them. Also an upstream fix rather than a merging change. See [Preserving detail a refresh drops](#preserving-detail-a-refresh-drops). Not affected by dry run. |
+| **Prevent catalogue deletion after an empty listing** | on | Blocks Dispatcharr's post-scan cleanup when a provider returns nothing, which otherwise deletes that account's whole catalogue. A third upstream fix, unrelated to merging. See [Surviving an empty provider listing](#surviving-an-empty-provider-listing). Not affected by dry run. |
 | **Limit series merging to accounts** | *(empty = all)* | Account names to merge series **from**. The canonical can live on any account. |
 | **Limit movie merging to accounts** | *(empty = all)* | The movie equivalent, **independent of the series list**. Also bounds which accounts the detail sweep looks up, so scope and sweep stay in step. |
 | **Tag movies no other providers have** | off | Lets the detail tier *create* a newly tagged movie rather than only merging into an existing one. Changes those movies' Dispatcharr ids now, and they revert if it is turned off. |
@@ -567,6 +568,47 @@ If you ran the sweep on an earlier version, its marks are still there and are
 so they suppress nothing after that, and anything reading the record sensibly
 reads it as "asked for recently" — a window those old timestamps have already
 fallen out of. There is no cleanup step to run.
+
+## Surviving an empty provider listing
+
+A third upstream fix, unrelated to merging, controlled by **Prevent catalogue
+deletion after an empty listing** (on by default).
+
+Every VOD scan ends with a cleanup pass. It deletes any relation the scan did
+not see, and then deletes every library item left with no relations from any
+account. That is right while "the scan did not see it" means "the provider no
+longer has it".
+
+It is wrong when a provider's movie endpoint returns an **empty list**. The scan
+sees nothing, so every relation on that account is stale, so all of them go —
+along with every title that account was the only source for. The titles return
+on the next good scan, but as **new rows with new ids**. Saved links break, and
+anything that remembered the old ids silently points at nothing.
+
+This is observed behaviour, not a worry. On one library an empty movie listing
+removed an account's entire set of movie relations and thousands of library
+items in a single scheduled refresh — while that same account's series, fetched
+seconds earlier over the same connection, came back complete. It is the kind of
+failure that leaves almost no trace: the cleanup reports itself as routine, and
+the count it logs is the smaller of the two numbers involved.
+
+Dispatcharr already guards the equivalent case one level up — a provider that
+returns no *categories* aborts the refresh instead of acting on the gap. The
+reasoning simply was not carried down to the movie and series lists.
+
+With this on, the plugin checks whether the scan that just finished saw **any**
+of that account's existing content. If it saw none, the cleanup is skipped for
+that scan and runs normally on the next one that returns something. The refusal
+is recorded in the log with its own action and appears in Dispatcharr's own
+cleanup line, so you do not have to go looking for it.
+
+**Only a completely empty result is refused.** A listing that merely comes back
+short is left alone. That is deliberate: a threshold would also block a catalogue
+that has genuinely shrunk, and because the unpruned rows keep the total high it
+would keep blocking it for ever. A partially short listing does proportional
+damage and is a real gap — it belongs upstream, and has been reported there.
+
+Turn it off only if your Dispatcharr version has fixed this upstream.
 
 ## Known limits
 

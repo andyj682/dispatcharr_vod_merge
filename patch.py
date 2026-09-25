@@ -246,6 +246,7 @@ TIER_MANUAL = "manual"
 TIER_DETAIL = "detail"   # movies: the tmdb the provider put in its own detail
 TIER_PROTECT = "protect"  # not a match at all -- a prevented destructive merge
 TIER_PRESERVE = "preserve"  # nor this -- essential detail a core write dropped
+TIER_PRUNE = "prune"        # nor this -- a refused catalogue-wide delete
 
 # Decision outcomes (also the audit-log `action` values).
 INJECT = "inject"
@@ -259,6 +260,7 @@ VARIANT = "variant"
 DENIED = "denied"
 PROTECTED = "protected"          # a destructive core merge was prevented
 PRESERVED = "preserved"          # detail a core refresh dropped was put back
+PRUNE_BLOCKED = "prune_blocked"  # a catalogue-wide delete after an empty listing
 
 # Values providers use to mean "no id" (mirrors the core cleaning in tasks.py).
 _BLANK_IDS = ("", "0", "none", "null")
@@ -273,6 +275,7 @@ _orig_process_series_batch = None
 _orig_handle_movie_id_conflicts = None
 _orig_process_movie_batch = None
 _orig_refresh_movie_advanced_data = None
+_orig_cleanup_orphaned_vod_content = None
 _PATCH_TAG = "_vodmerge_patched"
 
 _pid_logged = set()
@@ -461,6 +464,11 @@ def _load_config(force: bool = False) -> dict:
         # be able to switch it off either.
         "preserve_detail": _as_bool(
             settings.get("preserve_detail"), DEFAULT_PRESERVE_DETAIL),
+        # And the same again -- this is the most destructive of the three, so it
+        # is the last one that should be switchable by a flag meaning "do not
+        # inject".
+        "protect_prune": _as_bool(
+            settings.get("protect_prune"), DEFAULT_PROTECT_PRUNE),
         "merge_series": _as_bool(settings.get("merge_series"), DEFAULT_MERGE_SERIES),
         "merge_movies": _as_bool(settings.get("merge_movies"), DEFAULT_MERGE_MOVIES),
         "scheduled_sweep": _as_bool(
@@ -2200,6 +2208,148 @@ def patched_refresh_movie_advanced_data(m3u_movie_relation_id,
     return result
 
 
+# --------------------------------------------------------------------------- #
+# Protection: a catalogue-wide delete triggered by an empty listing
+# --------------------------------------------------------------------------- #
+# `refresh_vod_content` ends every scan with
+# `cleanup_orphaned_vod_content(account_id=..., scan_start_time=...)`, and that
+# runs with `stale_days=0`, so the cutoff is the scan's own start: any relation
+# not re-stamped DURING the scan is stale and is deleted. Then a second,
+# DELIBERATELY UNSCOPED pass deletes every Movie left with no relations from any
+# account.
+#
+# That is correct only while "the scan did not see it" implies "the provider no
+# longer has it". When a provider's movie endpoint returns an EMPTY list, the
+# scan sees nothing, so every relation on the account is stale and the whole
+# catalogue goes -- along with every title that account was the sole source for.
+# The rows come back on the next good scan with NEW primary keys, which is an id
+# churn for every downstream consumer.
+#
+# Core guards the equivalent case one layer up: `refresh_categories` returning
+# nothing aborts the refresh "to preserve existing category selections". The
+# same reasoning was never applied to the movie and series lists.
+#
+# Observed live: an empty movie listing deleted an entire account's movie
+# relations and thousands of Movie rows in one scheduled refresh, while series
+# in the same run processed normally.
+#
+# We do NOT try to repair or second-guess the cleanup -- we refuse it outright
+# for that scan and let the next one do it. A deferred cleanup costs some stale
+# rows for a day; the alternative costs the catalogue.
+
+DEFAULT_PROTECT_PRUNE = True
+
+
+def decide_prune(counts):
+    """Pure: should core's cleanup be allowed to run? -> (allow, reason).
+
+    `counts` maps a content type to `(total, seen)` for one account, where
+    `seen` is the number of that account's relations that would SURVIVE core's
+    staleness filter. Refuse when a content type has relations and the scan
+    re-stamped none of them, because that is the empty-listing signature and
+    nothing else produces it.
+
+    Deliberately ZERO-seen only, not a ratio. A ratio threshold would also catch
+    a listing that came back 90% short, but a genuinely shrinking catalogue
+    would then be refused for ever -- the stale rows keep the total high, so the
+    ratio never recovers and the cleanup deadlocks. Zero-seen has no such state:
+    one good scan clears it. The short-listing case is left to upstream.
+    """
+    for kind in sorted(counts):
+        total, seen = counts[kind]
+        if total and not seen:
+            return False, "%s: %d relations exist, none seen in this scan" % (
+                kind, total)
+    return True, None
+
+
+def _prune_counts(account_id, cutoff):
+    """(total, surviving) relation counts per content type for one account."""
+    from apps.vod.models import M3UMovieRelation, M3USeriesRelation
+
+    counts = {}
+    for kind, model in (("movie", M3UMovieRelation), ("series", M3USeriesRelation)):
+        qs = model.objects.filter(m3u_account_id=account_id)
+        total = qs.count()
+        counts[kind] = (total, qs.filter(last_seen__gte=cutoff).count() if total else 0)
+    return counts
+
+
+def patched_cleanup_orphaned_vod_content(stale_days=0, scan_start_time=None,
+                                         account_id=None, *args, **kwargs):
+    """Refuse core's cleanup when the scan that preceded it saw nothing.
+
+    Only the per-account, per-scan call is assessed -- the path the failure
+    occurs on. An unscoped or timestamp-less call cannot be evaluated against a
+    scan at all, so it is delegated untouched.
+
+    Fails OPEN, unlike `patched_handle_movie_id_conflicts`. That one replaces
+    core because core's behaviour there IS the bug; here core's cleanup is
+    normally correct and only catastrophic under one condition, so an error in
+    our own check is not evidence that condition holds. Permanently disabling a
+    correct cleanup on a bug of ours would be its own slow data problem, and the
+    counts we need are two trivial queries -- if those fail, core's much larger
+    ones were not going to succeed either.
+    """
+    _note_unexpected_args("cleanup_orphaned_vod_content", args, kwargs)
+
+    original = _orig_cleanup_orphaned_vod_content
+    if original is None:
+        return None
+
+    def _delegate():
+        return original(stale_days, scan_start_time, account_id, *args, **kwargs)
+
+    try:
+        if not _load_config()["protect_prune"]:
+            return _delegate()
+        if account_id is None or scan_start_time is None:
+            return _delegate()
+
+        from datetime import timedelta
+
+        # Mirror core's own cutoff exactly, so "seen" means precisely "would
+        # survive core's filter" rather than an approximation of it.
+        cutoff = scan_start_time - timedelta(days=stale_days or 0)
+        counts = _prune_counts(account_id, cutoff)
+        allow, reason = decide_prune(counts)
+        if allow:
+            return _delegate()
+    except Exception:
+        logger.exception(
+            "[VOD-MERGE] prune guard could not evaluate account %s; allowing "
+            "core cleanup to proceed", account_id)
+        return _delegate()
+
+    logger.warning(
+        "[VOD-MERGE] REFUSED core VOD cleanup for account %s -- %s. An empty "
+        "provider listing would have deleted the account's relations and every "
+        "title it solely supplies. Cleanup will run on the next scan that sees "
+        "content.", account_id, reason,
+    )
+    try:
+        _append_log([{
+            "ts": time.time(),
+            "action": PRUNE_BLOCKED,
+            "tier": TIER_PRUNE,
+            "kind": "movie",
+            "account": str(account_id),
+            "stream_id": None,
+            "name": None,
+            "tmdb_id": None,
+            "reason": reason,
+            "counts": {k: list(v) for k, v in sorted(counts.items())},
+            "creates_new_row": False,
+        }])
+    except Exception:
+        logger.exception("[VOD-MERGE] could not log a refused cleanup")
+
+    # Returned as core's own result string, so the refusal appears in core's
+    # `VOD cleanup completed: ...` line even where our logger is silenced.
+    return ("Skipped by dispatcharr_vod_merge: %s -- refusing to delete an "
+            "entire catalogue after a scan that saw nothing" % reason)
+
+
 def _refresh_binding_sites():
     """Every module namespace holding its own reference to core's refresh.
 
@@ -2293,6 +2443,7 @@ def install(manage_schedule=None) -> bool:
     """
     global _orig_process_series_batch, _orig_process_movie_batch
     global _orig_handle_movie_id_conflicts, _orig_refresh_movie_advanced_data
+    global _orig_cleanup_orphaned_vod_content
     global _ACTIVE
 
     try:
@@ -2348,12 +2499,31 @@ def install(manage_schedule=None) -> bool:
                 "detail preservation NOT installed (upstream may have "
                 "changed it)")
 
+        # Third protective patch, same treatment: absent means the catalogue is
+        # unguarded against an empty listing, not that merging is broken.
+        # Single call site, in this module, resolved as a global at call time --
+        # so unlike `refresh_movie_advanced_data` this needs no binding-site
+        # sweep.
+        prune = False
+        if hasattr(vod_tasks, "cleanup_orphaned_vod_content"):
+            original = _wrap(vod_tasks, "cleanup_orphaned_vod_content",
+                             patched_cleanup_orphaned_vod_content)
+            if original is not None:
+                _orig_cleanup_orphaned_vod_content = original
+            prune = True
+        else:
+            logger.warning(
+                "[VOD-MERGE] tasks.cleanup_orphaned_vod_content missing -- "
+                "empty-listing protection NOT installed (upstream may have "
+                "changed it)")
+
         _ACTIVE = True
         logger.info(
-            "[VOD-MERGE] installed series + movie batch wrappers%s%s in pid=%s",
+            "[VOD-MERGE] installed series + movie batch wrappers%s%s%s in pid=%s",
             " + destructive-merge protection" if protect else "",
             " + detail preservation (%d binding site%s)" % (
                 preserve, "" if preserve == 1 else "s") if preserve else "",
+            " + empty-listing protection" if prune else "",
             os.getpid(),
         )
     except Exception as exc:
@@ -2384,6 +2554,7 @@ def uninstall() -> bool:
         from apps.vod import tasks as vod_tasks
         for attr, original in (
             ("handle_movie_id_conflicts", _orig_handle_movie_id_conflicts),
+            ("cleanup_orphaned_vod_content", _orig_cleanup_orphaned_vod_content),
             ("process_series_batch", _orig_process_series_batch),
             ("process_movie_batch", _orig_process_movie_batch),
         ):

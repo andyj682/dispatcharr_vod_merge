@@ -7,6 +7,53 @@ Everything through 0.8.3 landed during initial development against a single
 large live library; the entries below record *why* each change was needed, since
 several were driven by failures that were invisible from the outside.
 
+## 1.3.0 — 2026-09-18
+
+**Added — an empty provider listing no longer deletes your catalogue**
+
+- New setting, **Prevent catalogue deletion after an empty listing**, on by
+  default.
+
+  Every VOD scan ends with Dispatcharr's cleanup pass, which deletes any
+  relation it did not see during that scan and then deletes every library item
+  left with no relations from any account. That is correct while "the scan did
+  not see it" means "the provider no longer has it".
+
+  It stops being correct when a provider's movie endpoint returns an **empty**
+  list. The scan then sees nothing, so *every* relation on that account is
+  treated as stale and removed, taking with it every title that account was the
+  only source for. The items come back on the next good scan, but as **new
+  rows with new ids** — which breaks saved links and anything downstream that
+  remembered the old ones.
+
+  This was not theoretical. On one library an empty movie listing removed an
+  account's entire set of movie relations and thousands of library items in a
+  single scheduled refresh, while that same account's series — fetched seconds
+  earlier, over the same connection — came back complete.
+
+  Dispatcharr already guards the equivalent case one level up: if a provider
+  returns no *categories*, the refresh aborts rather than acting on the gap. The
+  same reasoning simply was not applied to the movie and series lists.
+
+  With this setting on, the plugin checks whether the scan that just ran saw
+  *any* of the account's existing content. If it saw none, the cleanup is
+  refused for that scan and runs normally on the next one that returns content.
+  The refusal is written to the plugin log and appears in Dispatcharr's own
+  cleanup line, so it is visible without digging.
+
+  Deliberately narrow: only a completely empty result is refused. A listing that
+  merely comes back short is left alone, because a genuinely shrinking catalogue
+  would otherwise be blocked from ever being tidied. That case belongs upstream
+  and has been reported.
+
+  Like the other two protections, this applies even in dry-run mode — a setting
+  meaning "do not inject" should not be able to switch off something that
+  prevents data loss.
+
+- `Show status` now reports whether the protection is installed in the worker
+  you asked, for the same reason the other two do: a protection that has never
+  needed to fire looks exactly like one that was never installed.
+
 ## 1.2.1 — 2026-09-15
 
 **Fixed — the plugin's scan-time logging was being discarded**

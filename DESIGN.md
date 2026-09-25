@@ -313,6 +313,67 @@ could in principle be clobbered. The window is one query wide, the two writers
 would have to be refreshing the same movie simultaneously, and the outcome is a
 restored key rather than a lost row — not worth transaction machinery.
 
+## A third guard: the cleanup that trusts an empty answer
+
+The other two guards protect a row or a field. This one protects the catalogue.
+
+Every scan ends with `cleanup_orphaned_vod_content(account_id=…,
+scan_start_time=…)`, which runs at `stale_days=0` — so the cutoff is the scan's
+own start and anything not re-stamped *during that scan* is stale. It deletes
+those relations, then makes a second, deliberately **unscoped** pass deleting
+every `Movie` with no relations left from any account.
+
+The correctness of all that rests on one unstated assumption: **that the scan
+saw the provider's real answer.** When the movie endpoint returns an empty list
+the scan sees nothing, every relation on the account is stale, and the pass
+removes the account's whole catalogue plus every title it solely supplied. The
+rows return on the next good scan with new primary keys, so the damage is not
+just deletion but an id churn for everything downstream.
+
+Two things make it hard to notice. It is logged as routine cleanup at INFO, and
+the relation count — the larger number, and the actual cause — is computed and
+then discarded, so only the orphaned-*movie* count is visible.
+
+The structural version of the lesson is worth stating plainly, because it is not
+specific to this function: **"the source answered successfully" is not "the
+source answered completely".** Anywhere a deletion is driven by absence from a
+fetched list, an empty or truncated fetch is indistinguishable from a genuine
+removal, and the default reading is the destructive one.
+
+Core already applies the right reasoning one level up — `refresh_categories`
+returning nothing aborts the refresh "to preserve existing category selections".
+It was simply never carried down to the movie and series lists.
+
+So the guard refuses rather than repairs: before delegating, count how many of
+that account's relations would survive core's own filter, using core's own
+cutoff arithmetic so "seen" means exactly "not stale". If a content type has
+relations and **none** survive, skip the cleanup for that scan. A deferred
+cleanup costs a day of stale rows; the alternative costs the catalogue.
+
+**Zero, not a ratio.** A threshold would also catch a listing that came back 90%
+short — but a genuinely shrinking catalogue would then be refused permanently,
+because the rows that were never pruned keep the total high and the ratio can
+never recover. Zero-seen carries no such state: one good scan clears it. The
+short-listing case is real and is left upstream.
+
+**This one fails open**, like the detail guard and unlike the merge protection.
+Core's cleanup is normally correct and only catastrophic under one condition, so
+an error in our own check is not evidence that the condition holds, and
+permanently disabling a correct cleanup would be its own slow data problem. The
+counts are two trivial queries; if those fail, core's much larger ones were not
+going to succeed either.
+
+Only the per-account, per-scan call is assessed. An unscoped or timestamp-less
+invocation cannot be judged against a scan at all, so it is delegated untouched
+— a narrower patch than the bug strictly allows, but the bug only occurs on the
+path that is checked.
+
+The refusal is returned as core's own result string, so it appears inside
+Dispatcharr's `VOD cleanup completed: …` line. That matters more than it looks:
+plugin loggers inherit root, and root is `WARNING` in the Celery prefork child
+where scans run, so a message routed through `apps.vod.tasks` is visible in
+places our own logger historically was not.
+
 ## Manual approvals
 
 Some entries are unreachable by every signal: a provider can ship a title as a

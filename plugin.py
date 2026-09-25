@@ -109,7 +109,7 @@ def _format_log(data, limit=60):
 class Plugin:
     # UI title only; "Dispatcharr" is redundant inside the Dispatcharr UI.
     name = "VOD Merge"
-    version = "1.2.1"
+    version = "1.3.0"
     description = (
         "Durably merges duplicate VOD titles from providers that omit TMDB ids, "
         "by matching metadata like poster artwork and plot text to a title you "
@@ -172,6 +172,19 @@ class Plugin:
                 "to overwrite existing data. A value the provider actually "
                 "sent always wins -- this only refills what went missing. "
                 "Applies even in \"dry run\" mode."
+            ),
+        },
+        {
+            "id": "protect_prune",
+            "label": "Prevent catalogue deletion after an empty listing",
+            "type": "boolean",
+            "default": True,
+            "help_text": (
+                "Blocks Dispatcharr's post-scan cleanup when a provider returns "
+                "an empty listing, which otherwise deletes that account's "
+                "entire catalogue and every title only it supplies. Cleanup "
+                "resumes on the next scan that sees content. Applies even in "
+                "\"dry run\" mode."
             ),
         },
         {
@@ -429,6 +442,10 @@ class Plugin:
                     # Invisible when working, for the same reason.
                     f"preserve_detail={cfg['preserve_detail']}"
                     f"{'' if _patch._orig_refresh_movie_advanced_data else ' (NOT INSTALLED in this worker)'}, "
+                    # And again: a cleanup that never had to be refused looks
+                    # identical to a guard that was never installed.
+                    f"protect_prune={cfg['protect_prune']}"
+                    f"{'' if _patch._orig_cleanup_orphaned_vod_content else ' (NOT INSTALLED in this worker)'}, "
                     f"series_accounts={sorted(cfg['accounts']) or '<all>'}, "
                     f"movie_accounts={sorted(cfg['movie_accounts']) or '<all>'}, "
                     f"denylist={len(cfg['denylist'])}, "

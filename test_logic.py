@@ -17,6 +17,7 @@ one truncated with an ellipsis).
 import logging
 import re
 import unittest
+from datetime import datetime, timedelta
 
 import patch
 
@@ -906,7 +907,8 @@ class SignatureParityTests(unittest.TestCase):
         self._saved = {}
         for name in ("_orig_process_series_batch", "_orig_process_movie_batch",
                      "_orig_handle_movie_id_conflicts",
-                     "_orig_refresh_movie_advanced_data"):
+                     "_orig_refresh_movie_advanced_data",
+                     "_orig_cleanup_orphaned_vod_content"):
             self._saved[name] = getattr(patch, name)
         self._saved["is_enabled"] = patch.is_enabled
         self._saved["_load_config"] = patch._load_config
@@ -924,6 +926,18 @@ class SignatureParityTests(unittest.TestCase):
             self.seen.append((a, kw))
             return retval
         return fake
+
+    def test_cleanup_orphaned_vod_content_accepts_and_forwards(self):
+        patch._orig_cleanup_orphaned_vod_content = self._spy("ok")
+        # Delegate-only path, like the rest of this suite.
+        patch._load_config = lambda force=False: {"protect_prune": False}
+        result = patch.patched_cleanup_orphaned_vod_content(
+            0, "scan_start", 7, "extra_positional", future_kwarg="x",
+        )
+        self.assertEqual(result, "ok")
+        (args, kwargs), = self.seen
+        self.assertIn("extra_positional", args)
+        self.assertEqual(kwargs.get("future_kwarg"), "x")
 
     def test_series_batch_accepts_and_forwards(self):
         patch._orig_process_series_batch = self._spy("ok")
@@ -1248,6 +1262,154 @@ class SweepWritesOnlyItsOwnKeysTests(unittest.TestCase):
         import inspect
         src = inspect.getsource(patch.sweep_movies_impl)
         self.assertIn('props.get("detailed_info")', src)
+
+
+class DecidePruneTests(unittest.TestCase):
+    """Refuse a cleanup that follows a scan which saw nothing of an account.
+
+    The live failure this exists for: a provider's movie endpoint returned an
+    empty list, so no relation was re-stamped, so core's `stale_days=0` filter
+    matched every one of them and deleted the account's entire movie catalogue
+    plus every title it solely supplied -- while series in the same run
+    processed normally.
+    """
+
+    def test_allows_when_everything_was_seen(self):
+        allow, reason = patch.decide_prune(
+            {"movie": (100, 100), "series": (50, 50)})
+        self.assertTrue(allow)
+        self.assertIsNone(reason)
+
+    def test_allows_a_merely_short_scan(self):
+        # DELIBERATE: a short listing is not refused. Only zero is unambiguous.
+        # A ratio rule would deadlock on a genuinely shrinking catalogue -- the
+        # unpruned rows keep the total high, so the ratio could never recover.
+        allow, reason = patch.decide_prune({"movie": (100, 3), "series": (50, 50)})
+        self.assertTrue(allow)
+        self.assertIsNone(reason)
+
+    def test_refuses_when_movies_exist_but_none_were_seen(self):
+        allow, reason = patch.decide_prune(
+            {"movie": (12345, 0), "series": (6789, 6789)})
+        self.assertFalse(allow)
+        self.assertIn("movie", reason)
+        self.assertIn("12345", reason)
+
+    def test_refuses_when_series_exist_but_none_were_seen(self):
+        allow, reason = patch.decide_prune({"movie": (10, 10), "series": (99, 0)})
+        self.assertFalse(allow)
+        self.assertIn("series", reason)
+
+    def test_an_account_with_nothing_is_not_suspicious(self):
+        # A provider that genuinely carries no movies must keep being able to
+        # return an empty list, or the guard would latch on for ever.
+        allow, reason = patch.decide_prune({"movie": (0, 0), "series": (0, 0)})
+        self.assertTrue(allow)
+        self.assertIsNone(reason)
+
+
+class PruneGuardTests(unittest.TestCase):
+    """The wrapper around core's cleanup: when it defers, and when it refuses."""
+
+    def setUp(self):
+        self._saved = {
+            name: getattr(patch, name) for name in (
+                "_orig_cleanup_orphaned_vod_content", "_load_config",
+                "_prune_counts", "_append_log",
+            )
+        }
+        self.calls = []
+        patch._orig_cleanup_orphaned_vod_content = self._spy
+        patch._load_config = lambda force=False: {"protect_prune": True}
+        patch._append_log = lambda entries: None
+        patch._prune_counts = lambda account_id, cutoff: {
+            "movie": (100, 100), "series": (10, 10)}
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        for name, value in self._saved.items():
+            setattr(patch, name, value)
+
+    def _spy(self, *a, **kw):
+        self.calls.append((a, kw))
+        return "core ran"
+
+    def _call(self, **kw):
+        params = {"stale_days": 0, "scan_start_time": datetime(2026, 1, 1),
+                  "account_id": 7}
+        params.update(kw)
+        return patch.patched_cleanup_orphaned_vod_content(**params)
+
+    def test_delegates_when_the_guard_is_off(self):
+        patch._load_config = lambda force=False: {"protect_prune": False}
+        patch._prune_counts = lambda account_id, cutoff: {"movie": (5, 0)}
+        self.assertEqual(self._call(), "core ran")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_delegates_when_there_is_no_scan_to_assess(self):
+        # An unscoped or timestamp-less call cannot be judged against a scan, so
+        # it is passed through rather than blocked on a guess.
+        self.assertEqual(self._call(account_id=None), "core ran")
+        self.assertEqual(self._call(scan_start_time=None), "core ran")
+        self.assertEqual(len(self.calls), 2)
+
+    def test_delegates_on_a_healthy_scan(self):
+        self.assertEqual(self._call(), "core ran")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_refuses_and_does_not_call_core(self):
+        patch._prune_counts = lambda account_id, cutoff: {
+            "movie": (12345, 0), "series": (6789, 6789)}
+        result = self._call()
+        self.assertEqual(self.calls, [])
+        self.assertIn("dispatcharr_vod_merge", result)
+        self.assertIn("movie", result)
+
+    def test_refusal_is_logged_to_the_audit_trail(self):
+        written = []
+        patch._append_log = lambda entries: written.extend(entries)
+        patch._prune_counts = lambda account_id, cutoff: {"movie": (12, 0)}
+        self._call()
+        self.assertEqual(len(written), 1)
+        self.assertEqual(written[0]["action"], patch.PRUNE_BLOCKED)
+
+    def test_a_broken_audit_write_still_refuses(self):
+        def boom(entries):
+            raise RuntimeError("log unavailable")
+        patch._append_log = boom
+        patch._prune_counts = lambda account_id, cutoff: {"movie": (12, 0)}
+        result = self._call()
+        self.assertEqual(self.calls, [])
+        self.assertIn("dispatcharr_vod_merge", result)
+
+    def test_fails_open_when_the_check_itself_breaks(self):
+        # Opposite of the merge protection, on purpose: core's cleanup is
+        # normally correct, so an error in OUR check is not evidence that the
+        # dangerous condition holds, and permanently disabling a correct cleanup
+        # would be its own slow data problem.
+        def boom(account_id, cutoff):
+            raise RuntimeError("db unavailable")
+        patch._prune_counts = boom
+        self.assertEqual(self._call(), "core ran")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_cutoff_mirrors_cores_own_staleness_arithmetic(self):
+        seen = {}
+
+        def capture(account_id, cutoff):
+            seen["cutoff"] = cutoff
+            return {"movie": (5, 5)}
+
+        patch._prune_counts = capture
+        start = datetime(2026, 1, 10)
+        self._call(stale_days=3, scan_start_time=start)
+        # "Seen" must mean exactly "would survive core's filter", so the cutoff
+        # has to be computed the same way core computes it.
+        self.assertEqual(seen["cutoff"], start - timedelta(days=3))
+
+    def test_missing_original_is_not_an_exception(self):
+        patch._orig_cleanup_orphaned_vod_content = None
+        self.assertIsNone(self._call())
 
 
 class ManifestParityTests(unittest.TestCase):

@@ -1,6 +1,6 @@
 {
   "name": "VOD Merge",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "description": "Durably merges duplicate VOD titles from providers that omit TMDB ids, by matching metadata like poster artwork and plot text to a title you already have. Works only with XC accounts.",
   "author": "andyj682",
   "help_url": "https://github.com/andyj682/dispatcharr_vod_merge",
@@ -39,6 +39,13 @@
       "type": "boolean",
       "default": true,
       "help_text": "Preserves TMDB id and video and audio details for a library item even if a provider returns less detail on one call than it did on the last. Dispatcharr's default allows empty data to overwrite existing data. A value the provider actually sent always wins -- this only refills what went missing. Applies even in \"dry run\" mode."
+    },
+    {
+      "id": "protect_prune",
+      "label": "Prevent catalogue deletion after an empty listing",
+      "type": "boolean",
+      "default": true,
+      "help_text": "Blocks Dispatcharr's post-scan cleanup when a provider returns an empty listing, which otherwise deletes that account's entire catalogue and every title only it supplies. Cleanup resumes on the next scan that sees content. Applies even in \"dry run\" mode."
     },
     {
       "id": "allowed_accounts",
