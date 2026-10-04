@@ -185,7 +185,7 @@ _TMDB_URL_HINTS = ("image.tmdb.org", "/t/p/")
 _IMAGE_EXT_RE = re.compile(r"\.(?:jpe?g|png|webp)$", re.I)
 _NONALNUM_RE = re.compile(r"[^a-z0-9]+")
 
-# Minimum normalised plot length. Short blurbs ("Season 2.", a stray genre word)
+# Minimum normalized plot length. Short blurbs ("Season 2.", a stray genre word)
 # collide easily; the full text of a real synopsis does not.
 #
 # 40, not the 80 originally guessed. Measured over a real library, collisions do
@@ -193,7 +193,7 @@ _NONALNUM_RE = re.compile(r"[^a-z0-9]+")
 # from 80 down to 40 -- while the usable index grows by ~150 keys. The floor was
 # costing reach and buying no safety, and it was excluding real one-line
 # synopses: "The most miserable person on Earth must save the world from
-# happiness." normalises to 69 characters.
+# happiness." normalizes to 69 characters.
 #
 # The uniqueness guard is what actually protects against generic text, not this
 # length; anything two shows share is rejected regardless of how long it is.
@@ -246,7 +246,7 @@ TIER_MANUAL = "manual"
 TIER_DETAIL = "detail"   # movies: the tmdb the provider put in its own detail
 TIER_PROTECT = "protect"  # not a match at all -- a prevented destructive merge
 TIER_PRESERVE = "preserve"  # nor this -- essential detail a core write dropped
-TIER_PRUNE = "prune"        # nor this -- a refused catalogue-wide delete
+TIER_PRUNE = "prune"        # nor this -- a refused catalog-wide delete
 
 # Decision outcomes (also the audit-log `action` values).
 INJECT = "inject"
@@ -260,7 +260,7 @@ VARIANT = "variant"
 DENIED = "denied"
 PROTECTED = "protected"          # a destructive core merge was prevented
 PRESERVED = "preserved"          # detail a core refresh dropped was put back
-PRUNE_BLOCKED = "prune_blocked"  # a catalogue-wide delete after an empty listing
+PRUNE_BLOCKED = "prune_blocked"  # a catalog-wide delete after an empty listing
 
 # Values providers use to mean "no id" (mirrors the core cleaning in tasks.py).
 _BLANK_IDS = ("", "0", "none", "null")
@@ -331,7 +331,7 @@ def _note_unexpected_args(where: str, args, kwargs) -> None:
         logger.warning(
             "[VOD-MERGE] %s got arguments this plugin version does not know "
             "about (%d positional, keywords=%s). They were forwarded to core "
-            "unchanged. If they carry meaning this wrapper may need to HONOUR "
+            "unchanged. If they carry meaning this wrapper may need to HONOR "
             "them -- check the Dispatcharr release notes.",
             where, len(args), sorted(kwargs) or "none",
         )
@@ -478,6 +478,13 @@ def _load_config(force: bool = False) -> dict:
                            or DEFAULT_SCHEDULE_QUEUE),
         "tag_unique_movies": _as_bool(
             settings.get("tag_unique_movies"), DEFAULT_TAG_UNIQUE_MOVIES),
+        "wanted_set_path": (str(settings.get("wanted_set_path") or "").strip()
+                            or DEFAULT_WANTED_SET_PATH),
+        "enrich_movies": _as_bool(
+            settings.get("enrich_movies"), DEFAULT_ENRICH_MOVIES),
+        "enrich_limit": _as_int(settings.get("enrich_limit"), DEFAULT_ENRICH_LIMIT),
+        "enrich_delay_ms": _as_int(
+            settings.get("enrich_delay_ms"), DEFAULT_ENRICH_DELAY_MS),
     }
     with _cfg_lock:
         _cfg_cache = cfg
@@ -528,7 +535,7 @@ def _poster_key(url):
 
 
 def _plot_hash(text):
-    """Normalised full plot text, or None when too short to be distinctive."""
+    """Normalized full plot text, or None when too short to be distinctive."""
     if not text or not isinstance(text, str):
         return None
     norm = _NONALNUM_RE.sub(" ", text.lower()).strip()
@@ -719,7 +726,7 @@ def category_enabled(entry, categories, relations):
 
     Mirrors the check in process_series_batch / process_movie_batch. Fails open:
     anything we cannot resolve is treated as enabled, so a shape we do not
-    recognise costs a wasted lookup rather than a missed merge.
+    recognize costs a wasted lookup rather than a missed merge.
     """
     try:
         raw = (entry or {}).get("category_id")
@@ -983,7 +990,7 @@ def patched_process_series_batch(account, batch, categories, relations,
 
     Signature-agnostic: anything core grows is accepted and forwarded rather
     than raising during argument binding. Core still runs, so a new parameter is
-    honoured by core itself; the only risk is one that changes how core
+    honored by core itself; the only risk is one that changes how core
     INTERPRETS the batch we just mutated, which `_note_unexpected_args` surfaces.
     """
     _log_pid_once("series-batch wrapper active")
@@ -1723,6 +1730,472 @@ def patched_process_movie_batch(account, batch, categories, relations,
 
 
 # --------------------------------------------------------------------------- #
+# Enrichment, step 1: the wanted set
+# --------------------------------------------------------------------------- #
+# vod_preferences ranks a movie's candidate relations against each other, so it
+# needs measured video and audio for EVERY relation of a title, not one. Nothing
+# in Dispatcharr produces that: the XC detail endpoint refreshes a single
+# relation per movie (the highest-priority account's), which is a structural cap
+# rather than a configuration one.
+#
+# Enriching all 37k movies is not the goal and never was -- the useful set is
+# the few thousand titles actually synced to a library, and only the generator
+# knows which those are. It publishes them as a file; we read it. Demand is the
+# one thing it holds that we cannot query.
+#
+# FAIL OPEN ON ENRICHMENT, FAIL CLOSED ON SCOPE. A fault in the enrichment costs
+# some missing metadata. A fault in the thing that decides HOW MUCH WORK TO DO
+# costs thousands of provider calls on a set nobody asked for. So every way the
+# file can be untrustworthy -- absent, unreadable, malformed, unknown schema,
+# count disagreeing with the array, or simply too old to believe -- collapses to
+# doing nothing. It must never widen to "enrich everything".
+
+DEFAULT_WANTED_SET_PATH = ""        # blank = feature off, no default path
+DEFAULT_ENRICH_MOVIES = False       # opt-in, like merge_movies
+DEFAULT_ENRICH_LIMIT = 25
+DEFAULT_ENRICH_DELAY_MS = 500
+
+WANTED_SCHEMA = 1
+# Generous on purpose. Too low blocks a weekly sync; too high defeats the check.
+# A value that only matters in a failure case is not worth a settings row.
+WANTED_MAX_AGE_DAYS = 14
+# Only an ERROR is worth retrying -- a provider that answered and had nothing is
+# a fact about that stream, not a transient.
+ENRICH_ERROR_RETRY_DAYS = 7
+
+ENRICHED = "enriched"
+
+
+def _parse_iso_z(text):
+    """ISO 8601 with a trailing Z, which fromisoformat rejects before 3.11."""
+    from datetime import datetime
+
+    s = str(text or "").strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def validate_wanted_set(doc, now=None, max_age_days=WANTED_MAX_AGE_DAYS):
+    """Pure. -> (ok, reason). Every failure means DO NOTHING, never 'do all'."""
+    from datetime import timedelta
+
+    if not isinstance(doc, dict):
+        return False, "not a JSON object"
+    if doc.get("schema") != WANTED_SCHEMA:
+        return False, "unsupported schema %r (expected %r)" % (
+            doc.get("schema"), WANTED_SCHEMA)
+    ids = doc.get("tmdb_ids")
+    if not isinstance(ids, list):
+        return False, "tmdb_ids missing or not a list"
+    unid = doc.get("unidentified") or []
+    if not isinstance(unid, list):
+        return False, "unidentified present but not a list"
+    count = doc.get("count")
+    # Their writer runs at the end of a sync that can abort part-way, so a count
+    # disagreeing with the array is the cheapest possible corruption signal.
+    if count != len(ids):
+        return False, "count=%r disagrees with len(tmdb_ids)=%d" % (count, len(ids))
+    stamped = _parse_iso_z(doc.get("generated_at"))
+    if stamped is None:
+        return False, "generated_at missing or unparseable"
+    if now is not None and max_age_days:
+        age = now - stamped
+        if age > timedelta(days=max_age_days):
+            # NB a stale file can mean "their provider was flaky", not only
+            # "the generator stopped" -- they publish nothing on a partial
+            # fetch rather than publishing a subset. Either way we decline.
+            return False, "generated_at is %d days old (limit %d)" % (
+                age.days, max_age_days)
+    if not ids and not unid:
+        return False, "wanted set is empty"
+    return True, None
+
+
+def read_wanted_set(path, now=None):
+    """-> (doc|None, status, detail). Status separates the two cases that must
+    NOT look alike: absent is NORMAL (pre-first-sync, or a wiped mount) and logs
+    INFO; unreadable is a MISCONFIGURATION and logs WARNING. Collapsing them
+    would let a permissions mistake silently disable the whole feature."""
+    import json
+
+    if not path:
+        return None, "disabled", "no wanted-set path configured"
+    if not os.path.exists(path):
+        return None, "absent", path
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read()
+    except Exception as exc:
+        return None, "unreadable", "%s: %s" % (type(exc).__name__, exc)
+    try:
+        doc = json.loads(raw)
+    except Exception as exc:
+        return None, "malformed", str(exc)
+    ok, reason = validate_wanted_set(doc, now=now)
+    if not ok:
+        return None, "invalid", reason
+    return doc, "ok", None
+
+
+def resolve_unidentified(entry, lookup_by_id, lookup_by_name):
+    """Pure given the two lookups. -> (movie_id|None, how, skip_reason).
+
+    Strict order, because these are not interchangeable:
+      1. stream_id -- authoritative while the row exists
+      2. name      -- ONLY on a unique match; ambiguity is skipped, never guessed
+      3. resolved_tmdb_id -- never alone. It comes from an unverified
+         first-result lookup, so it may only CORROBORATE a match something else
+         already made. Disagreement means trust neither.
+    """
+    sid = entry.get("stream_id")
+    name = entry.get("name")
+    rid = entry.get("resolved_tmdb_id")
+
+    if sid is not None:
+        row = lookup_by_id(sid)
+        if row is not None:
+            return row[0], "stream_id", None
+
+    if name:
+        hits = lookup_by_name(name)
+        if len(hits) == 1:
+            mid, tmdb = hits[0]
+            if rid and tmdb and str(tmdb) != str(rid):
+                return None, None, "name and resolved_tmdb_id disagree"
+            return mid, "name", None
+        if len(hits) > 1:
+            return None, None, "name matches %d rows (ambiguous)" % len(hits)
+
+    return None, None, "stream_id dead and no unique name match"
+
+
+def wanted_movie_ids(doc):
+    """-> (set of Movie.id, stats dict). DB-backed wrapper around the above."""
+    from apps.vod.models import Movie
+
+    ids = [str(t) for t in (doc.get("tmdb_ids") or [])]
+    unid = doc.get("unidentified") or []
+
+    found = {}
+    by_tmdb = dict(
+        Movie.objects.filter(tmdb_id__in=ids).values_list("tmdb_id", "id"))
+    for t in ids:
+        mid = by_tmdb.get(t)
+        if mid:
+            found[mid] = "tmdb_id"
+
+    def lookup_by_id(sid):
+        row = Movie.objects.filter(id=sid).values_list("id", "tmdb_id").first()
+        return row
+
+    def lookup_by_name(name):
+        return list(
+            Movie.objects.filter(name=name).values_list("id", "tmdb_id")[:3])
+
+    stats = {"tmdb_total": len(ids), "tmdb_resolved": len(by_tmdb),
+             "unid_total": len(unid), "unid_resolved": 0, "skipped": []}
+    for e in unid:
+        mid, how, why = resolve_unidentified(e, lookup_by_id, lookup_by_name)
+        if mid is None:
+            stats["skipped"].append("%s: %s" % (e.get("stream_id"), why))
+            continue
+        found.setdefault(mid, how)
+        stats["unid_resolved"] += 1
+    return set(found), stats
+
+
+# --------------------------------------------------------------------------- #
+# Enrichment, step 2: harvest what the providers already know
+# --------------------------------------------------------------------------- #
+# Our sweep calls `get_vod_info` PER RELATION, straight at the provider, so it
+# is not subject to the one-relation-per-movie cap the XC endpoint imposes. That
+# asymmetry is the whole reason this belongs here rather than in the generator.
+#
+# Cheap -- a light API call, measured around 0.65s median -- and its real job is
+# to SHRINK the expensive ffprobe pass precisely rather than leaving it guessed.
+#
+# We stamp an ATTEMPT, not a success. Skipping on "has usable data" would
+# re-ask, every single run, for exactly the relations whose providers never
+# answer -- and those are the ones a later probe pass pays the most for.
+
+def relation_has_essentials(props):
+    """Measured video dimensions AND an audio block. "Essential" here means
+    resolution plus audio codec; a Dolby Vision record is explicitly not
+    required, since no provider payload has ever carried one."""
+    d = (props or {}).get("detailed_info") or {}
+    if not isinstance(d, dict):
+        return False
+    v = d.get("video")
+    return bool(isinstance(v, dict) and v.get("width") and d.get("audio"))
+
+
+def decide_enrich(props, now_iso, retry_days=ENRICH_ERROR_RETRY_DAYS):
+    """Pure. -> (should_fetch, reason)."""
+    if relation_has_essentials(props):
+        return False, "has essentials"
+    own = ((props or {}).get(OWN_PROPS_KEY) or {})
+    mark = own.get("enrich") if isinstance(own, dict) else None
+    if not isinstance(mark, dict):
+        return True, "never attempted"
+    got = mark.get("got")
+    if got != "error":
+        # The provider answered and this is what it has. Asking again is how a
+        # permanent gap turns into a nightly cost.
+        return False, "attempted, provider had nothing more (%s)" % got
+    when = _parse_iso_z(mark.get("at"))
+    if when is None:
+        return True, "previous error, unreadable timestamp"
+    from datetime import timedelta
+    now = _parse_iso_z(now_iso)
+    if now is not None and (now - when) < timedelta(days=retry_days):
+        return False, "previous error, still inside retry window"
+    return True, "previous error, retry window elapsed"
+
+
+def enrich_candidates(movie_ids):
+    """Relations of wanted movies, GROUPED BY MOVIE. Not account-scoped: the
+    point is every candidate of a wanted title, whoever carries it.
+
+    Deliberately not newest-relation-first, unlike the detail sweep. Providers
+    cluster in id ranges -- overwhelmingly so for one that has been wholesale
+    recreated -- so `-id` walks a single provider's copies across every movie
+    before reaching the next provider's. Measured on a real wanted set: the
+    first thirty fetches were all one provider.
+
+    That ordering leaves EVERY movie partially covered for as long as the
+    backlog lasts, which is the worst possible state for ranking. A candidate
+    with no audio data scores zero, so a half-enriched comparison set can rank
+    an enriched stereo track above an unmeasured surround one. Completing
+    movies one at a time keeps coverage uniform across whatever has been done.
+    """
+    from apps.vod.models import M3UMovieRelation
+
+    return (M3UMovieRelation.objects
+            .filter(movie_id__in=list(movie_ids))
+            .select_related("m3u_account", "movie")
+            .order_by("movie_id", "id"))
+
+
+def take_whole_movies(groups, limit):
+    """Pick whole movies up to `limit` relations. Pure.
+
+    `groups` is an ordered sequence of `(movie_id, [items])`. A movie is never
+    split across runs, for the reason above. A single movie LARGER than the
+    limit is still taken whole rather than skipped for ever -- otherwise a
+    title with more copies than the batch size could never be enriched at all,
+    and those are exactly the titles ranking matters most for.
+    """
+    chosen = []
+    for _mid, items in groups:
+        if limit and chosen and len(chosen) + len(items) > limit:
+            break
+        chosen.extend(items)
+        if limit and len(chosen) >= limit:
+            break
+    return chosen
+
+
+def enrich_status(cfg=None):
+    """Read-only preview. Makes NO provider calls -- safe to run any time, and
+    the thing to look at before pointing this at a real wanted set."""
+    from django.utils import timezone
+
+    cfg = cfg or _load_config(force=True)
+    out = {"enrich_movies": cfg["enrich_movies"],
+           "path": cfg["wanted_set_path"] or "<unset>"}
+    doc, status, detail = read_wanted_set(cfg["wanted_set_path"],
+                                          now=timezone.now())
+    out["file_status"] = status
+    out["file_detail"] = detail
+    if doc is None:
+        return out
+
+    out["generated_at"] = doc.get("generated_at")
+    ids, stats = wanted_movie_ids(doc)
+    out.update(stats)
+    out["movies"] = len(ids)
+
+    now_iso = timezone.now().isoformat()
+    todo = have = attempted = 0
+    per_account = {}
+    for rel in enrich_candidates(ids).iterator(chunk_size=500):
+        props = rel.custom_properties or {}
+        name = rel.m3u_account.name
+        slot = per_account.setdefault(name, {"relations": 0, "need": 0})
+        slot["relations"] += 1
+        if relation_has_essentials(props):
+            have += 1
+            continue
+        should, _ = decide_enrich(props, now_iso)
+        if should:
+            todo += 1
+            slot["need"] += 1
+        else:
+            attempted += 1
+    out.update({"relations": have + todo + attempted, "have_essentials": have,
+                "need_fetch": todo, "already_attempted": attempted,
+                "per_account": per_account,
+                "runs_at_current_limit": (
+                    0 if not cfg["enrich_limit"]
+                    else -(-todo // cfg["enrich_limit"]))})
+    return out
+
+
+def enrich_movies_impl(limit=None, delay=None):
+    """Fetch provider detail for every relation of every wanted movie.
+
+    Writes `detailed_info` -- the same key core writes and vod_preferences
+    reads -- but never core's `detailed_fetched` or `last_advanced_refresh`.
+    Those two remain the only record that a CLIENT asked for a movie, and a
+    sweep must not write the field it reads.
+    """
+    from django.utils import timezone
+    from core.xtream_codes import Client as XtreamCodesClient
+
+    cfg = _load_config(force=True)
+    limit = cfg["enrich_limit"] if limit is None else limit
+    delay = (cfg["enrich_delay_ms"] if delay is None else delay) / 1000.0
+
+    stats = {"fetched": 0, "got_essentials": 0, "empty": 0, "errors": 0,
+             "skipped": 0, "remaining": 0}
+    if not cfg["enrich_movies"]:
+        stats["aborted"] = "enrichment is off"
+        return stats
+
+    doc, status, detail = read_wanted_set(cfg["wanted_set_path"],
+                                          now=timezone.now())
+    if doc is None:
+        # Fail CLOSED on scope. Never widen to "everything".
+        stats["aborted"] = "wanted set %s (%s)" % (status, detail)
+        if status in ("unreadable", "malformed", "invalid"):
+            logger.warning("[VOD-MERGE] enrichment declined -- wanted set %s: %s",
+                           status, detail)
+        else:
+            logger.info("[VOD-MERGE] enrichment skipped -- wanted set %s: %s",
+                        status, detail)
+        return stats
+
+    movie_ids, resolve_stats = wanted_movie_ids(doc)
+    stats["wanted_movies"] = len(movie_ids)
+    stats.update({k: v for k, v in resolve_stats.items() if k != "skipped"})
+
+    now_iso = timezone.now().isoformat()
+    # Collect first, then take WHOLE movies, so a bounded run never leaves a
+    # title half-measured. The scan is cheap next to the provider calls.
+    per_movie = []
+    for rel in enrich_candidates(movie_ids).iterator(chunk_size=500):
+        should, _why = decide_enrich(rel.custom_properties or {}, now_iso)
+        if not should:
+            stats["skipped"] += 1
+            continue
+        if per_movie and per_movie[-1][0] == rel.movie_id:
+            per_movie[-1][1].append(rel)
+        else:
+            per_movie.append((rel.movie_id, [rel]))
+
+    by_account = {}
+    chosen = take_whole_movies(per_movie, limit)
+    stats["movies_this_run"] = len({r.movie_id for r in chosen})
+    for rel in chosen:
+        by_account.setdefault(rel.m3u_account_id, []).append(rel)
+
+    per_account = {}
+    for rels in by_account.values():
+        account = rels[0].m3u_account
+        name = account.name
+        slot = per_account.setdefault(
+            name, {"fetched": 0, "essentials": 0, "empty": 0, "errors": 0})
+        try:
+            client = XtreamCodesClient(
+                server_url=account.server_url,
+                username=account.username,
+                password=account.password,
+                user_agent=account.get_user_agent_string(),
+            )
+        except Exception:
+            logger.exception("[VOD-MERGE] could not build client for %r", name)
+            stats["errors"] += len(rels)
+            slot["errors"] += len(rels)
+            continue
+
+        with client:
+            for rel in rels:
+                props = rel.custom_properties or {}
+                outcome = "none"
+                try:
+                    payload = client.get_vod_info(rel.stream_id)
+                except Exception as exc:
+                    stats["errors"] += 1
+                    slot["errors"] += 1
+                    outcome = "error"
+                    logger.warning("[VOD-MERGE] enrich fetch failed %r rel=%s: %s",
+                                   name, rel.id, exc)
+                    payload = None
+
+                if payload is not None:
+                    info = (payload or {}).get("info")
+                    if isinstance(info, list):
+                        info = info[0] if info and isinstance(info[0], dict) else {}
+                    if isinstance(info, dict) and info:
+                        cleaned = _clean_props(info)
+                        if cleaned:
+                            # Our own write is a WHOLE REPLACE of detailed_info,
+                            # exactly like core's -- so it can drop a tmdb_id the
+                            # detail sweep captured, which is the merge plugin's
+                            # strongest movie signal. `preserve_detail` guards
+                            # core's refresh and does not reach this path, so the
+                            # same rule is applied here directly: a value the
+                            # provider actually sent always wins, and this only
+                            # ever refills a hole the new payload left.
+                            previous = props.get("detailed_info")
+                            if isinstance(previous, dict) and previous:
+                                cleaned, refilled = restore_essential(previous, cleaned)
+                                if refilled:
+                                    logger.info(
+                                        "[VOD-MERGE] enrichment preserved %s on "
+                                        "rel=%s", refilled, rel.id)
+                            props["detailed_info"] = cleaned
+                        stats["fetched"] += 1
+                        slot["fetched"] += 1
+                        if relation_has_essentials(props):
+                            stats["got_essentials"] += 1
+                            slot["essentials"] += 1
+                            outcome = "full"
+                        else:
+                            outcome = "partial"
+                    else:
+                        stats["empty"] += 1
+                        slot["empty"] += 1
+                        outcome = "none"
+
+                _stamp_own(props, enrich={"at": now_iso, "got": outcome})
+                rel.custom_properties = props
+                try:
+                    rel.save(update_fields=["custom_properties"])
+                except Exception:
+                    logger.exception(
+                        "[VOD-MERGE] could not store enrichment for rel=%s", rel.id)
+                if delay:
+                    time.sleep(delay)
+
+    remaining = 0
+    for rel in enrich_candidates(movie_ids).iterator(chunk_size=500):
+        should, _why = decide_enrich(rel.custom_properties or {}, now_iso)
+        if should:
+            remaining += 1
+    stats["remaining"] = remaining
+    stats["per_account"] = per_account
+    logger.info("[VOD-MERGE] movie enrichment: %s", stats)
+    return stats
+
+
+# --------------------------------------------------------------------------- #
 # Scheduling
 # --------------------------------------------------------------------------- #
 # The sweep is the only step that cannot happen inside a scan: the poster and
@@ -1911,11 +2384,11 @@ def patched_handle_movie_id_conflicts(current_movie, relation,
     This is the one wrapper here that REPLACES core rather than wrapping it:
     when protection is on, the original never runs. So it carries the most
     signature risk of the four -- any parameter core grows is one that NOTHING
-    honours unless this function is taught to.
+    honors unless this function is taught to.
 
     ⚠ The instinct for a replace-shaped wrapper is "when in doubt, defer to
-    core". That is WRONG here, because core's behaviour on this path is the bug
-    we exist to prevent: deferring on an argument we do not recognise would
+    core". That is WRONG here, because core's behavior on this path is the bug
+    we exist to prevent: deferring on an argument we do not recognize would
     reinstate the destructive merge. So we keep protecting and log loudly
     instead -- see `_note_unexpected_args`. The extras are still forwarded on
     the one path that does delegate, below.
@@ -2168,7 +2641,7 @@ def patched_refresh_movie_advanced_data(m3u_movie_relation_id,
     untouched.
 
     Signature risk sits in the middle of the four. Core still runs, so a new
-    parameter is honoured by core -- but this wrapper REPAIRS core's write
+    parameter is honored by core -- but this wrapper REPAIRS core's write
     afterwards, and a parameter that made core deliberately write LESS (a
     partial or lightweight refresh, say) would have us refilling keys core
     meant to omit, fighting its intent rather than repairing an accident. We
@@ -2209,7 +2682,7 @@ def patched_refresh_movie_advanced_data(m3u_movie_relation_id,
 
 
 # --------------------------------------------------------------------------- #
-# Protection: a catalogue-wide delete triggered by an empty listing
+# Protection: a catalog-wide delete triggered by an empty listing
 # --------------------------------------------------------------------------- #
 # `refresh_vod_content` ends every scan with
 # `cleanup_orphaned_vod_content(account_id=..., scan_start_time=...)`, and that
@@ -2221,7 +2694,7 @@ def patched_refresh_movie_advanced_data(m3u_movie_relation_id,
 # That is correct only while "the scan did not see it" implies "the provider no
 # longer has it". When a provider's movie endpoint returns an EMPTY list, the
 # scan sees nothing, so every relation on the account is stale and the whole
-# catalogue goes -- along with every title that account was the sole source for.
+# catalog goes -- along with every title that account was the sole source for.
 # The rows come back on the next good scan with NEW primary keys, which is an id
 # churn for every downstream consumer.
 #
@@ -2235,7 +2708,7 @@ def patched_refresh_movie_advanced_data(m3u_movie_relation_id,
 #
 # We do NOT try to repair or second-guess the cleanup -- we refuse it outright
 # for that scan and let the next one do it. A deferred cleanup costs some stale
-# rows for a day; the alternative costs the catalogue.
+# rows for a day; the alternative costs the catalog.
 
 DEFAULT_PROTECT_PRUNE = True
 
@@ -2250,7 +2723,7 @@ def decide_prune(counts):
     nothing else produces it.
 
     Deliberately ZERO-seen only, not a ratio. A ratio threshold would also catch
-    a listing that came back 90% short, but a genuinely shrinking catalogue
+    a listing that came back 90% short, but a genuinely shrinking catalog
     would then be refused for ever -- the stale rows keep the total high, so the
     ratio never recovers and the cleanup deadlocks. Zero-seen has no such state:
     one good scan clears it. The short-listing case is left to upstream.
@@ -2284,7 +2757,7 @@ def patched_cleanup_orphaned_vod_content(stale_days=0, scan_start_time=None,
     scan at all, so it is delegated untouched.
 
     Fails OPEN, unlike `patched_handle_movie_id_conflicts`. That one replaces
-    core because core's behaviour there IS the bug; here core's cleanup is
+    core because core's behavior there IS the bug; here core's cleanup is
     normally correct and only catastrophic under one condition, so an error in
     our own check is not evidence that condition holds. Permanently disabling a
     correct cleanup on a bug of ours would be its own slow data problem, and the
@@ -2347,7 +2820,7 @@ def patched_cleanup_orphaned_vod_content(stale_days=0, scan_start_time=None,
     # Returned as core's own result string, so the refusal appears in core's
     # `VOD cleanup completed: ...` line even where our logger is silenced.
     return ("Skipped by dispatcharr_vod_merge: %s -- refusing to delete an "
-            "entire catalogue after a scan that saw nothing" % reason)
+            "entire catalog after a scan that saw nothing" % reason)
 
 
 def _refresh_binding_sites():
@@ -2499,7 +2972,7 @@ def install(manage_schedule=None) -> bool:
                 "detail preservation NOT installed (upstream may have "
                 "changed it)")
 
-        # Third protective patch, same treatment: absent means the catalogue is
+        # Third protective patch, same treatment: absent means the catalog is
         # unguarded against an empty listing, not that merging is broken.
         # Single call site, in this module, resolved as a global at call time --
         # so unlike `refresh_movie_advanced_data` this needs no binding-site

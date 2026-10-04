@@ -7,11 +7,80 @@ Everything through 0.8.3 landed during initial development against a single
 large live library; the entries below record *why* each change was needed, since
 several were driven by failures that were invisible from the outside.
 
+## 1.4.0 — 2026-10-04
+
+**Added — fill in video and audio for the movies you actually sync**
+
+- Four new settings and two new actions, all opt-in and all off by default.
+
+  Dispatcharr's quality ranking compares a movie's candidate copies against
+  each other, so it needs measured video and audio for *every* copy, not one.
+  Nothing produces that today. The XC detail endpoint refreshes a single copy
+  per movie — the highest-priority account's — and that is a structural limit,
+  not a setting. On one library the copy it picks happens to be the one
+  provider that supplies technical detail for roughly 0.7% of movies.
+
+  Fetching detail for all 37,000 movies is not the answer either. The useful
+  set is the few thousand titles actually synced to a media library, and only
+  the tool doing the syncing knows which those are. So it publishes them as a
+  file, and this reads it: **Wanted-set file (enrichment)**. Demand is the one
+  thing that tool holds which cannot be queried from here.
+
+  **Enrich wanted movies** then fetches provider detail for every candidate
+  copy of every wanted title — directly, per copy, which is exactly the thing
+  the detail endpoint cannot do.
+
+- **A run completes whole titles, never part of one.** Ranking compares a
+  movie's copies against each other, and a copy with no audio data counts as
+  zero -- so a half-measured comparison can rank an enriched stereo track above
+  an unmeasured surround one. Partial coverage of a title is worse than none,
+  which makes the title, not the individual copy, the unit a bounded run is
+  allowed to stop at. A title with more copies than the batch size is still
+  done whole, rather than being skipped for ever.
+
+- **Enrichment status** reports what would happen and makes no provider calls
+  at all. Run it first; it is safe at any time, and it tells you the size of
+  the job before you start one.
+
+- **Nothing is ever widened.** If the file is missing, unreadable, malformed,
+  of an unknown schema, internally inconsistent, or simply too old to believe,
+  the answer is to do nothing. It never falls back to enriching your whole
+  library. A fault in the enrichment itself costs some missing metadata; a
+  fault in the thing deciding *how much work to do* would cost thousands of
+  provider calls on a set nobody asked for, so the two fail in opposite
+  directions by design.
+
+  Missing and unreadable are reported separately, and deliberately so. A
+  permissions mistake would otherwise look exactly like "no file yet" and
+  silently disable the feature with nothing to find.
+
+- **An attempt is recorded, not just a success.** A copy whose provider
+  answered and had nothing more to give is not asked again. Skipping only on
+  "has data" would re-ask, every run, for precisely the copies whose providers
+  never answer — and those are the expensive ones later. Genuine errors retry
+  after a week.
+
+- Enrichment writes the same stored detail Dispatcharr itself writes, and
+  still never touches `detailed_fetched` or `last_advanced_refresh`. Those
+  remain the only record that a *client* asked for a movie.
+
+  It also carries the same protection the existing **Preserve essential movie
+  detail** setting provides, applied to its own write. That write replaces the
+  stored detail wholesale, so a provider reply that omits a TMDB id an earlier
+  lookup had captured would otherwise destroy it silently -- and that id is
+  this plugin's strongest signal for merging movies. A value the provider
+  actually sent always wins; only a gap is refilled.
+
+**Also in this release**
+
+- Spelling throughout the documentation and code comments standardized to
+  American English. No behavior change.
+
 ## 1.3.0 — 2026-09-18
 
-**Added — an empty provider listing no longer deletes your catalogue**
+**Added — an empty provider listing no longer deletes your catalog**
 
-- New setting, **Prevent catalogue deletion after an empty listing**, on by
+- New setting, **Prevent catalog deletion after an empty listing**, on by
   default.
 
   Every VOD scan ends with Dispatcharr's cleanup pass, which deletes any
@@ -42,7 +111,7 @@ several were driven by failures that were invisible from the outside.
   cleanup line, so it is visible without digging.
 
   Deliberately narrow: only a completely empty result is refused. A listing that
-  merely comes back short is left alone, because a genuinely shrinking catalogue
+  merely comes back short is left alone, because a genuinely shrinking catalog
   would otherwise be blocked from ever being tidied. That case belongs upstream
   and has been reported.
 
@@ -106,13 +175,13 @@ fix working** — those lines were always being emitted, just never recorded.
   parameter carries meaning — the release behind that outage added a per-user
   permission allowlist — then a wrapper that replaces core's work, or
   post-processes it, may silently drop a constraint core was enforcing. Nothing
-  useful can be decided automatically, so unrecognised arguments are now logged
+  useful can be decided automatically, so unrecognized arguments are now logged
   once per shape, at `WARNING`, naming the hook.
 
   Two of the four carry real risk and say so in their docstrings: the
   destructive-merge protection *replaces* core, so any new parameter is one
-  nothing honours unless it is taught to — and for that one the usual instinct
-  of "when in doubt defer to core" is wrong, because core's behaviour on that
+  nothing honors unless it is taught to — and for that one the usual instinct
+  of "when in doubt defer to core" is wrong, because core's behavior on that
   path is the bug. The detail-preservation wrapper repairs core's write
   afterwards, so a parameter making core deliberately write *less* would have it
   refilling keys core meant to omit.
@@ -205,7 +274,7 @@ Dispatcharr writes. Neither alters how anything is merged.
 - `Prevent destructive movie merges` and `Preserve essential movie detail` both
   have much shorter help text. The previous wording explained the upstream bug
   in full, which belongs in this file and the README rather than in a settings
-  panel. Behaviour is unchanged.
+  panel. Behavior is unchanged.
 
 **Note on patching**
 
@@ -298,14 +367,14 @@ symmetrical between the two, and the documentation matches what the code does.
 
   An approval bypasses the variant guard and ignores `Tag movies no other
   providers have`, on the same reasoning as the series path: those gates bound
-  *unattended* behaviour, and an approval is one entry a person typed.
+  *unattended* behavior, and an approval is one entry a person typed.
 
 - **A `Merge series` switch.** Movies had one and series did not, so the only way
   to stop series merging was to guess at the account allowlist. Each kind now has
   its own switch and its own allowlist, and they are independent.
 
   The two default differently — series on, movies off — so that neither an
-  upgrade nor a fresh install changes behaviour on its own. `Dry run` is the real
+  upgrade nor a fresh install changes behavior on its own. `Dry run` is the real
   safety gate and both sit behind it. Asserted in the tests, so changing it has
   to be deliberate.
 
@@ -328,7 +397,7 @@ symmetrical between the two, and the documentation matches what the code does.
   compared by id before and so would not have caught a reshuffle.
 - **`Limit movie details to accounts` is now `Limit movie merging to accounts`.**
   The old label understated it: the setting already bounded movie *merging*, not
-  just the detail lookup. Behaviour unchanged; the label was wrong.
+  just the detail lookup. Behavior unchanged; the label was wrong.
 - `Also tag movies no one else has` is now **`Tag movies no other providers
   have`**, and its help says the change is not one-way — it alters those movies'
   Dispatcharr ids immediately, and they revert if it is turned off.

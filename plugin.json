@@ -1,6 +1,6 @@
 {
   "name": "VOD Merge",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Durably merges duplicate VOD titles from providers that omit TMDB ids, by matching metadata like poster artwork and plot text to a title you already have. Works only with XC accounts.",
   "author": "andyj682",
   "help_url": "https://github.com/andyj682/dispatcharr_vod_merge",
@@ -42,10 +42,10 @@
     },
     {
       "id": "protect_prune",
-      "label": "Prevent catalogue deletion after an empty listing",
+      "label": "Prevent catalog deletion after an empty listing",
       "type": "boolean",
       "default": true,
-      "help_text": "Blocks Dispatcharr's post-scan cleanup when a provider returns an empty listing, which otherwise deletes that account's entire catalogue and every title only it supplies. Cleanup resumes on the next scan that sees content. Applies even in \"dry run\" mode."
+      "help_text": "Blocks Dispatcharr's post-scan cleanup when a provider returns an empty listing, which otherwise deletes that account's entire catalog and every title only it supplies. Cleanup resumes on the next scan that sees content. Applies even in \"dry run\" mode."
     },
     {
       "id": "allowed_accounts",
@@ -67,6 +67,34 @@
       "type": "boolean",
       "default": false,
       "help_text": "Inject a TMDB tag even for movies no other provider has, to reduce future churn and let later copies merge properly. Changes those movies' Dispatcharr ids now, and they revert if this is turned off."
+    },
+    {
+      "id": "wanted_set_path",
+      "label": "Wanted-set file (enrichment)",
+      "type": "string",
+      "default": "",
+      "help_text": "Path, inside the container, to the wanted-set file your .strm generator publishes. Blank disables enrichment. If the file is missing, stale or malformed nothing happens -- it never falls back to enriching your whole library."
+    },
+    {
+      "id": "enrich_movies",
+      "label": "Enrich wanted movies",
+      "type": "boolean",
+      "default": false,
+      "help_text": "Fetch provider detail for every candidate copy of the movies in the wanted-set file, so quality ranking has something to compare. Use 'Enrichment status' first to see the size."
+    },
+    {
+      "id": "enrich_limit",
+      "label": "Enrichment lookups per run",
+      "type": "number",
+      "default": 25,
+      "help_text": "How many relations 'Enrich movies' fetches in one go. 0 means no limit."
+    },
+    {
+      "id": "enrich_delay_ms",
+      "label": "Delay between enrichment calls (ms)",
+      "type": "number",
+      "default": 500,
+      "help_text": "Spacing between provider calls during enrichment."
     },
     {
       "id": "scheduled_sweep",
@@ -159,6 +187,20 @@
       "label": "Fetch movie details",
       "description": "Look up provider detail for id-less movies and store it. Collects data only; merges nothing. Use 'Movie details per manual run' to adjust the number fetched each run. Resumable, so run it again to continue.",
       "button_label": "Fetch details",
+      "button_variant": "filled"
+    },
+    {
+      "id": "enrich_status",
+      "label": "Enrichment status",
+      "description": "Read the wanted-set file and report how many of its movies resolve, how many candidate copies they have, and how many still need a provider lookup. Makes no provider calls -- safe to run any time.",
+      "button_label": "Enrichment status",
+      "button_variant": "outline"
+    },
+    {
+      "id": "enrich_now",
+      "label": "Enrich movies",
+      "description": "Fetch provider detail for the candidate copies of wanted movies that still lack measured video and audio. Use 'Enrichment lookups per run' to adjust the batch size. Resumable, so run it again to continue.",
+      "button_label": "Enrich now",
       "button_variant": "filled"
     },
     {

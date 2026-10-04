@@ -17,7 +17,11 @@ one truncated with an ellipsis).
 import logging
 import re
 import unittest
-from datetime import datetime, timedelta
+import ast
+import json
+import os
+import tempfile
+from datetime import datetime, timedelta, timezone as _tz
 
 import patch
 
@@ -94,7 +98,7 @@ class PosterKeyTests(unittest.TestCase):
 
 
 class PlotHashTests(unittest.TestCase):
-    def test_punctuation_and_case_are_normalised(self):
+    def test_punctuation_and_case_are_normalized(self):
         a = patch._plot_hash(LONG_PLOT)
         b = patch._plot_hash(LONG_PLOT.upper().replace(",", " --"))
         self.assertIsNotNone(a)
@@ -193,7 +197,7 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(idx["poster"], {})
         self.assertEqual(idx["plot"], {})
 
-    def test_int_tmdb_is_normalised_to_str(self):
+    def test_int_tmdb_is_normalized_to_str(self):
         idx = patch.build_indexes_from_rows([
             _row(cover="https://image.tmdb.org/t/p/w500/a.jpg", tmdb=5920)])
         self.assertEqual(idx["poster"], {"a.jpg": "5920"})
@@ -367,7 +371,7 @@ class VariantPatternTests(unittest.TestCase):
 
     def test_matches(self):
         for name in ("Spider-Noir [Black/White]", "Spider-Noir [black white]",
-                     "Some Show [B&W]", "Some Show [Colorized]", "Some Show [Colourised]"):
+                     "Some Show [B&W]", "Some Show [Colorized]", "Some Show [Colorised]"):
             self.assertTrue(self.rx.search(name), name)
 
     def test_does_not_match(self):
@@ -384,7 +388,7 @@ class DetailTmdbTests(unittest.TestCase):
         props = {"detailed_info": {"tmdb_id": "1504358"}}
         self.assertEqual(patch.detail_tmdb(props), "1504358")
 
-    def test_int_is_normalised(self):
+    def test_int_is_normalized(self):
         self.assertEqual(patch.detail_tmdb({"detailed_info": {"tmdb_id": 1504358}}),
                          "1504358")
 
@@ -913,7 +917,7 @@ class SignatureParityTests(unittest.TestCase):
         self._saved["is_enabled"] = patch.is_enabled
         self._saved["_load_config"] = patch._load_config
         # Keep the wrappers on their delegate-only paths: this suite is about
-        # argument plumbing, not injection or protection behaviour.
+        # argument plumbing, not injection or protection behavior.
         patch.is_enabled = lambda: False
         self.addCleanup(self._restore)
 
@@ -1269,7 +1273,7 @@ class DecidePruneTests(unittest.TestCase):
 
     The live failure this exists for: a provider's movie endpoint returned an
     empty list, so no relation was re-stamped, so core's `stale_days=0` filter
-    matched every one of them and deleted the account's entire movie catalogue
+    matched every one of them and deleted the account's entire movie catalog
     plus every title it solely supplied -- while series in the same run
     processed normally.
     """
@@ -1282,7 +1286,7 @@ class DecidePruneTests(unittest.TestCase):
 
     def test_allows_a_merely_short_scan(self):
         # DELIBERATE: a short listing is not refused. Only zero is unambiguous.
-        # A ratio rule would deadlock on a genuinely shrinking catalogue -- the
+        # A ratio rule would deadlock on a genuinely shrinking catalog -- the
         # unpruned rows keep the total high, so the ratio could never recover.
         allow, reason = patch.decide_prune({"movie": (100, 3), "series": (50, 50)})
         self.assertTrue(allow)
@@ -1412,6 +1416,329 @@ class PruneGuardTests(unittest.TestCase):
         self.assertIsNone(self._call())
 
 
+NOW = datetime(2026, 10, 4, 12, 0, 0, tzinfo=_tz.utc)
+
+
+def _doc(**over):
+    base = {"schema": 1, "generated_at": "2026-10-04T08:00:00Z",
+            "generator": "x", "count": 2, "tmdb_ids": [1, 2],
+            "unidentified": []}
+    base.update(over)
+    return base
+
+
+class ValidateWantedSetTests(unittest.TestCase):
+    """FAIL CLOSED ON SCOPE. Every rejection here must mean "do nothing" --
+    never "do everything", which is the expensive direction."""
+
+    def test_a_good_document_passes(self):
+        self.assertEqual(patch.validate_wanted_set(_doc(), now=NOW), (True, None))
+
+    def test_unknown_schema_is_refused(self):
+        ok, why = patch.validate_wanted_set(_doc(schema=2), now=NOW)
+        self.assertFalse(ok)
+        self.assertIn("schema", why)
+
+    def test_count_disagreeing_with_the_array_is_refused(self):
+        # Their writer runs at the end of a sync that can abort part-way, so
+        # this is the cheapest corruption signal available to either side.
+        ok, why = patch.validate_wanted_set(_doc(count=3), now=NOW)
+        self.assertFalse(ok)
+        self.assertIn("count", why)
+
+    def test_missing_or_wrong_typed_arrays_are_refused(self):
+        self.assertFalse(patch.validate_wanted_set(_doc(tmdb_ids=None), now=NOW)[0])
+        self.assertFalse(patch.validate_wanted_set(
+            _doc(unidentified="nope"), now=NOW)[0])
+        self.assertFalse(patch.validate_wanted_set("not a dict", now=NOW)[0])
+
+    def test_unparseable_timestamp_is_refused(self):
+        ok, why = patch.validate_wanted_set(_doc(generated_at="last tuesday"),
+                                            now=NOW)
+        self.assertFalse(ok)
+        self.assertIn("generated_at", why)
+
+    def test_a_stale_set_is_refused(self):
+        old = (NOW - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ok, why = patch.validate_wanted_set(_doc(generated_at=old), now=NOW)
+        self.assertFalse(ok)
+        self.assertIn("old", why)
+
+    def test_an_empty_set_is_refused(self):
+        ok, _ = patch.validate_wanted_set(
+            _doc(count=0, tmdb_ids=[], unidentified=[]), now=NOW)
+        self.assertFalse(ok)
+
+    def test_unidentified_only_is_legitimate(self):
+        ok, why = patch.validate_wanted_set(
+            _doc(count=0, tmdb_ids=[], unidentified=[{"stream_id": 1}]), now=NOW)
+        self.assertTrue(ok)
+        self.assertIsNone(why)
+
+
+class ReadWantedSetTests(unittest.TestCase):
+    """Absent and unreadable must NOT look alike. Absent is normal; unreadable
+    is a misconfiguration, and collapsing them lets a permissions mistake
+    silently disable the whole feature with no symptom."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def _write(self, text):
+        p = os.path.join(self.dir, "wanted-set.json")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return p
+
+    def test_no_path_configured(self):
+        self.assertEqual(patch.read_wanted_set("", now=NOW)[1], "disabled")
+
+    def test_absent_file(self):
+        self.assertEqual(
+            patch.read_wanted_set(os.path.join(self.dir, "nope.json"), now=NOW)[1],
+            "absent")
+
+    def test_unreadable_is_distinct_from_absent(self):
+        # A directory stands in for any open() failure; the point is only that
+        # it lands in a different bucket from "absent".
+        doc, status, _ = patch.read_wanted_set(self.dir, now=NOW)
+        self.assertIsNone(doc)
+        self.assertEqual(status, "unreadable")
+
+    def test_malformed_json(self):
+        self.assertEqual(
+            patch.read_wanted_set(self._write("{nope"), now=NOW)[1], "malformed")
+
+    def test_invalid_contents(self):
+        p = self._write(json.dumps(_doc(count=99)))
+        doc, status, why = patch.read_wanted_set(p, now=NOW)
+        self.assertIsNone(doc)
+        self.assertEqual(status, "invalid")
+        self.assertIn("count", why)
+
+    def test_a_good_file_reads(self):
+        p = self._write(json.dumps(_doc()))
+        doc, status, _ = patch.read_wanted_set(p, now=NOW)
+        self.assertEqual(status, "ok")
+        self.assertEqual(doc["tmdb_ids"], [1, 2])
+
+
+class ResolveUnidentifiedTests(unittest.TestCase):
+    """Strict order: stream_id, then a UNIQUE name, and resolved_tmdb_id only
+    ever as a corroborator -- it comes from an unverified first-result lookup,
+    so on its own it could silently enrich the wrong movie."""
+
+    def _lookups(self, by_id=None, by_name=None):
+        return (lambda s: (by_id or {}).get(s),
+                lambda n: (by_name or {}).get(n, []))
+
+    def test_live_stream_id_wins(self):
+        bid, bname = self._lookups(by_id={7: (7, None)})
+        self.assertEqual(
+            patch.resolve_unidentified({"stream_id": 7, "name": "x"}, bid, bname),
+            (7, "stream_id", None))
+
+    def test_dead_stream_id_falls_back_to_a_unique_name(self):
+        bid, bname = self._lookups(by_name={"x": [(42, None)]})
+        mid, how, why = patch.resolve_unidentified(
+            {"stream_id": 7, "name": "x"}, bid, bname)
+        self.assertEqual((mid, how, why), (42, "name", None))
+
+    def test_ambiguous_name_is_skipped_not_guessed(self):
+        bid, bname = self._lookups(by_name={"x": [(1, None), (2, None)]})
+        mid, _, why = patch.resolve_unidentified(
+            {"stream_id": 7, "name": "x"}, bid, bname)
+        self.assertIsNone(mid)
+        self.assertIn("ambiguous", why)
+
+    def test_no_match_at_all_is_expected_churn(self):
+        bid, bname = self._lookups()
+        mid, _, why = patch.resolve_unidentified(
+            {"stream_id": 7, "name": "x"}, bid, bname)
+        self.assertIsNone(mid)
+        self.assertIn("dead", why)
+
+    def test_resolved_tmdb_id_may_corroborate(self):
+        bid, bname = self._lookups(by_name={"x": [(42, "555")]})
+        mid, how, _ = patch.resolve_unidentified(
+            {"stream_id": 7, "name": "x", "resolved_tmdb_id": 555}, bid, bname)
+        self.assertEqual((mid, how), (42, "name"))
+
+    def test_resolved_tmdb_id_disagreeing_blocks_the_match(self):
+        bid, bname = self._lookups(by_name={"x": [(42, "555")]})
+        mid, _, why = patch.resolve_unidentified(
+            {"stream_id": 7, "name": "x", "resolved_tmdb_id": 999}, bid, bname)
+        self.assertIsNone(mid)
+        self.assertIn("disagree", why)
+
+    def test_resolved_tmdb_id_never_resolves_on_its_own(self):
+        # No stream_id row and no name: a resolved id alone must not be enough.
+        bid, bname = self._lookups()
+        mid, _, _ = patch.resolve_unidentified(
+            {"stream_id": 7, "resolved_tmdb_id": 555}, bid, bname)
+        self.assertIsNone(mid)
+
+
+class EssentialsAndEnrichDecisionTests(unittest.TestCase):
+
+    def _props(self, video=None, audio=None, mark=None):
+        d = {}
+        if video is not None:
+            d["video"] = video
+        if audio is not None:
+            d["audio"] = audio
+        p = {"detailed_info": d}
+        if mark is not None:
+            p[patch.OWN_PROPS_KEY] = {"enrich": mark}
+        return p
+
+    def test_essentials_need_both_dims_and_audio(self):
+        self.assertTrue(patch.relation_has_essentials(
+            self._props(video={"width": 1920}, audio={"codec": "ac3"})))
+        self.assertFalse(patch.relation_has_essentials(
+            self._props(video={"width": 1920})))
+        self.assertFalse(patch.relation_has_essentials(
+            self._props(audio={"codec": "ac3"})))
+
+    def test_an_empty_video_block_is_absent_not_data(self):
+        # clean_custom_properties drops None/''/[] but NOT {}, so an empty block
+        # reaches storage looking like data.
+        self.assertFalse(patch.relation_has_essentials(
+            self._props(video={}, audio={"codec": "ac3"})))
+
+    def test_junk_detailed_info_does_not_raise(self):
+        self.assertFalse(patch.relation_has_essentials({"detailed_info": "nope"}))
+        self.assertFalse(patch.relation_has_essentials({}))
+        self.assertFalse(patch.relation_has_essentials(None))
+
+    def test_already_complete_is_not_refetched(self):
+        should, _ = patch.decide_enrich(
+            self._props(video={"width": 1920}, audio={"c": 1}), NOW.isoformat())
+        self.assertFalse(should)
+
+    def test_never_attempted_is_fetched(self):
+        should, why = patch.decide_enrich(self._props(), NOW.isoformat())
+        self.assertTrue(should)
+        self.assertIn("never", why)
+
+    def test_a_provider_that_had_nothing_is_not_asked_again(self):
+        # THE point of stamping an attempt rather than a success: otherwise the
+        # relations whose providers never answer are re-asked every single run,
+        # and those are exactly the ones a later probe pass pays most for.
+        for got in ("none", "partial", "full"):
+            should, _ = patch.decide_enrich(
+                self._props(mark={"at": NOW.isoformat(), "got": got}),
+                NOW.isoformat())
+            self.assertFalse(should, got)
+
+    def test_an_error_retries_but_only_after_the_window(self):
+        recent = (NOW - timedelta(days=1)).isoformat()
+        should, _ = patch.decide_enrich(
+            self._props(mark={"at": recent, "got": "error"}), NOW.isoformat())
+        self.assertFalse(should)
+
+        old = (NOW - timedelta(days=30)).isoformat()
+        should, why = patch.decide_enrich(
+            self._props(mark={"at": old, "got": "error"}), NOW.isoformat())
+        self.assertTrue(should)
+        self.assertIn("retry", why)
+
+    def test_an_unreadable_mark_retries_rather_than_stalls(self):
+        should, _ = patch.decide_enrich(
+            self._props(mark={"got": "error"}), NOW.isoformat())
+        self.assertTrue(should)
+        should, _ = patch.decide_enrich(
+            self._props(mark="not a dict"), NOW.isoformat())
+        self.assertTrue(should)
+
+
+class TakeWholeMoviesTests(unittest.TestCase):
+    """A bounded run must never leave a movie half-measured.
+
+    Ranking compares a movie's copies against each other, and a copy with no
+    audio data scores zero -- so a half-enriched comparison set can rank an
+    enriched stereo track above an unmeasured surround one. Partial coverage of
+    a movie is worse than none, which makes the movie, not the relation, the
+    unit a run is allowed to stop at.
+    """
+
+    def _g(self, *sizes):
+        return [(i, ["r%d-%d" % (i, j) for j in range(n)])
+                for i, n in enumerate(sizes)]
+
+    def test_takes_whole_movies_only(self):
+        got = patch.take_whole_movies(self._g(3, 3, 3), 7)
+        self.assertEqual(len(got), 6)        # not 7 -- would have split the third
+
+    def test_exact_fit_is_taken(self):
+        self.assertEqual(len(patch.take_whole_movies(self._g(3, 3), 6)), 6)
+
+    def test_zero_limit_means_everything(self):
+        self.assertEqual(len(patch.take_whole_movies(self._g(3, 4, 5), 0)), 12)
+
+    def test_a_movie_bigger_than_the_limit_is_still_taken(self):
+        # Otherwise a title with more copies than the batch size could never be
+        # enriched at all -- and those are the titles ranking matters most for.
+        got = patch.take_whole_movies(self._g(9), 5)
+        self.assertEqual(len(got), 9)
+
+    def test_an_oversized_movie_does_not_drag_in_the_next_one(self):
+        got = patch.take_whole_movies(self._g(9, 2), 5)
+        self.assertEqual(len(got), 9)
+
+    def test_nothing_to_do(self):
+        self.assertEqual(patch.take_whole_movies([], 5), [])
+
+
+class EnrichmentPreservesEssentialTests(unittest.TestCase):
+    """Enrichment's write is a WHOLE REPLACE of detailed_info, so it can drop a
+    tmdb_id the detail sweep captured -- the merge plugin's strongest movie
+    signal, and precisely the failure `preserve_detail` exists to stop. That
+    guard wraps CORE's refresh and does not reach this path, so the same rule
+    has to be applied here explicitly.
+
+    Structural rather than behavioural, because the bug is an OMISSION: a later
+    rewrite of the write path that simply forgot the call would pass any test
+    that did not happen to construct the drop case. This fails on absence.
+    """
+
+    def _impl(self):
+        import ast
+        src = open(patch.__file__, encoding="utf-8").read()
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "enrich_movies_impl":
+                return node
+        self.fail("enrich_movies_impl not found")
+
+    def test_the_write_path_restores_essential_keys(self):
+        fn = self._impl()
+        called = {c.func.id for c in ast.walk(fn)
+                  if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+        self.assertIn(
+            "restore_essential", called,
+            "enrich_movies_impl replaces detailed_info wholesale and must call "
+            "restore_essential, or a provider reply lacking tmdb_id silently "
+            "destroys a captured merge signal")
+
+    def test_restore_actually_protects_the_merge_signal(self):
+        # The policy itself, on the case that matters: sweep captured a tmdb,
+        # the fresh payload has richer video but no id.
+        old = {"tmdb_id": "555", "video": {}, "audio": None}
+        new = {"video": {"width": 1920}, "audio": {"codec": "ac3"}}
+        merged, restored = patch.restore_essential(old, new)
+        self.assertEqual(merged.get("tmdb_id"), "555")
+        self.assertEqual(merged["video"], {"width": 1920})
+        self.assertIn("tmdb_id", restored)
+
+    def test_a_value_the_provider_sent_always_wins(self):
+        old = {"tmdb_id": "111"}
+        new = {"tmdb_id": "222", "video": {"width": 1}, "audio": {"c": 1}}
+        merged, restored = patch.restore_essential(old, new)
+        self.assertEqual(merged["tmdb_id"], "222")
+        self.assertNotIn("tmdb_id", restored)
+
+
 class ManifestParityTests(unittest.TestCase):
     """plugin.json and the Plugin class both declare the UI, so they must agree.
 
@@ -1468,7 +1795,7 @@ class ManifestParityTests(unittest.TestCase):
 
     def test_defaults_are_the_deliberate_asymmetry(self):
         # Series ON, movies OFF -- so neither an upgrade nor a fresh install
-        # changes behaviour on its own. Documented in patch.py; asserted here so
+        # changes behavior on its own. Documented in patch.py; asserted here so
         # a "tidy up the defaults" edit has to be deliberate.
         self.assertIs(patch.DEFAULT_MERGE_SERIES, True)
         self.assertIs(patch.DEFAULT_MERGE_MOVIES, False)
@@ -1479,7 +1806,7 @@ class ManifestParityTests(unittest.TestCase):
 
     def test_the_two_protective_settings_default_on(self):
         # Both fix upstream data loss rather than changing this plugin's
-        # behaviour, so an install that ignores them is still protected. And
+        # behavior, so an install that ignores them is still protected. And
         # neither may be gated by dry_run -- that would make dry run permit
         # the loss it exists to avoid.
         self.assertIs(patch.DEFAULT_PROTECT_MERGES, True)

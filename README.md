@@ -191,10 +191,14 @@ the other. Listed in the order the UI shows them.
 | **Merge movies** | off | Merge duplicate movies. Off by default so an upgrade never starts merging movies on its own. |
 | **Prevent destructive movie merges** | on | Fixes an upstream Dispatcharr bug; independent of this plugin's own merging. See [Protecting against a destructive core merge](#protecting-against-a-destructive-core-merge). Not affected by dry run. |
 | **Preserve essential movie detail** | on | Puts back the TMDB id, video and audio details when a Dispatcharr detail fetch drops them. Also an upstream fix rather than a merging change. See [Preserving detail a refresh drops](#preserving-detail-a-refresh-drops). Not affected by dry run. |
-| **Prevent catalogue deletion after an empty listing** | on | Blocks Dispatcharr's post-scan cleanup when a provider returns nothing, which otherwise deletes that account's whole catalogue. A third upstream fix, unrelated to merging. See [Surviving an empty provider listing](#surviving-an-empty-provider-listing). Not affected by dry run. |
+| **Prevent catalog deletion after an empty listing** | on | Blocks Dispatcharr's post-scan cleanup when a provider returns nothing, which otherwise deletes that account's whole catalog. A third upstream fix, unrelated to merging. See [Surviving an empty provider listing](#surviving-an-empty-provider-listing). Not affected by dry run. |
 | **Limit series merging to accounts** | *(empty = all)* | Account names to merge series **from**. The canonical can live on any account. |
 | **Limit movie merging to accounts** | *(empty = all)* | The movie equivalent, **independent of the series list**. Also bounds which accounts the detail sweep looks up, so scope and sweep stay in step. |
 | **Tag movies no other providers have** | off | Lets the detail tier *create* a newly tagged movie rather than only merging into an existing one. Changes those movies' Dispatcharr ids now, and they revert if it is turned off. |
+| **Wanted-set file (enrichment)** | *(empty = off)* | Path, inside the container, to the file your `.strm` generator publishes listing the movies it syncs. See [Enriching the movies you sync](#enriching-the-movies-you-sync). |
+| **Enrich wanted movies** | off | Fetch provider detail for every candidate copy of those movies, so quality ranking has something to compare. |
+| **Enrichment lookups per run** | 25 | Batch size for the manual **Enrich movies** action. 0 means no limit. |
+| **Delay between enrichment calls (ms)** | 500 | Spacing between provider calls during enrichment. |
 | **Fetch movie details nightly** | off | Creates the beat schedule. |
 | **Nightly sweep hour (0-23)** | 4 | System timezone. |
 | **Approve manually** | *(empty)* | `<account>:<id>=<tmdb_id>`, for duplicates no signal reaches. Series and movies — see [Manual approvals](#manual-approvals). |
@@ -317,7 +321,7 @@ showing `None` is the duplicate you need to approve.
 
 ### Verifying
 
-Check the approval is recognised **before** running a refresh. Everything below
+Check the approval is recognized **before** running a refresh. Everything below
 is read-only and makes no provider calls, so none of it needs dry run turned on.
 
 **Movies — Movie merge status.** Its output leads with a short summary rather than a
@@ -569,9 +573,66 @@ so they suppress nothing after that, and anything reading the record sensibly
 reads it as "asked for recently" — a window those old timestamps have already
 fallen out of. There is no cleanup step to run.
 
+## Enriching the movies you sync
+
+Unrelated to merging. Off by default, and it does nothing at all until you give
+it a file to read.
+
+Dispatcharr can rank a movie's candidate copies by measured resolution and audio
+rather than by whatever the stream name claims — but only where that data has
+been fetched. Two things get in the way.
+
+**The detail endpoint only ever refreshes one copy per movie.** It picks the
+highest-priority account's and stops. That is a structural limit, not a setting,
+and ranking compares copies against each other, so data for one of six settles
+nothing. Worse, partial coverage is actively harmful: a copy with no audio data
+scores zero, so an enriched stereo track can beat an unenriched surround one.
+
+**Fetching detail for your whole library is the wrong answer.** Most of a large
+catalog is content you will never watch. The useful set is the few thousand
+titles you actually sync — and only your `.strm` generator knows which those
+are.
+
+So it publishes them, and this reads them. Point **Wanted-set file
+(enrichment)** at the file, turn on **Enrich wanted movies**, and run **Enrich
+movies**. It fetches provider detail for every candidate copy of every wanted
+title, directly per copy.
+
+**Run Enrichment status first.** It makes no provider calls and tells you how
+many titles resolve, how many copies they have between them, and how many still
+need a lookup — so you know the size of the job before starting one.
+
+### What it refuses to do
+
+If the file is missing, unreadable, malformed, of an unknown schema, internally
+inconsistent, or older than two weeks, **nothing happens**. It never falls back
+to enriching everything. A mistake in the enrichment costs you some missing
+metadata; a mistake in the thing deciding how much work to do would cost
+thousands of provider calls on a set nobody asked for.
+
+Missing and unreadable are reported separately on purpose. A permissions
+mistake would otherwise look identical to "no file yet", and quietly disable
+the feature with nothing to find.
+
+### Why repeated runs are cheap
+
+Each copy records that it was *attempted*, not merely whether it succeeded. A
+provider that answered and had nothing more to give is not asked again —
+otherwise every run would re-ask for exactly the copies that never answer.
+Genuine errors retry after a week.
+
+So the first run does the work, and later runs cost almost nothing until you add
+titles.
+
+### What this does not do yet
+
+It harvests what providers already know. On libraries where most providers
+return no technical detail at all, that leaves a lot unfilled — the remedy for
+which is measuring the streams directly, and that is not in this release.
+
 ## Surviving an empty provider listing
 
-A third upstream fix, unrelated to merging, controlled by **Prevent catalogue
+A third upstream fix, unrelated to merging, controlled by **Prevent catalog
 deletion after an empty listing** (on by default).
 
 Every VOD scan ends with a cleanup pass. It deletes any relation the scan did
@@ -585,7 +646,7 @@ along with every title that account was the only source for. The titles return
 on the next good scan, but as **new rows with new ids**. Saved links break, and
 anything that remembered the old ids silently points at nothing.
 
-This is observed behaviour, not a worry. On one library an empty movie listing
+This is observed behavior, not a worry. On one library an empty movie listing
 removed an account's entire set of movie relations and thousands of library
 items in a single scheduled refresh — while that same account's series, fetched
 seconds earlier over the same connection, came back complete. It is the kind of
@@ -603,7 +664,7 @@ is recorded in the log with its own action and appears in Dispatcharr's own
 cleanup line, so you do not have to go looking for it.
 
 **Only a completely empty result is refused.** A listing that merely comes back
-short is left alone. That is deliberate: a threshold would also block a catalogue
+short is left alone. That is deliberate: a threshold would also block a catalog
 that has genuinely shrunk, and because the unpruned rows keep the total high it
 would keep blocking it for ever. A partially short listing does proportional
 damage and is a real gap — it belongs upstream, and has been reported there.
@@ -619,7 +680,7 @@ testing movie listings almost never did — the movie plot index came out orders
 magnitude smaller than the poster index. It costs nothing to keep, catches real
 duplicates when a provider does supply descriptions, and the detail tier covers
 the same ground for movies. Just don't size your expectations on the series
-behaviour.
+behavior.
 
 **Poster matching requires TMDB-hosted URLs.** Some providers mirror TMDB artwork
 onto their own CDN, preserving the asset basename but not the hostname, and those

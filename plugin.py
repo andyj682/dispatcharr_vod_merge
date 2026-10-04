@@ -109,7 +109,7 @@ def _format_log(data, limit=60):
 class Plugin:
     # UI title only; "Dispatcharr" is redundant inside the Dispatcharr UI.
     name = "VOD Merge"
-    version = "1.3.0"
+    version = "1.4.0"
     description = (
         "Durably merges duplicate VOD titles from providers that omit TMDB ids, "
         "by matching metadata like poster artwork and plot text to a title you "
@@ -176,13 +176,13 @@ class Plugin:
         },
         {
             "id": "protect_prune",
-            "label": "Prevent catalogue deletion after an empty listing",
+            "label": "Prevent catalog deletion after an empty listing",
             "type": "boolean",
             "default": True,
             "help_text": (
                 "Blocks Dispatcharr's post-scan cleanup when a provider returns "
                 "an empty listing, which otherwise deletes that account's "
-                "entire catalogue and every title only it supplies. Cleanup "
+                "entire catalog and every title only it supplies. Cleanup "
                 "resumes on the next scan that sees content. Applies even in "
                 "\"dry run\" mode."
             ),
@@ -219,6 +219,46 @@ class Plugin:
                 "Changes those movies' Dispatcharr ids now, and they revert if "
                 "this is turned off."
             ),
+        },
+        {
+            "id": "wanted_set_path",
+            "label": "Wanted-set file (enrichment)",
+            "type": "string",
+            "default": "",
+            "help_text": (
+                "Path, inside the container, to the wanted-set file your .strm "
+                "generator publishes. Blank disables enrichment. If the file is "
+                "missing, stale or malformed nothing happens -- it never falls "
+                "back to enriching your whole library."
+            ),
+        },
+        {
+            "id": "enrich_movies",
+            "label": "Enrich wanted movies",
+            "type": "boolean",
+            "default": False,
+            "help_text": (
+                "Fetch provider detail for every candidate copy of the movies "
+                "in the wanted-set file, so quality ranking has something to "
+                "compare. Use 'Enrichment status' first to see the size."
+            ),
+        },
+        {
+            "id": "enrich_limit",
+            "label": "Enrichment lookups per run",
+            "type": "number",
+            "default": 25,
+            "help_text": (
+                "How many relations 'Enrich movies' fetches in one go. 0 means "
+                "no limit."
+            ),
+        },
+        {
+            "id": "enrich_delay_ms",
+            "label": "Delay between enrichment calls (ms)",
+            "type": "number",
+            "default": 500,
+            "help_text": "Spacing between provider calls during enrichment.",
         },
         {
             "id": "scheduled_sweep",
@@ -375,6 +415,27 @@ class Plugin:
             "button_variant": "filled",
         },
         {
+            "id": "enrich_status",
+            "label": "Enrichment status",
+            "description": "Read the wanted-set file and report how many of its "
+                           "movies resolve, how many candidate copies they have, "
+                           "and how many still need a provider lookup. Makes no "
+                           "provider calls -- safe to run any time.",
+            "button_label": "Enrichment status",
+            "button_variant": "outline",
+        },
+        {
+            "id": "enrich_now",
+            "label": "Enrich movies",
+            "description": "Fetch provider detail for the candidate copies of "
+                           "wanted movies that still lack measured video and "
+                           "audio. Use 'Enrichment lookups per run' to adjust "
+                           "the batch size. Resumable, so run it again to "
+                           "continue.",
+            "button_label": "Enrich now",
+            "button_variant": "filled",
+        },
+        {
             "id": "list_log",
             "label": "Show injection log",
             "description": "List recorded merges and skipped variants. Also "
@@ -525,6 +586,76 @@ class Plugin:
             except Exception as exc:
                 logger.exception("[VOD-MERGE] sweep_movies failed")
                 return {"status": "error", "message": f"Detail sweep failed: {exc}"}
+
+        if action == "enrich_status":
+            try:
+                st = _patch.enrich_status()
+                if st.get("file_status") != "ok":
+                    # Absent is normal before the first sync; the others are
+                    # misconfiguration. Either way nothing would run -- say which.
+                    return {
+                        "status": "ok",
+                        "message": (
+                            f"enrich_movies={st['enrich_movies']}\n"
+                            f"wanted-set file: {st['file_status']}"
+                            f" ({st.get('file_detail')})\n"
+                            f"path: {st['path']}\n"
+                            "Nothing would be enriched. This never falls back "
+                            "to enriching the whole library."
+                        ),
+                        "report": st,
+                    }
+                per = "\n".join(
+                    f"   {a}: {v['relations']} copies, {v['need']} need a lookup"
+                    for a, v in sorted(st.get("per_account", {}).items()))
+                return {
+                    "status": "ok",
+                    "message": (
+                        f"enrich_movies={st['enrich_movies']}  "
+                        f"generated {st.get('generated_at')}\n"
+                        f"wanted: {st['tmdb_resolved']}/{st['tmdb_total']} by TMDB id, "
+                        f"{st['unid_resolved']}/{st['unid_total']} unidentified "
+                        f"-> {st['movies']} movies\n"
+                        f"candidate copies: {st['relations']} "
+                        f"({st['relations'] / st['movies']:.1f} per movie)\n"
+                        f"already have video+audio: {st['have_essentials']}, "
+                        f"need a lookup: {st['need_fetch']}, "
+                        f"previously attempted: {st['already_attempted']}\n"
+                        f"runs at the current limit: {st['runs_at_current_limit']}"
+                        + ("\n" + per if per else "")
+                    ),
+                    "report": st,
+                }
+            except Exception as exc:
+                logger.exception("[VOD-MERGE] enrich_status failed")
+                return {"status": "error", "message": f"Enrichment status failed: {exc}"}
+
+        if action == "enrich_now":
+            try:
+                st = _patch.enrich_movies_impl()
+                if st.get("aborted"):
+                    return {"status": "ok",
+                            "message": f"Nothing done: {st['aborted']}",
+                            "report": st}
+                per = "\n".join(
+                    f"   {a}: fetched={v['fetched']}, with video+audio={v['essentials']}, "
+                    f"empty={v['empty']}, errors={v['errors']}"
+                    for a, v in sorted(st.get("per_account", {}).items()))
+                return {
+                    "status": "ok",
+                    "message": (
+                        f"fetched={st['fetched']} "
+                        f"(gained video+audio={st['got_essentials']}), "
+                        f"empty={st['empty']}, errors={st['errors']}, "
+                        f"skipped={st['skipped']}\n"
+                        f"remaining: {st['remaining']}"
+                        + ("\n" + per if per else "")
+                    ),
+                    "report": st,
+                }
+            except Exception as exc:
+                logger.exception("[VOD-MERGE] enrich_now failed")
+                return {"status": "error", "message": f"Enrichment failed: {exc}"}
 
         if action == "list_log":
             data = _patch.get_log()

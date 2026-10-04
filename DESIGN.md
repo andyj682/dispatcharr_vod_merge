@@ -20,7 +20,7 @@ has zero callers, and `refresh_series_episodes` reads the detailed
 Movies have one, and it is worse than nothing; see
 [Why this never calls the core movie refresh](#why-this-never-calls-the-core-movie-refresh).
 
-On the library this was built against, **~90% of one provider's catalogue was
+On the library this was built against, **~90% of one provider's catalog was
 duplicate content.** De-duplication is not a tidiness feature here — it is the
 precondition for syncing that provider at all.
 
@@ -186,7 +186,7 @@ already fetches exactly this payload. It must not, for two independent reasons.
 the movie being refreshed and **deletes** the pre-existing one. The movie being
 refreshed is, on this path, always the freshly-minted orphan — so the canonical
 carrying most of the relations, the curated name and the established UUID is
-deleted in favour of a one-relation row named after a provider's raw listing
+deleted in favor of a one-relation row named after a provider's raw listing
 string. It fires precisely when the detail's tmdb belongs to another row, which
 is every candidate here. Running it across thousands of relations would rewrite
 the library.
@@ -315,7 +315,7 @@ restored key rather than a lost row — not worth transaction machinery.
 
 ## A third guard: the cleanup that trusts an empty answer
 
-The other two guards protect a row or a field. This one protects the catalogue.
+The other two guards protect a row or a field. This one protects the catalog.
 
 Every scan ends with `cleanup_orphaned_vod_content(account_id=…,
 scan_start_time=…)`, which runs at `stale_days=0` — so the cutoff is the scan's
@@ -326,7 +326,7 @@ every `Movie` with no relations left from any account.
 The correctness of all that rests on one unstated assumption: **that the scan
 saw the provider's real answer.** When the movie endpoint returns an empty list
 the scan sees nothing, every relation on the account is stale, and the pass
-removes the account's whole catalogue plus every title it solely supplied. The
+removes the account's whole catalog plus every title it solely supplied. The
 rows return on the next good scan with new primary keys, so the damage is not
 just deletion but an id churn for everything downstream.
 
@@ -348,10 +348,10 @@ So the guard refuses rather than repairs: before delegating, count how many of
 that account's relations would survive core's own filter, using core's own
 cutoff arithmetic so "seen" means exactly "not stale". If a content type has
 relations and **none** survive, skip the cleanup for that scan. A deferred
-cleanup costs a day of stale rows; the alternative costs the catalogue.
+cleanup costs a day of stale rows; the alternative costs the catalog.
 
 **Zero, not a ratio.** A threshold would also catch a listing that came back 90%
-short — but a genuinely shrinking catalogue would then be refused permanently,
+short — but a genuinely shrinking catalog would then be refused permanently,
 because the rows that were never pruned keep the total high and the ratio can
 never recover. Zero-seen carries no such state: one good scan clears it. The
 short-listing case is real and is left upstream.
@@ -373,6 +373,94 @@ Dispatcharr's `VOD cleanup completed: …` line. That matters more than it looks
 plugin loggers inherit root, and root is `WARNING` in the Celery prefork child
 where scans run, so a message routed through `apps.vod.tasks` is visible in
 places our own logger historically was not.
+
+## Enrichment: whose job is it to know what matters
+
+Ranking candidate copies needs measured video and audio for **every** copy of a
+movie, not one. Two constraints shape the whole design.
+
+**The XC detail endpoint refreshes exactly one copy per movie** — it resolves
+the id, filters to active accounts, and takes
+`order_by('-m3u_account__priority','id').first()`. That is structural. No amount
+of configuration makes a client-side caller cover all N, so a client-driven
+harvest can only ever reach 1/N, and on a real library far less than that when
+the winning account is one that supplies no technical detail.
+
+**Our own sweep has no such limit**, because it calls the provider per relation
+directly rather than going through the endpoint. That asymmetry is the entire
+reason this lives here rather than in the tool that knows which titles matter.
+
+**But we do not know which titles matter, and cannot.** That is demand, and it
+exists only in the thing doing the syncing. Everything else — how many copies a
+movie has, which providers carry it, what detail is already stored — is a query.
+So the contract carries exactly one thing and the rest is looked up.
+
+### Fail open on enrichment, fail closed on scope
+
+The two halves fail in opposite directions, and the asymmetry is the point.
+
+A fault in the enrichment costs some missing metadata. Nothing is destroyed, and
+a user waiting on data should not lose it to an over-careful guard. That half
+fails open.
+
+A fault in the thing that decides **how much work to do** is different in kind:
+the failure mode is thousands of provider calls against a set nobody asked for.
+So every way the input can be untrustworthy — absent, unreadable, malformed,
+unknown schema, a count disagreeing with its own array, or a timestamp too old
+to believe — collapses to doing nothing. It must never widen.
+
+Absent and unreadable are reported separately. They are indistinguishable in
+effect, and absent is defined as "do nothing", so collapsing them would turn a
+permissions mistake into a silent no-op with no symptom. The one that is normal
+logs INFO; the one that is a misconfiguration logs WARNING.
+
+### Stamp the attempt, not the success
+
+The skip rule keys on *was this tried*, not *does this have data*.
+
+Keying on data looks equivalent and is not. The copies that never yield anything
+are the ones whose providers do not supply it — so a data-keyed rule re-asks for
+exactly those, every run, forever. They are also the ones a later measuring pass
+pays the most for, which makes it precisely the wrong set to keep retrying.
+
+Recording the outcome alongside the attempt is what lets the distinction be
+drawn later: a provider that answered and had nothing is a fact about that
+stream, while an error is a fact about that moment. Only the second is retried,
+and only after a week.
+
+### Order by movie, not by relation
+
+The detail sweep walks newest-relation-first, which is right for it: new
+arrivals are the ones duplicating titles already in the library.
+
+Enrichment must not. Providers cluster in id ranges -- overwhelmingly so for one
+that has been wholesale recreated -- so newest-first walks a single provider's
+copies across every movie before reaching the next provider's. Measured on a
+real wanted set, the first thirty fetches were all one provider.
+
+The cost is not slowness, it is shape. That ordering leaves every movie
+partially covered for the whole backlog, and partial coverage is the one state
+ranking handles worst: a copy with no audio data scores zero, so a half-measured
+set can rank an enriched stereo track above an unmeasured surround one. Grouping
+by movie keeps coverage uniform across whatever has been completed, and makes
+the movie the unit a bounded run may stop at.
+
+A movie with more copies than the batch size is taken whole anyway. The
+alternative is that it never gets enriched at all -- and a title with many
+copies is precisely the one where ranking matters most.
+
+### What is deliberately not here
+
+Measuring streams directly — opening them and reading the bitstream — is the
+only way to reach what providers never send, and it is absent from this release
+on purpose. It costs a real connection slot per copy rather than a light API
+call, which brings in throttling, provider health checks, and a retry ladder
+with a circuit breaker. Bundling that with the contract and the harvest would
+mean shipping two risk profiles as one change.
+
+It also benefits from going second: this pass reports exactly how many copies it
+could not fill, which sizes the expensive one from measurement instead of
+estimate.
 
 ## Manual approvals
 
