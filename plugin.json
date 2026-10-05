@@ -1,7 +1,7 @@
 {
-  "name": "VOD Merge",
-  "version": "1.5.4",
-  "description": "Durably merges duplicate VOD titles from providers that omit TMDB ids, by matching metadata like poster artwork and plot text to a title you already have. Works only with XC accounts.",
+  "name": "VOD Merge & Enrich",
+  "version": "1.5.5",
+  "description": "Merges duplicate VOD titles from providers that omit TMDB ids, by matching other details to an existing title. Adds video and audio specs for a given list of movies. Works only with XC accounts.",
   "author": "andyj682",
   "help_url": "https://github.com/andyj682/dispatcharr_vod_merge",
   "fields": [

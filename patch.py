@@ -1,6 +1,6 @@
 """
-Dispatcharr VOD Merge -- implementation
-==============================================
+Dispatcharr VOD Merge & Enrich -- implementation
+================================================
 
 SEE `DESIGN.md` for the current, complete rationale. This docstring predates
 movie support and describes the series path only; it is kept because the series

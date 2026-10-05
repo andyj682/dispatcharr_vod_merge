@@ -7,6 +7,15 @@ Everything through 0.8.3 landed during initial development against a single
 large live library; the entries below record *why* each change was needed, since
 several were driven by failures that were invisible from the outside.
 
+## 1.5.5 — 2026-10-05
+
+**Changed — renamed to VOD Merge & Enrich**
+
+- The plugin now does two things — merging duplicates and enriching the movies
+  you sync — so its display name and description say both. Only the label
+  changed: the folder and internal key stay `dispatcharr_vod_merge`, so
+  settings, records and schedules carry over untouched.
+
 ## 1.5.4 — 2026-10-05
 
 **Added — check 4K copies for Dolby Vision even when the provider described them**

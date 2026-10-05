@@ -1,9 +1,19 @@
-# Dispatcharr VOD Merge
+# Dispatcharr VOD Merge & Enrich
 
 Merges duplicate VOD series and movies created by providers that omit the
 TMDB id from their listing, by matching each duplicate to the title you already
 have via **TMDB poster artwork**, **plot text**, or — for movies — the
 provider's own id in its **detail** payload. Merges are durable across subsequent VOD library refreshes.
+
+It also **enriches the movies you sync** with real video and audio details — from
+the provider's detail where it has them, and by analyzing the stream with
+ffprobe where it does not — so quality ranking can tell a movie's copies apart
+and pick the best one, including avoiding Dolby Vision copies a device cannot
+show. See [Enriching the movies you sync](#enriching-the-movies-you-sync).
+
+The plugin's folder and internal key stay `dispatcharr_vod_merge` from its
+merge-only beginnings; renaming them would make Dispatcharr treat it as a new
+plugin and lose its settings and records.
 
 **Works only with Xtream-Codes (XC) accounts.** Both wrappers skip any account
 whose type is not XC, because the signals are read from the XC listing payload

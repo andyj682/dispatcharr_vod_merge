@@ -1,6 +1,6 @@
 """
-Dispatcharr VOD Merge
-=====================
+Dispatcharr VOD Merge & Enrich
+==============================
 
 Merges duplicate VOD *series and movies* created by providers that omit the TMDB
 id from their listing. Such an entry keys by name+year and lands on its own row
@@ -201,12 +201,12 @@ def _format_log(data, limit=60):
 
 class Plugin:
     # UI title only; "Dispatcharr" is redundant inside the Dispatcharr UI.
-    name = "VOD Merge"
-    version = "1.5.4"
+    name = "VOD Merge & Enrich"
+    version = "1.5.5"
     description = (
-        "Durably merges duplicate VOD titles from providers that omit TMDB ids, "
-        "by matching metadata like poster artwork and plot text to a title you "
-        "already have. Works only with XC accounts."
+        "Merges duplicate VOD titles from providers that omit TMDB ids, by "
+        "matching other details to an existing title. Adds video and audio specs "
+        "for a given list of movies. Works only with XC accounts."
     )
     author = "andyj682"
     help_url = "https://github.com/andyj682/dispatcharr_vod_merge"

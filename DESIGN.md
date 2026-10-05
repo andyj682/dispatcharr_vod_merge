@@ -1,4 +1,4 @@
-# Dispatcharr VOD Merge — design
+# Dispatcharr VOD Merge & Enrich — design
 
 ## Problem
 
