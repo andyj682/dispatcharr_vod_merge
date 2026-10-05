@@ -7,6 +7,32 @@ Everything through 0.8.3 landed during initial development against a single
 large live library; the entries below record *why* each change was needed, since
 several were driven by failures that were invisible from the outside.
 
+## 1.5.4 — 2026-10-05
+
+**Added — check 4K copies for Dolby Vision even when the provider described them**
+
+- New setting **Also ffprobe 4K copies for Dolby Vision**, on by default; it only
+  applies once ffprobe measuring is on. Until now a copy whose provider
+  supplied resolution and audio was never measured, so its Dolby Vision status
+  could not be known — and no provider ever reports it. Avoiding DV streams
+  without a fallback layer therefore worked for some movies and silently not
+  for others.
+
+- Only copies the provider described as 4K are checked, using the same 4K rule
+  the quality-ranking plugin uses, and each only once (an error retries after
+  the usual window). They are measured after copies with no details at all,
+  within the same per-run budget.
+
+- A DV record found this way is added to the provider's existing video details,
+  keeping every value the provider sent — that is where the ranking plugin looks
+  for it. Previously a measurement only filled details that were entirely
+  missing, so on these copies the record would never have reached it.
+
+- **Enrichment status** shows the 4K checks waiting and includes them in the run
+  and nights estimates. The last run reports how many 4K checks were made and,
+  across **every** measurement, how many copies were Dolby Vision and how many
+  of those have no fallback layer — the ones that matter on non-DV hardware.
+
 ## 1.5.3 — 2026-10-04
 
 **Added — enrich the wanted set nightly**

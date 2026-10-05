@@ -573,6 +573,28 @@ bounded window — playback that starts during a probe of at most thirty
 seconds — and a measurement cut short in that window is already recorded as a
 retryable error rather than a fact about the stream.
 
+### Checking described 4K copies for Dolby Vision
+
+"Essential" was defined as resolution and audio, which a provider can supply.
+That left one blind spot: a copy the provider described is never measured, so
+its Dolby Vision status is unknowable, while an undescribed copy is measured
+and gains it. Avoid-DV would work for some movies and silently not for others,
+indistinguishably — and since detection is positive-only, an unmeasured
+no-fallback stream is not "known safe", it is invisible and can win selection.
+
+The fix is narrow on purpose. DV lives on 4K copies, so only copies the
+provider described as 4K are checked, using the ranking plugin's own 4K rule
+(copied, not imported — the plugins never depend on each other) so the two
+agree on what 4K means. They go after gap-filling within the same budget: a
+copy with no resolution or audio costs ranking more than an unknown DV status.
+
+The subtle part is where the result lands. The mirror into the detail the
+ranking plugin reads fills holes, and a described copy has no hole — its video
+block exists. Left alone, the DV record would sit only in our own key, where
+nothing that acts on it looks. So the same rule is applied one level down: the
+one key a provider never sends is added into the provider's video block, and
+every value the provider did send is kept.
+
 ### Running unattended
 
 The busy check was the prerequisite: an unattended run cannot choose its

@@ -209,6 +209,7 @@ the other. Listed in the order the UI shows them.
 | **Delay between enrichment calls (ms)** | 500 | Spacing between provider calls during enrichment. |
 | **Use ffprobe to analyze streams with no provider details** | off | Adds a second step to **Enrich movies**: open each copy the lookup could not describe and measure it. The only source of Dolby Vision information. Costs a provider connection slot per copy. |
 | **Ffprobe lookups per run** | 3 | Maximum number of streams one **Enrich movies** run analyzes. Deliberately small. |
+| **Also ffprobe 4K copies for Dolby Vision** | on | When a provider's details say a copy is 4K, ffprobe it anyway to look for Dolby Vision, which providers never report. Only applies with ffprobe on; copies missing details are measured first. |
 | **Delay between ffprobe calls (ms)** | 2000 | Spacing between ffprobe calls. |
 | **Movie details per manual run** | 50 | Bounds the **manual** sweep only — it runs inside a web request and would otherwise time out. The nightly sweep is unbounded by design. |
 | **Delay between detail calls (ms)** | 200 | Provider rate-limit throttle. Raise before adding several large categories at once. |
@@ -408,7 +409,7 @@ it can go stale quietly.
 | **Movie merge status** | Read-only, no provider calls. What would be merged for movies and how much detail backlog is left. Full list written to `movie_status.json`. |
 | **Fetch movie details** | Runs the sweep manually, bounded by *Movie details per manual run*. |
 | **Enrichment status** | Read-only, no provider calls. How much of the wanted set resolves, how many copies still need a lookup or a measurement, and whether the last enrichment run is still going or how it ended. |
-| **Enrich movies** | Starts a background run: provider detail for the next batch of wanted copies, then — if measuring is on — measures the ones no provider described. Returns at once; the result appears under **Enrichment status**. |
+| **Enrich movies** | Starts a background run: provider detail for the next batch of wanted copies, then analyzes any streams still without information with ffprobe (if enabled). Returns at once; the result appears under **Enrichment status**. |
 | **Show injection log** | The audit trail. |
 | **Clear injection log** | Resets it. |
 
@@ -688,6 +689,29 @@ If several measurements against one provider fail in a row, the rest are
 abandoned for that run and nothing is recorded against those streams — repeated
 failure says the provider is not answering, not that each individual stream is
 bad.
+
+### Checking 4K copies for Dolby Vision
+
+A copy whose provider supplied resolution and audio is normally never measured
+— there is nothing to fill. But no provider payload carries the Dolby Vision
+record, and that record is what tells a DV stream *without* a fallback layer
+(which renders with the wrong colors on non-DV hardware) apart from one that is
+safe anywhere. DV lives almost entirely on 4K copies, so with **Also ffprobe 4K
+copies for Dolby Vision** on, a copy the provider described as 4K gets one
+measurement anyway.
+
+"4K" uses the same rule the quality-ranking plugin uses, so the copies checked
+are exactly the ones it ranks as 4K: the larger dimension within 5% of 3840
+(cropped widescreen masters are often a little narrower), or a height of 2160.
+
+Each copy is checked once, under the same retry rule as every other
+measurement, and only with whatever is left of the run's ffprobe budget after
+copies with no details at all. If the measurement finds a DV record, it is
+added to the provider's existing video details — every value the provider sent
+is kept — because that is where the ranking plugin looks for it. **Enrichment
+status** shows how many 4K checks are waiting, and the last run reports how
+many were checked, and — across every measurement, not just these — how many
+copies were DV and how many of those have no fallback layer.
 
 ### Running it nightly
 

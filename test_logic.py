@@ -2829,6 +2829,179 @@ class NightlyScheduleTests(unittest.TestCase):
                       ast.unparse(fn))
 
 
+class DolbyVisionCheckTests(unittest.TestCase):
+    """A provider that describes a copy never includes its Dolby Vision record,
+    so 4K copies get a probe anyway -- and the record has to land where the
+    ranking plugin actually reads it."""
+
+    DOVI = [{"side_data_type": "DOVI configuration record", "dv_profile": 5,
+             "dv_bl_signal_compatibility_id": 0}]
+
+    def _described(self, w=3840, h=2160, mark=None, **video):
+        props = {"detailed_info": {"video": dict({"width": w, "height": h}, **video),
+                                   "audio": {"codec_name": "eac3"}}}
+        own = {"enrich": {"at": NOW.isoformat(), "got": "full"}}
+        if mark is not None:
+            own["probe"] = mark
+        props[patch.OWN_PROPS_KEY] = own
+        return props
+
+    # --- what counts as 4K: the same rule vod_preferences ranks by ---------
+    def test_4k_threshold_matches_the_ranking_plugin(self):
+        f = patch.is_4k_video
+        self.assertTrue(f({"width": 3840, "height": 2160}))
+        self.assertTrue(f({"width": 3840, "height": 1600}))   # scope crop
+        self.assertTrue(f({"width": 3700, "height": 1540}))   # within 5%
+        self.assertTrue(f({"width": 2880, "height": 2160}))   # 4:3 at 2160
+        self.assertFalse(f({"width": 3600, "height": 1500}))  # outside 5%
+        self.assertFalse(f({"width": 1920, "height": 1080}))
+
+    def test_a_poster_is_never_4k_video(self):
+        f = patch.is_4k_video
+        self.assertFalse(f({"width": 2160, "height": 3840,
+                            "disposition": {"attached_pic": 1}}))
+        self.assertFalse(f({"width": 3840, "height": 2160, "codec_name": "mjpeg"}))
+
+    def test_junk_is_not_4k(self):
+        for junk in (None, "x", {}, {"width": "wide"}):
+            self.assertFalse(patch.is_4k_video(junk))
+
+    def test_dovi_detection(self):
+        self.assertTrue(patch.has_dovi({"side_data_list": self.DOVI}))
+        self.assertFalse(patch.has_dovi({"side_data_list": [
+            {"side_data_type": "Mastering display metadata"}]}))
+        self.assertFalse(patch.has_dovi({}))
+        self.assertFalse(patch.has_dovi(None))
+
+    # --- which described copies get a check --------------------------------
+    def test_a_described_4k_copy_is_checked_once(self):
+        now = NOW.isoformat()
+        self.assertTrue(patch.decide_dv_check(self._described(), now)[0])
+        old = (NOW - timedelta(days=90)).isoformat()
+        for got in ("full", "none"):
+            self.assertFalse(patch.decide_dv_check(
+                self._described(mark={"at": old, "got": got}), now)[0], got)
+
+    def test_a_failed_check_retries_after_the_window(self):
+        now = NOW.isoformat()
+        recent = (NOW - timedelta(days=1)).isoformat()
+        old = (NOW - timedelta(days=30)).isoformat()
+        self.assertFalse(patch.decide_dv_check(
+            self._described(mark={"at": recent, "got": "error"}), now)[0])
+        self.assertTrue(patch.decide_dv_check(
+            self._described(mark={"at": old, "got": "error"}), now)[0])
+
+    def test_non_4k_and_already_known_are_not_checked(self):
+        now = NOW.isoformat()
+        self.assertFalse(patch.decide_dv_check(self._described(1920, 1080), now)[0])
+        self.assertFalse(patch.decide_dv_check(
+            self._described(side_data_list=self.DOVI), now)[0])
+
+    def test_undescribed_copies_belong_to_gap_filling_not_here(self):
+        props = {"detailed_info": {},
+                 patch.OWN_PROPS_KEY: {"enrich": {"at": NOW.isoformat(), "got": "partial"}}}
+        self.assertFalse(patch.decide_dv_check(props, NOW.isoformat())[0])
+        self.assertTrue(patch.decide_probe(props, NOW.isoformat())[0])
+
+    def test_gap_filling_still_skips_described_copies(self):
+        self.assertFalse(patch.decide_probe(self._described(), NOW.isoformat())[0])
+
+    # --- where the record lands --------------------------------------------
+    def test_the_record_joins_the_providers_video_block(self):
+        props = self._described(w=3840, h=1600)
+        props = patch.store_probe(props, {
+            "video": {"width": 3840, "height": 1608, "side_data_list": self.DOVI},
+            "audio": {"codec_name": "aac"}})
+        video = props["detailed_info"]["video"]
+        self.assertEqual(video["side_data_list"], self.DOVI)
+        # every value the provider sent is untouched
+        self.assertEqual(video["height"], 1600)
+        self.assertEqual(props["detailed_info"]["audio"]["codec_name"], "eac3")
+
+    def test_known_side_data_is_never_overwritten(self):
+        mine = [{"side_data_type": "Mastering display metadata"}]
+        props = self._described(side_data_list=mine)
+        props = patch.store_probe(props, {"video": {"side_data_list": self.DOVI}})
+        self.assertEqual(props["detailed_info"]["video"]["side_data_list"], mine)
+
+    def test_nothing_is_added_when_the_probe_found_no_side_data(self):
+        props = patch.store_probe(self._described(), {"video": {"width": 3840}})
+        self.assertNotIn("side_data_list", props["detailed_info"]["video"])
+
+    # --- ordering and wiring -------------------------------------------------
+    def _fn(self, name):
+        tree = ast.parse(open(patch.__file__, encoding="utf-8").read())
+        return next(n for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef) and n.name == name)
+
+    def test_gaps_go_before_dv_checks_and_the_switch_is_honored(self):
+        src = ast.unparse(self._fn("probe_movies_impl"))
+        self.assertIn("per_movie = fill + dv", src)
+        # elif: a copy needing gap-filling is never ALSO queued as a DV check
+        self.assertRegex(src, r"if decide_probe\(props, now_iso\)\[0\]:\s*target = fill\s*"
+                              r"elif cfg\['probe_4k_dv'\] and decide_dv_check\(props, now_iso\)\[0\]:")
+
+    def test_status_counts_dv_checks_by_the_runs_own_rule(self):
+        src = ast.unparse(self._fn("enrich_status"))
+        self.assertRegex(src, r"cfg\['probe_movies'\] and cfg\['probe_4k_dv'\] and "
+                              r"decide_dv_check\(props, now_iso\)\[0\]")
+        self.assertIn("estimate_nights(todo, measure + dv_checks, cfg)", src)
+
+    def test_status_text(self):
+        import plugin as plugin_mod
+        base = EnrichStatusMessageTests()._st()
+        self.assertIn("need measuring 30 + 5 4K DV checks (10 runs)",
+                      plugin_mod._format_enrich_status(dict(base, need_dv_check=5)))
+        self.assertIn("need measuring 30 (10 runs)",
+                      plugin_mod._format_enrich_status(dict(base, need_dv_check=0)))
+        out = plugin_mod._format_last_run({
+            "state": "finished", "finished_at": "2030-01-02T03:04:05+00:00",
+            "result": {"lookup": {"fetched": 1},
+                       "measure": {"probed": 6, "gained": 4, "dv_checked": 2,
+                                   "dv_found": 1, "dv_no_fallback": 1}}})
+        self.assertIn("4K DV checks 2, DV found 1 (no fallback 1)", out)
+        quiet = plugin_mod._format_last_run({
+            "state": "finished", "finished_at": "2030-01-02T03:04:05+00:00",
+            "result": {"lookup": {"fetched": 1},
+                       "measure": {"probed": 6, "gained": 6}}})
+        self.assertNotIn("DV", quiet)
+
+    def test_dv_is_counted_on_every_measurement(self):
+        # A copy measured to fill its gaps reveals DV exactly as a 4K check
+        # does; counting only the checks would hide the likeliest problems.
+        st = {}
+        patch.note_dv(st, {"video": {"side_data_list": self.DOVI}}, False)
+        patch.note_dv(st, {"video": {"width": 3840}}, True)
+        patch.note_dv(st, None, True)
+        self.assertEqual(st, {"dv_checked": 2, "dv_found": 1, "dv_no_fallback": 1})
+
+    def test_no_fallback_matches_the_ranking_plugins_rule(self):
+        f = patch.is_dv_no_fallback
+        rec = lambda **kw: {"side_data_list": [dict(
+            {"side_data_type": "DOVI configuration record"}, **kw)]}
+        self.assertTrue(f(rec(dv_profile=5, dv_bl_signal_compatibility_id=0)))
+        self.assertTrue(f(rec(dv_profile=5)))                 # compat missing
+        self.assertFalse(f(rec(dv_profile=8, dv_bl_signal_compatibility_id=1)))
+        self.assertFalse(f(rec(dv_profile=8, dv_bl_signal_compatibility_id=4)))
+        self.assertFalse(f({"side_data_list": [{"side_data_type": "Mastering display",
+                                                "dv_bl_signal_compatibility_id": 0}]}))
+        self.assertFalse(f(None))
+
+    def test_the_probe_loop_tallies_every_measurement(self):
+        fn = self._fn("probe_movies_impl")
+        loop = next(n for n in ast.walk(fn)
+                    if isinstance(n, ast.For) and getattr(n.iter, "id", None) == "chosen")
+        self.assertIn("note_dv(stats, parsed, rel.id in dv_ids)", ast.unparse(loop))
+
+    def test_nightly_totals_carry_dv_counts(self):
+        res = {"lookup": {"fetched": 1},
+               "measure": {"probed": 2, "dv_checked": 2, "dv_found": 1}}
+        it = iter([res, res, {"lookup": {}, "measure": {}}])
+        tot = patch.run_batches(lambda skip: next(it), lambda: True)
+        self.assertEqual(tot["measure"]["dv_checked"], 4)
+        self.assertEqual(tot["measure"]["dv_found"], 2)
+
+
 class ManifestParityTests(unittest.TestCase):
     """plugin.json and the Plugin class both declare the UI, so they must agree.
 

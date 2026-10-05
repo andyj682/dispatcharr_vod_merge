@@ -116,8 +116,10 @@ def _format_enrich_status(st):
         f"{_short_time(st.get('generated_at'))}\n"
         f"have video+audio {st['have_essentials']} | need lookup "
         f"{st['need_fetch']} ({st['runs_at_current_limit']} runs) | need "
-        f"measuring {st['need_measure']} "
-        f"({st['measure_runs_at_current_limit']} runs)"
+        f"measuring {st['need_measure']}"
+        + (f" + {st['need_dv_check']} 4K DV checks"
+           if st.get("need_dv_check") else "")
+        + f" ({st['measure_runs_at_current_limit']} runs)"
         + (f" | nightly: ~{st['nights']} night{'' if st['nights'] == 1 else 's'}"
            if st.get("nights") else "")
         + "\n"
@@ -157,6 +159,11 @@ def _format_last_run(lp):
     else:
         line += (f", measured {meas.get('probed', 0)} "
                  f"(gained {meas.get('gained', 0)})")
+        if meas.get("dv_checked"):
+            line += f", 4K DV checks {meas['dv_checked']}"
+        if meas.get("dv_found"):
+            line += (f", DV found {meas['dv_found']} "
+                     f"(no fallback {meas.get('dv_no_fallback', 0)})")
     errors = look.get("errors", 0) + ((meas or {}).get("errors", 0))
     line += f", errors {errors}"
     notes = []
@@ -195,7 +202,7 @@ def _format_log(data, limit=60):
 class Plugin:
     # UI title only; "Dispatcharr" is redundant inside the Dispatcharr UI.
     name = "VOD Merge"
-    version = "1.5.3"
+    version = "1.5.4"
     description = (
         "Durably merges duplicate VOD titles from providers that omit TMDB ids, "
         "by matching metadata like poster artwork and plot text to a title you "
@@ -456,6 +463,17 @@ class Plugin:
             ),
         },
         {
+            "id": "probe_4k_dv",
+            "label": "Also ffprobe 4K copies for Dolby Vision",
+            "type": "boolean",
+            "default": True,
+            "help_text": (
+                "When a provider's details say a copy is 4K, ffprobe it anyway "
+                "to look for Dolby Vision, which providers never report. Only "
+                "applies with ffprobe on; copies missing details go first."
+            ),
+        },
+        {
             "id": "probe_limit",
             "label": "Ffprobe lookups per run",
             "type": "number",
@@ -575,9 +593,9 @@ class Plugin:
             "id": "enrich_now",
             "label": "Enrich movies",
             "description": "Fill in video and audio for the next batch of "
-                           "wanted copies: provider detail first, then -- if "
-                           "measuring is on -- measure what no provider "
-                           "described. Runs in the background; 'Enrichment "
+                           "wanted copies: provider detail first, then analyze "
+                           "any streams still without information (if "
+                           "enabled). Runs in the background; 'Enrichment "
                            "status' shows the result. Resumable, so run it "
                            "again to continue.",
             "button_label": "Enrich now",

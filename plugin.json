@@ -1,6 +1,6 @@
 {
   "name": "VOD Merge",
-  "version": "1.5.3",
+  "version": "1.5.4",
   "description": "Durably merges duplicate VOD titles from providers that omit TMDB ids, by matching metadata like poster artwork and plot text to a title you already have. Works only with XC accounts.",
   "author": "andyj682",
   "help_url": "https://github.com/andyj682/dispatcharr_vod_merge",
@@ -160,6 +160,13 @@
       "help_text": "Measure audio/video details directly for any streams for which provider details don't include video/audio information. Also the only way to get information about Dolby Vision. Each probe uses a provider slot."
     },
     {
+      "id": "probe_4k_dv",
+      "label": "Also ffprobe 4K copies for Dolby Vision",
+      "type": "boolean",
+      "default": true,
+      "help_text": "When a provider's details say a copy is 4K, ffprobe it anyway to look for Dolby Vision, which providers never report. Only applies with ffprobe on; copies missing details go first."
+    },
+    {
       "id": "probe_limit",
       "label": "Ffprobe lookups per run",
       "type": "number",
@@ -241,7 +248,7 @@
     {
       "id": "enrich_now",
       "label": "Enrich movies",
-      "description": "Fill in video and audio for the next batch of wanted copies: provider detail first, then -- if measuring is on -- measure what no provider described. Runs in the background; 'Enrichment status' shows the result. Resumable, so run it again to continue.",
+      "description": "Fill in video and audio for the next batch of wanted copies: provider detail first, then analyze any streams still without information (if enabled). Runs in the background; 'Enrichment status' shows the result. Resumable, so run it again to continue.",
       "button_label": "Enrich now",
       "button_variant": "filled"
     },

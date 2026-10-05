@@ -504,6 +504,7 @@ def _load_config(force: bool = False) -> dict:
         "probe_movies": _as_bool(
             settings.get("probe_movies"), DEFAULT_PROBE_MOVIES),
         "probe_limit": _as_int(settings.get("probe_limit"), DEFAULT_PROBE_LIMIT),
+        "probe_4k_dv": _as_bool(settings.get("probe_4k_dv"), DEFAULT_PROBE_4K_DV),
         "probe_delay_ms": _as_int(
             settings.get("probe_delay_ms"), DEFAULT_PROBE_DELAY_MS),
     }
@@ -2074,7 +2075,7 @@ def enrich_status(cfg=None):
     out["movies"] = len(ids)
 
     now_iso = timezone.now().isoformat()
-    todo = have = attempted = measure = 0
+    todo = have = attempted = measure = dv_checks = 0
     per_account = {}
     for rel in enrich_candidates(ids).iterator(chunk_size=500):
         props = rel.custom_properties or {}
@@ -2084,6 +2085,9 @@ def enrich_status(cfg=None):
         slot["relations"] += 1
         if relation_has_essentials(props):
             have += 1
+            if (cfg["probe_movies"] and cfg["probe_4k_dv"]
+                    and decide_dv_check(props, now_iso)[0]):
+                dv_checks += 1
             continue
         # The same decision a run makes when measuring, so this is its backlog
         # exactly rather than an estimate of it.
@@ -2103,12 +2107,13 @@ def enrich_status(cfg=None):
                 "runs_at_current_limit": (
                     0 if not cfg["enrich_limit"]
                     else -(-todo // cfg["enrich_limit"])),
+                "need_dv_check": dv_checks,
                 "measure_runs_at_current_limit": (
                     0 if not cfg["probe_limit"]
-                    else -(-measure // cfg["probe_limit"])),
+                    else -(-(measure + dv_checks) // cfg["probe_limit"])),
                 # Disclosure, not a guard: a big wanted set is legitimate, but
                 # how many nights it takes should never be a surprise.
-                "nights": estimate_nights(todo, measure, cfg)})
+                "nights": estimate_nights(todo, measure + dv_checks, cfg)})
     return out
 
 
@@ -2294,6 +2299,9 @@ def enrich_movies_impl(limit=None, delay=None, heartbeat=None):
 DEFAULT_PROBE_MOVIES = False
 DEFAULT_PROBE_LIMIT = 3             # deliberately tiny; this is not a sweep yet
 DEFAULT_PROBE_DELAY_MS = 2000
+# On by default because it only ever applies once measuring itself is on,
+# and it is the only way to learn DV status for a copy a provider described.
+DEFAULT_PROBE_4K_DV = True
 
 PROBE_KEY = "ffprobe_info"
 PROBE_TIMEOUT_S = 30
@@ -2375,7 +2383,12 @@ def decide_probe(props, now_iso, retry_days=PROBE_ERROR_RETRY_DAYS):
     # endpoint always fails must still be measurable.
     if not isinstance(own.get("enrich"), dict):
         return False, "provider lookup not tried yet"
-    mark = own.get("probe")
+    return _probe_mark_decision(own.get("probe"), now_iso, retry_days)
+
+
+def _probe_mark_decision(mark, now_iso, retry_days):
+    """Pure. The retry rule every kind of probe shares: never probed -> yes;
+    probed and answered -> never again; errored -> after the retry window."""
     if not isinstance(mark, dict):
         return True, "never probed"
     got = mark.get("got")
@@ -2389,6 +2402,102 @@ def decide_probe(props, now_iso, retry_days=PROBE_ERROR_RETRY_DAYS):
     if now is not None and (now - when) < timedelta(days=retry_days):
         return False, "previous error, still inside retry window"
     return True, "previous error, retry window elapsed"
+
+
+# A copy can have everything ranking needs from its provider and still hide the
+# one thing no provider payload carries: the Dolby Vision record. That decides
+# whether a DV stream without a fallback layer renders correctly on non-DV
+# hardware, and DV lives almost entirely on 4K copies -- so those, and only
+# those, are worth a probe even when the provider described them.
+#
+# The 4K rule mirrors vod_preferences' tiering exactly (the larger dimension
+# within 5% of 3840, or a height of at least 2160), so the copies checked here
+# are the copies that plugin ranks as 4K. It is a copy, not an import: the two
+# plugins never depend on each other.
+DV_WIDTH = 3840
+DV_HEIGHT = 2160
+DIM_TOLERANCE = 0.05
+
+
+def _is_cover_image(video):
+    """An embedded poster rides in the video list too; never treat it as the
+    picture. A tall poster can be as large as a 4K frame."""
+    disp = video.get("disposition")
+    if isinstance(disp, dict) and disp.get("attached_pic"):
+        return True
+    return str(video.get("codec_name") or "").lower() in ("mjpeg", "png", "bmp")
+
+
+def is_4k_video(video):
+    """Pure. Same threshold vod_preferences uses for its 4K tier."""
+    if not isinstance(video, dict) or _is_cover_image(video):
+        return False
+    try:
+        w = int(video.get("width") or 0)
+        h = int(video.get("height") or 0)
+    except (TypeError, ValueError):
+        return False
+    return max(w, h) >= DV_WIDTH * (1 - DIM_TOLERANCE) or h >= DV_HEIGHT
+
+
+def has_dovi(video):
+    """Pure. Does a video block carry a Dolby Vision configuration record?"""
+    if not isinstance(video, dict):
+        return False
+    return any(isinstance(sd, dict) and "DOVI" in str(sd.get("side_data_type") or "")
+               for sd in (video.get("side_data_list") or []))
+
+
+def is_dv_no_fallback(video):
+    """Pure. Dolby Vision with NO fallback layer (Profile 5): renders with the
+    wrong colors on non-DV hardware. Same rule vod_preferences avoids by --
+    a base-layer compatibility id of 0, or Profile 5 with the id missing."""
+    if not isinstance(video, dict):
+        return False
+    for sd in video.get("side_data_list") or []:
+        if not isinstance(sd, dict) or "DOVI" not in str(sd.get("side_data_type") or ""):
+            continue
+        compat = sd.get("dv_bl_signal_compatibility_id")
+        if compat == 0 or (compat is None and sd.get("dv_profile") == 5):
+            return True
+    return False
+
+
+def note_dv(stats, parsed, was_dv_check):
+    """Pure. Tally what one answered measurement says about Dolby Vision.
+
+    DV found is counted for EVERY measurement, not just the 4K checks: a copy
+    no provider described is measured for its gaps and reveals DV the same way,
+    and a count that ignored those would under-report exactly the copies most
+    likely to be the problem.
+    """
+    if was_dv_check:
+        stats["dv_checked"] = stats.get("dv_checked", 0) + 1
+    video = (parsed or {}).get("video")
+    if has_dovi(video):
+        stats["dv_found"] = stats.get("dv_found", 0) + 1
+        if is_dv_no_fallback(video):
+            stats["dv_no_fallback"] = stats.get("dv_no_fallback", 0) + 1
+    return stats
+
+
+def decide_dv_check(props, now_iso, retry_days=PROBE_ERROR_RETRY_DAYS):
+    """Pure. -> (should_probe, reason) for a copy the provider DID describe.
+
+    Only 4K copies, only where no side data is known yet, and under the same
+    retry rule as every other probe -- a check that answered is never repeated,
+    whatever it found.
+    """
+    if not relation_has_essentials(props):
+        return False, "not described by the provider (gap-filling handles it)"
+    video = (props.get("detailed_info") or {}).get("video")
+    if not is_4k_video(video):
+        return False, "not 4K"
+    if video.get("side_data_list"):
+        return False, "side data already known"
+    own = props.get(OWN_PROPS_KEY)
+    mark = own.get("probe") if isinstance(own, dict) else None
+    return _probe_mark_decision(mark, now_iso, retry_days)
 
 
 def run_ffprobe(url, user_agent=None, timeout=PROBE_TIMEOUT_S):
@@ -2444,6 +2553,16 @@ def store_probe(props, parsed):
         # storage looking like data and must be treated as absent.
         if parsed.get(key) and not detail.get(key):
             detail[key] = parsed[key]
+    # The same fill-a-hole rule one level down, for the one key a provider
+    # never sends. A 4K copy the provider described already HAS a video block,
+    # so the rule above leaves it alone -- and the DV record would then live
+    # only in our own key, where the plugin that acts on it never looks.
+    # Every value the provider sent is kept; only the missing key is added.
+    measured = parsed.get("video")
+    existing = detail.get("video")
+    if (isinstance(measured, dict) and measured.get("side_data_list")
+            and isinstance(existing, dict) and not existing.get("side_data_list")):
+        existing["side_data_list"] = measured["side_data_list"]
     props["detailed_info"] = detail
     return props
 
@@ -2580,7 +2699,8 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=None
     delay = (cfg["probe_delay_ms"] if delay is None else delay) / 1000.0
 
     stats = {"probed": 0, "gained": 0, "nothing": 0, "errors": 0,
-             "skipped": 0, "no_url": 0, "broken": [], "busy": []}
+             "skipped": 0, "no_url": 0, "broken": [], "busy": [],
+             "dv_checked": 0, "dv_found": 0, "dv_no_fallback": 0}
     if not cfg["probe_movies"]:
         stats["aborted"] = "stream probing is off"
         return stats
@@ -2603,16 +2723,25 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=None
     movie_ids, _res = wanted_movie_ids(doc)
     now_iso = timezone.now().isoformat()
 
-    per_movie = []
+    fill, dv = [], []
+    dv_ids = set()
     for rel in enrich_candidates(movie_ids).iterator(chunk_size=500):
-        should, _why = decide_probe(rel.custom_properties or {}, now_iso)
-        if not should:
+        props = rel.custom_properties or {}
+        if decide_probe(props, now_iso)[0]:
+            target = fill
+        elif cfg["probe_4k_dv"] and decide_dv_check(props, now_iso)[0]:
+            target = dv
+            dv_ids.add(rel.id)
+        else:
             stats["skipped"] += 1
             continue
-        if per_movie and per_movie[-1][0] == rel.movie_id:
-            per_movie[-1][1].append(rel)
+        if target and target[-1][0] == rel.movie_id:
+            target[-1][1].append(rel)
         else:
-            per_movie.append((rel.movie_id, [rel]))
+            target.append((rel.movie_id, [rel]))
+    # Gaps first, DV checks with whatever budget is left: a copy with no
+    # resolution or audio at all costs ranking more than an unknown DV status.
+    per_movie = fill + dv
 
     # Leave accounts that are busy RIGHT NOW out of the batch before choosing
     # it. Otherwise the budget can land entirely on a busy provider -- the next
@@ -2697,6 +2826,7 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=None
             continue
 
         consecutive[name] = 0
+        note_dv(stats, parsed, rel.id in dv_ids)
         props = rel.custom_properties or {}
         if outcome == "full":
             props = store_probe(props, parsed)
@@ -3019,7 +3149,8 @@ def _stop_reason(heartbeat):
 
 
 _LOOKUP_SUMS = ("fetched", "got_essentials", "empty", "errors")
-_MEASURE_SUMS = ("probed", "gained", "nothing", "errors", "no_url")
+_MEASURE_SUMS = ("probed", "gained", "nothing", "errors", "no_url",
+                 "dv_checked", "dv_found", "dv_no_fallback")
 
 
 def _attempted(result):
