@@ -2446,6 +2446,98 @@ def errors_to_stamp(deferred, broken):
     return out
 
 
+# --------------------------------------------------------------------------- #
+# Do not probe a provider that is busy with real playback
+# --------------------------------------------------------------------------- #
+# Many accounts allow ONE connection, so a probe during playback is not a risk
+# but a certainty: one of the two gets dropped, and it may be the viewer's.
+#
+# Dispatcharr counts every real stream -- live and VOD alike -- in a per-profile
+# Redis counter, and exposes a non-mutating check of it. We ask that check
+# before every probe, exactly as the VOD proxy asks it before admitting a
+# viewer, and only probe through a profile that has room. On a one-connection
+# account that means "only when nothing is playing".
+#
+# We deliberately do NOT reserve a slot. Core has no cleanup for a leaked
+# counter, so a worker killed mid-probe would leave a one-connection account
+# looking full -- refusing all playback -- until Redis restarts. And while a
+# probe held the slot, a viewer arriving would be refused outright rather than
+# merely risking a collision. Checking without reserving leaves one narrow
+# window: playback that starts DURING a probe of up to PROBE_TIMEOUT_S. A
+# measurement cut short there is recorded as a retryable error, not as a fact
+# about the stream.
+
+
+def pick_probe_profile(profiles, has_capacity):
+    """Pure. First profile with room, in the order the VOD proxy tries them:
+    the default first, then the rest. -> profile or None (all busy)."""
+    profiles = list(profiles)
+    ordered = ([p for p in profiles if getattr(p, "is_default", False)]
+               + [p for p in profiles if not getattr(p, "is_default", False)])
+    for profile in ordered:
+        if has_capacity(profile):
+            return profile
+    return None
+
+
+def busy_account_ids(groups, profile_for):
+    """Pure. Ids of the accounts in `groups` that have no free profile.
+
+    `profile_for(account)` returns the profile a probe would use, or None when
+    the account is busy (or cannot be checked). Each account is asked once.
+    """
+    seen, busy = set(), set()
+    for _mid, rels in groups:
+        for r in rels:
+            if r.m3u_account_id in seen:
+                continue
+            seen.add(r.m3u_account_id)
+            if profile_for(r.m3u_account) is None:
+                busy.add(r.m3u_account_id)
+    return busy
+
+
+def without_accounts(groups, account_ids):
+    """Pure. `(movie_id, [relations])` groups minus relations on the given
+    accounts; groups left empty are dropped."""
+    if not account_ids:
+        return list(groups)
+    out = []
+    for mid, rels in groups:
+        kept = [r for r in rels if r.m3u_account_id not in account_ids]
+        if kept:
+            out.append((mid, kept))
+    return out
+
+
+def _capacity_checker(client):
+    """-> callable(profile) -> bool, using Dispatcharr's own capacity rule.
+
+    Raises if that rule cannot be loaded. The caller turns that into "measure
+    nothing": a future Dispatcharr that moves the function must stop probing
+    loudly, not start probing blind.
+    """
+    from apps.m3u.connection_pool import pool_has_capacity_for_profile
+    return lambda profile: pool_has_capacity_for_profile(profile, client)
+
+
+def _probe_profile(account, has_capacity):
+    """The account profile to probe through, or None if it has no free slot.
+
+    Any failure to tell is treated as busy. Not knowing whether someone is
+    watching is not permission to interrupt them.
+    """
+    try:
+        from apps.m3u.models import M3UAccountProfile
+        profiles = M3UAccountProfile.objects.filter(m3u_account=account,
+                                                    is_active=True)
+        return pick_probe_profile(profiles, has_capacity)
+    except Exception as exc:
+        logger.warning("[VOD-MERGE] could not check whether %r is busy, so not "
+                       "probing it: %s", getattr(account, "name", account), exc)
+        return None
+
+
 def probe_movies_impl(limit=None, delay=None, heartbeat=None):
     """Measure the wanted copies no provider would describe.
 
@@ -2464,9 +2556,16 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None):
     delay = (cfg["probe_delay_ms"] if delay is None else delay) / 1000.0
 
     stats = {"probed": 0, "gained": 0, "nothing": 0, "errors": 0,
-             "skipped": 0, "no_url": 0, "broken": []}
+             "skipped": 0, "no_url": 0, "broken": [], "busy": []}
     if not cfg["probe_movies"]:
         stats["aborted"] = "stream probing is off"
+        return stats
+
+    try:
+        has_capacity = _capacity_checker(_redis_client())
+    except Exception as exc:
+        stats["aborted"] = "cannot check whether providers are busy (%s)" % (exc,)
+        logger.warning("[VOD-MERGE] probing declined -- %s", stats["aborted"])
         return stats
 
     doc, status, detail = read_wanted_set(cfg["wanted_set_path"],
@@ -2491,6 +2590,20 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None):
         else:
             per_movie.append((rel.movie_id, [rel]))
 
+    # Leave accounts that are busy RIGHT NOW out of the batch before choosing
+    # it. Otherwise the budget can land entirely on a busy provider -- the next
+    # title's copies may all be there -- and the run measures nothing while
+    # other providers sit idle with copies waiting. The check before each probe
+    # still stands, for playback that starts mid-run.
+    busy_ids = busy_account_ids(
+        per_movie, lambda acc: _probe_profile(acc, has_capacity))
+    if busy_ids:
+        stats["busy"] = sorted({r.m3u_account.name for _m, rels in per_movie
+                                for r in rels if r.m3u_account_id in busy_ids})
+        logger.info("[VOD-MERGE] busy with playback, not probing this run: %s",
+                    ", ".join(stats["busy"]))
+    per_movie = without_accounts(per_movie, busy_ids)
+
     # allow_oversized=False: here the limit is a SAFETY ceiling, not a target.
     chosen = take_whole_movies(per_movie, limit, allow_oversized=False)
     per_account = {}
@@ -2500,18 +2613,29 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None):
     for rel in chosen:
         account = rel.m3u_account
         name = account.name
-        if name in stats["broken"]:
+        if name in stats["broken"] or name in stats["busy"]:
             continue
         if heartbeat is not None and not heartbeat():
             stats["stopped"] = "lost the run lock"
             logger.warning("[VOD-MERGE] stream probe stopped early -- lost the "
                            "run lock, so another run may be measuring")
             break
+        # Checked before EVERY probe, not once per run: playback can start at
+        # any point. A busy account is left alone for the rest of the run and
+        # nothing is recorded against its copies -- they were not attempted.
+        profile = _probe_profile(account, has_capacity)
+        if profile is None:
+            stats["busy"].append(name)
+            logger.info("[VOD-MERGE] %r is busy with playback -- not probing "
+                        "it this run", name)
+            continue
         slot = per_account.setdefault(
             name, {"probed": 0, "gained": 0, "nothing": 0, "errors": 0})
 
         try:
-            url = rel.get_stream_url()
+            # Through the profile that was checked, so the connection we open
+            # is the one whose slot was free.
+            url = rel.get_stream_url(profile)
         except Exception:
             logger.exception("[VOD-MERGE] could not build stream URL rel=%s", rel.id)
             url = None

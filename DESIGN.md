@@ -537,19 +537,50 @@ killed worker frees it in minutes, while a run that cannot confirm it still
 holds it stops. That last rule fails closed for the same reason scope does: a
 missed run costs data, a collision costs someone's stream.
 
+### Not probing a provider that is busy
+
+On a one-connection account a probe during playback is not a risk but a
+certainty: one of the two connections gets dropped, and it may be the viewer's.
+That makes this check a prerequisite for any unattended run, not a refinement.
+
+Dispatcharr counts every real stream, live and VOD alike, in one per-profile
+counter, and exposes a non-mutating check of it — the one the VOD proxy asks
+before admitting a viewer. The probe asks the same question, in the same order
+(default profile first, active profiles only), **before every probe** rather
+than once per run, and probes through the profile that answered, so the slot
+checked and the connection opened belong to the same login. A busy account is
+left alone for the rest of the run and nothing is stamped against its copies;
+they were not attempted.
+
+Accounts are also checked once **before the batch is chosen**, and busy ones
+left out of it. The first live run showed why: the batch is taken in title
+order, the next title's waiting copies were all on the busy provider, and a
+batch chosen first and checked later measured nothing while another provider
+had copies waiting. The per-probe check stays, for playback that starts
+mid-run. Not being able to tell — the check failing, or a future
+Dispatcharr moving it — counts as busy, and an unloadable check stops measuring
+altogether. Not knowing whether someone is watching is not permission to
+interrupt them.
+
+The obvious stronger design is to **reserve** a slot for the probe, so
+Dispatcharr sees it and steers viewers elsewhere. It was rejected on two counts.
+Core has no cleanup for a leaked counter, so a worker killed mid-probe would
+leave a one-connection account looking full — refusing every viewer — until
+Redis restarts: a rare event with an unbounded cost. And while a probe held the
+slot, an arriving viewer would be refused outright (the proxy answers 429)
+instead of merely risking a collision. Checking without reserving leaves one
+bounded window — playback that starts during a probe of at most thirty
+seconds — and a measurement cut short in that window is already recorded as a
+retryable error rather than a fact about the stream.
+
 ### What is deliberately not here
 
 Measuring was built second, after the harvest, so that the harvest could report
 exactly how many copies it could not fill and size the expensive pass from
-measurement instead of estimate. Two pieces are still missing, in this order:
+measurement instead of estimate. One piece is still missing:
 
-- **Pausing when a provider is busy with real playback.** Dispatcharr's own
-  connection counters see playback even though they never see our probes, so
-  this is buildable, and it is a prerequisite for any unattended run rather than
-  a refinement: on a one-connection account a probe during playback is a
-  certain collision, not a risk.
-- **A schedule.** Until the check above exists, every run is started by hand at
-  a moment someone chose.
+- **A schedule.** Every run is still started by hand. The busy check above was
+  its prerequisite, since an unattended run cannot choose its moment.
 
 ## Manual approvals
 

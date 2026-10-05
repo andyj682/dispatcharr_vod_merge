@@ -7,6 +7,33 @@ Everything through 0.8.3 landed during initial development against a single
 large live library; the entries below record *why* each change was needed, since
 several were driven by failures that were invisible from the outside.
 
+## 1.5.2 — 2026-10-04
+
+**Added — a provider that is busy with playback is not measured**
+
+- Before every measurement the plugin now asks Dispatcharr whether the account
+  has a free connection slot — the same check the VOD proxy makes before
+  admitting a viewer, covering live TV and VOD playback alike. If not, that
+  account is skipped for the rest of the run, nothing is recorded against its
+  copies, and **Enrichment status** names it. On an account that allows one
+  connection, measuring now only ever happens while nothing is playing from it.
+
+  Busy accounts are left out **before** the run's batch is chosen, so one busy
+  provider cannot use up the whole batch while others sit idle with copies
+  waiting. The check is repeated before each measurement, for playback that
+  starts mid-run.
+
+  The measurement also goes through the profile that was checked, so the slot
+  counted and the connection opened belong to the same login. If the check
+  cannot be made at all, nothing is measured: not knowing whether someone is
+  watching is not permission to interrupt them.
+
+- **Deliberately not done: reserving a slot for the measurement.** It would
+  close the one remaining window — playback that starts *during* a measurement
+  of at most thirty seconds — but Dispatcharr has no cleanup for a slot that is
+  never released, so one interrupted run could leave a one-connection account
+  refusing all playback until the next restart.
+
 ## 1.5.1 — 2026-10-04
 
 **Changed — one Enrich action does both steps, in the background, one run at a

@@ -152,6 +152,9 @@ def _format_last_run(lp):
     errors = look.get("errors", 0) + ((meas or {}).get("errors", 0))
     line += f", errors {errors}"
     notes = []
+    if (meas or {}).get("busy"):
+        notes.append("did not measure " + ", ".join(meas["busy"])
+                     + " (busy with playback)")
     if (meas or {}).get("broken"):
         notes.append("stopped measuring " + ", ".join(meas["broken"])
                      + " (not answering; nothing recorded)")
@@ -184,7 +187,7 @@ def _format_log(data, limit=60):
 class Plugin:
     # UI title only; "Dispatcharr" is redundant inside the Dispatcharr UI.
     name = "VOD Merge"
-    version = "1.5.1"
+    version = "1.5.2"
     description = (
         "Durably merges duplicate VOD titles from providers that omit TMDB ids, "
         "by matching metadata like poster artwork and plot text to a title you "

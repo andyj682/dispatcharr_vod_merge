@@ -657,12 +657,25 @@ enrichment run is ever active — starting another while one is going reports th
 and does nothing, since two runs on a one-connection account would collide with
 each other.
 
-> **Do not run this while anything is streaming from that provider.** Many IPTV
-> accounts permit only one simultaneous connection. On such an account a
-> measurement and a playing stream cannot coexist, and depending on how the
-> provider resolves it you may lose the measurement, the playback, or both.
-> There is no automatic protection against this yet — it is on you to pick a
-> quiet moment.
+**A provider that is busy with playback is not measured.** Many IPTV accounts
+permit only one simultaneous connection, and on such an account a measurement
+and a playing stream cannot coexist — you may lose the measurement, the
+playback, or both. So before every measurement the plugin asks Dispatcharr the
+same question it asks before admitting a viewer: does this account have a free
+slot? If not, that account is skipped for the rest of the run, nothing is
+recorded against its copies, and **Enrichment status** names it. Its copies do
+not count toward the run's batch, so the measurements go to providers that are
+free. On a
+one-connection account that means it is only ever measured while nothing is
+playing from it. Live TV and VOD playback both count.
+
+> **One narrow window remains:** playback that *starts during* a measurement.
+> Dispatcharr does not see the measurement's connection, so it may admit the
+> viewer, and on a one-connection account the two then collide for the few
+> seconds the measurement has left (at most thirty). Reserving a slot would
+> close that window, and is deliberately not done: Dispatcharr has no cleanup
+> for a reserved slot that is never released, so one interrupted run could
+> leave a one-connection account refusing all playback until the next restart.
 
 A measurement that gets cut off part-way is recorded as a retryable error
 rather than as "this stream has nothing", so a collision costs you a retry and

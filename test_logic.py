@@ -2405,6 +2405,177 @@ class MeasureBacklogTests(unittest.TestCase):
         self.assertIn("decide_probe", called)
 
 
+class _Profile:
+    def __init__(self, pid, default=False, free=True):
+        self.id, self.is_default, self.free = pid, default, free
+
+
+class BusyProviderTests(unittest.TestCase):
+    """Never probe a provider that is busy with real playback. On a
+    one-connection account a probe during playback is a certainty of
+    collision, and the stream that gets dropped may be the viewer's."""
+
+    def _pick(self, *profiles):
+        got = patch.pick_probe_profile(profiles, lambda p: p.free)
+        return got.id if got else None
+
+    def test_an_idle_account_is_probed_through_its_default_profile(self):
+        self.assertEqual(self._pick(_Profile(2), _Profile(1, default=True)), 1)
+
+    def test_a_busy_default_falls_back_to_another_free_profile(self):
+        # Same order the VOD proxy uses to admit a viewer.
+        self.assertEqual(
+            self._pick(_Profile(1, default=True, free=False), _Profile(2)), 2)
+
+    def test_every_profile_busy_means_no_probe(self):
+        self.assertIsNone(self._pick(_Profile(1, default=True, free=False),
+                                     _Profile(2, free=False)))
+
+    def test_no_profiles_means_no_probe(self):
+        self.assertIsNone(self._pick())
+
+    def test_unable_to_tell_counts_as_busy(self):
+        # Offline there is no Dispatcharr to ask, which is exactly the "could
+        # not check" case: it must answer busy, never free.
+        self.assertIsNone(patch._probe_profile(object(), lambda p: True))
+
+    def _probe_loop(self):
+        tree = ast.parse(open(patch.__file__, encoding="utf-8").read())
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "probe_movies_impl")
+        return fn, next(n for n in ast.walk(fn)
+                        if isinstance(n, ast.For) and getattr(n.iter, "id", None) == "chosen")
+
+    def test_busy_is_checked_before_every_probe(self):
+        # Per probe, not per run: playback can start at any moment.
+        _fn, loop = self._probe_loop()
+        calls = {}
+        for c in ast.walk(loop):
+            if isinstance(c, ast.Call):
+                name = getattr(c.func, "id", None) or getattr(c.func, "attr", None)
+                calls.setdefault(name, c.lineno)
+        self.assertIn("_probe_profile", calls)
+        self.assertLess(calls["_probe_profile"], calls["run_ffprobe"])
+
+    def test_a_busy_account_is_actually_skipped(self):
+        # Calling the check is not enough; its answer has to stop the probe.
+        _fn, loop = self._probe_loop()
+        branches = [n for n in ast.walk(loop) if isinstance(n, ast.If)
+                    and isinstance(n.test, ast.Compare)
+                    and getattr(n.test.left, "id", None) == "profile"
+                    and isinstance(n.test.ops[0], ast.Is)]
+        self.assertEqual(len(branches), 1, "expected one `if profile is None`")
+        body = branches[0].body
+        self.assertTrue(any(isinstance(s, (ast.Continue, ast.Break)) for s in body),
+                        "a busy account must not fall through to the probe")
+        self.assertIn("busy", ast.dump(ast.Module(body=body, type_ignores=[])))
+
+    def test_an_unloadable_capacity_check_measures_nothing(self):
+        # A future Dispatcharr that moves the check must stop probing loudly,
+        # not probe blind.
+        fn, _loop = self._probe_loop()
+        tries = [t for t in ast.walk(fn) if isinstance(t, ast.Try)
+                 and any(isinstance(c, ast.Call)
+                         and getattr(c.func, "id", None) == "_capacity_checker"
+                         for c in ast.walk(ast.Module(body=t.body, type_ignores=[])))]
+        self.assertEqual(len(tries), 1)
+        handler = ast.dump(ast.Module(body=tries[0].handlers[0].body, type_ignores=[]))
+        self.assertIn("aborted", handler)
+        self.assertTrue(any(isinstance(s, ast.Return) for s in tries[0].handlers[0].body))
+
+    def test_the_probe_uses_the_profile_that_was_checked(self):
+        # Otherwise the slot checked and the connection opened can belong to
+        # different logins.
+        _fn, loop = self._probe_loop()
+        urls = [c for c in ast.walk(loop) if isinstance(c, ast.Call)
+                and getattr(c.func, "attr", None) == "get_stream_url"]
+        self.assertEqual(len(urls), 1)
+        self.assertEqual([getattr(a, "id", None) for a in urls[0].args], ["profile"])
+
+    def test_no_slot_is_ever_reserved(self):
+        # Core has no cleanup for a leaked counter; a reserved slot left behind
+        # by a killed worker would block all playback on a one-connection
+        # account until Redis restarts.
+        src = open(patch.__file__, encoding="utf-8").read()
+        for forbidden in ("reserve_profile_slot", "release_profile_slot",
+                          "profile_connections:", ".incr("):
+            self.assertNotIn(forbidden, src)
+
+    class _Rel:
+        def __init__(self, rid, account_id):
+            self.id, self.m3u_account_id = rid, account_id
+            self.m3u_account = account_id
+
+    def test_busy_accounts_are_found_and_each_is_asked_once(self):
+        R = self._Rel
+        groups = [(1, [R(1, "busy"), R(2, "free")]),
+                  (2, [R(3, "busy"), R(4, "free")])]
+        asked = []
+
+        def profile_for(account):
+            asked.append(account)
+            return None if account == "busy" else object()
+
+        self.assertEqual(patch.busy_account_ids(groups, profile_for), {"busy"})
+        self.assertEqual(sorted(asked), ["busy", "free"])
+
+    def test_the_batch_filter_is_fed_the_busy_check(self):
+        # The filter is only as good as its input: an empty or inverted set at
+        # the call site would leave every test of the filter itself green.
+        fn, _loop = self._probe_loop()
+        assigns = {}
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call):
+                for t in n.targets:
+                    if isinstance(t, ast.Name):
+                        assigns.setdefault(t.id, getattr(n.value.func, "id", None))
+        call = next(c for c in ast.walk(fn) if isinstance(c, ast.Call)
+                    and getattr(c.func, "id", None) == "without_accounts")
+        arg = call.args[1]
+        self.assertIsInstance(arg, ast.Name)
+        self.assertEqual(assigns.get(arg.id), "busy_account_ids")
+        check = next(c for c in ast.walk(fn) if isinstance(c, ast.Call)
+                     and getattr(c.func, "id", None) == "busy_account_ids")
+        self.assertIn("_probe_profile", ast.dump(check))
+
+    def test_a_busy_account_does_not_use_up_the_batch(self):
+        # Seen live: the next title's waiting copies were all on the busy
+        # provider, so a batch chosen first and checked later measured nothing
+        # while another provider had copies waiting.
+        R = self._Rel
+        groups = [(1, [R(1, "busy"), R(2, "busy"), R(3, "busy")]),
+                  (2, [R(4, "free"), R(5, "busy")]),
+                  (3, [R(6, "free"), R(7, "free")])]
+        kept = patch.without_accounts(groups, {"busy"})
+        self.assertEqual([m for m, _ in kept], [2, 3])
+        chosen = patch.take_whole_movies(kept, 3, allow_oversized=False)
+        self.assertEqual([r.id for r in chosen], [4, 6, 7])
+
+    def test_no_busy_accounts_changes_nothing(self):
+        groups = [(1, [self._Rel(1, "a")])]
+        self.assertEqual(patch.without_accounts(groups, set()), groups)
+
+    def test_busy_accounts_are_removed_before_the_batch_is_chosen(self):
+        fn, _loop = self._probe_loop()
+        lines = {}
+        for c in ast.walk(fn):
+            if isinstance(c, ast.Call):
+                name = getattr(c.func, "id", None)
+                if name in ("without_accounts", "take_whole_movies"):
+                    lines.setdefault(name, c.lineno)
+        self.assertIn("without_accounts", lines)
+        self.assertLess(lines["without_accounts"], lines["take_whole_movies"])
+
+    def test_status_names_the_busy_account(self):
+        import plugin as plugin_mod
+        out = plugin_mod._format_last_run({
+            "state": "finished", "finished_at": "2030-01-02T03:04:05+00:00",
+            "result": {"lookup": {"fetched": 1},
+                       "measure": {"probed": 0, "busy": ["ProviderX"]}}})
+        self.assertIn("ProviderX", out)
+        self.assertIn("busy", out)
+
+
 class ManifestParityTests(unittest.TestCase):
     """plugin.json and the Plugin class both declare the UI, so they must agree.
 
