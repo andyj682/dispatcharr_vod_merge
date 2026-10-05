@@ -573,14 +573,34 @@ bounded window — playback that starts during a probe of at most thirty
 seconds — and a measurement cut short in that window is already recorded as a
 retryable error rather than a fact about the stream.
 
-### What is deliberately not here
+### Running unattended
 
-Measuring was built second, after the harvest, so that the harvest could report
-exactly how many copies it could not fill and size the expensive pass from
-measurement instead of estimate. One piece is still missing:
+The busy check was the prerequisite: an unattended run cannot choose its
+moment, so it has to be able to tell for itself that a provider is in use. With
+that in place, the nightly run is the manual run repeated — same lock, same
+order, same checks — under a time limit.
 
-- **A schedule.** Every run is still started by hand. The busy check above was
-  its prerequisite, since an unattended run cannot choose its moment.
+One guard object is consulted before every lookup and every probe. It keeps the
+run lock alive and enforces the deadline, and it remembers which of the two
+said stop, because "time limit reached" is the expected end of every night with
+a backlog and "lost the run lock" is not. They must not read alike in the
+record.
+
+The loop ends on the first batch that tries nothing. Two details keep that
+honest. Copies with no stream URL are never stamped, so they are picked again
+every batch; counting them as progress would spin until the deadline. And a
+provider whose breaker trips is carried into a skip list for the rest of the
+night: its failures are deliberately not stamped, so without the list every
+later batch would choose the same copies and ask a provider that has already
+shown it is not answering. A safety cap on batches backs both up.
+
+The time limit is never unlimited, unlike the batch sizes. "0 means no limit"
+is a reasonable convention for a batch someone starts by hand; for a run nobody
+is watching, an unbounded night runs into whatever is scheduled after it.
+
+The timer is written into Dispatcharr's scheduler on Enable and at startup, the
+same as the merge sweep's. Rather than leave a switched-off feature running
+until the next restart, the task re-reads the switch when it fires.
 
 ## Manual approvals
 

@@ -202,6 +202,9 @@ the other. Listed in the order the UI shows them.
 | **Variant edition pattern (regex)** | `[B&W]`, `[Black/White]`, `[Colorized]` | Matching entries are never merged (see below). |
 | **Enrich wanted movies** | off | Fetch audio/video details for every candidate copy of the movies in the wanted set file: provider details first, then — if enabled — ffprobe for what providers did not describe. |
 | **Movie wanted set file** | *(empty = off)* | Path, inside the container, to the file your `.strm` generator publishes listing the movies it syncs. See [Enriching the movies you sync](#enriching-the-movies-you-sync). |
+| **Enrich wanted movies nightly** | off | Runs **Enrich movies** automatically each night, repeating batches until nothing is left or the time limit is reached. See [Running it nightly](#running-it-nightly). |
+| **Nightly enrichment start hour (0-23)** | 1 | System timezone. A new hour takes effect after **Enable** or a restart. |
+| **Nightly enrichment time limit (minutes)** | 90 | No new lookup or measurement starts after this; the rest continues the next night. 1 to 720 — deliberately never unlimited. |
 | **Enrichment lookups per run** | 25 | Maximum number of movie copies one **Enrich movies** run looks up. 0 means no limit. |
 | **Delay between enrichment calls (ms)** | 500 | Spacing between provider calls during enrichment. |
 | **Use ffprobe to analyze streams with no provider details** | off | Adds a second step to **Enrich movies**: open each copy the lookup could not describe and measure it. The only source of Dolby Vision information. Costs a provider connection slot per copy. |
@@ -685,6 +688,36 @@ If several measurements against one provider fail in a row, the rest are
 abandoned for that run and nothing is recorded against those streams — repeated
 failure says the provider is not answering, not that each individual stream is
 bad.
+
+### Running it nightly
+
+Turn on **Enrich wanted movies nightly** and enrichment runs by itself at
+**Nightly enrichment start hour**. Each night it repeats the same batches **Enrich
+movies** runs — lookups first, then measurements — until one of these happens,
+and **Enrichment status** says which:
+
+- **the time limit is reached** — the normal end of a night while there is a
+  backlog; the rest continues the next night;
+- **nothing is left to try** — the backlog is done;
+- **the rest is on providers that are busy or not answering** — what remains
+  needs a provider that is in use, or that stopped responding earlier in the
+  night (it is not asked again until the next night);
+- the wanted set was refused, or the run lost its lock — as for a manual run.
+
+It is the same run as the button, under the same rules: one run at a time, no
+measuring of a busy provider, and the same lock. If a manual run is going when
+the timer fires, the nightly run does nothing that night rather than queuing
+behind it.
+
+**Enrichment status** shows roughly how many nights the current backlog needs at
+the current settings — an estimate, not a promise, but enough that a large
+wanted set never turns into weeks of nightly provider traffic by surprise.
+
+Pick an hour clear of anything else that uses your providers: backups, the
+nightly merge sweep, provider refreshes, and recordings. The start hour is
+written into Dispatcharr's scheduler only on **Enable** or a restart; turning the
+feature off takes effect at once, because the run checks the switch when it
+fires.
 
 ## Surviving an empty provider listing
 

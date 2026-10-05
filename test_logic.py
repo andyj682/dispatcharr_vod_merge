@@ -2187,7 +2187,7 @@ class ProbeCallSiteTests(unittest.TestCase):
         self.assertIsNone(self._action_branch("probe_now"))
 
     def test_the_task_runs_lookup_before_measuring(self):
-        calls = [c for c in ast.walk(self._fn("run_enrichment"))
+        calls = [c for c in ast.walk(self._fn("_run_enrichment"))
                  if isinstance(c, ast.Call)
                  and getattr(c.func, "id", None) == "enrich_run_impl"]
         self.assertEqual(len(calls), 1)
@@ -2205,7 +2205,7 @@ class ProbeCallSiteTests(unittest.TestCase):
         self.assertIn("queue", {k.arg for k in calls[0].keywords})
 
     def test_the_task_hands_the_run_a_heartbeat(self):
-        calls = [c for c in ast.walk(self._fn("run_enrichment"))
+        calls = [c for c in ast.walk(self._fn("_run_enrichment"))
                  if isinstance(c, ast.Call)
                  and getattr(c.func, "id", None) == "enrich_run_impl"]
         self.assertEqual(len(calls), 1)
@@ -2239,7 +2239,7 @@ class EnrichRunOrderTests(unittest.TestCase):
             calls.append(("lookup", heartbeat))
             return lookup_result if lookup_result is not None else {"fetched": 5}
 
-        def measure(heartbeat=None):
+        def measure(heartbeat=None, skip_accounts=None):
             calls.append(("measure", heartbeat))
             return {"probed": 2}
 
@@ -2251,6 +2251,17 @@ class EnrichRunOrderTests(unittest.TestCase):
         out, calls, hb = self._run()
         self.assertEqual(calls, [("lookup", hb), ("measure", hb)])
         self.assertEqual(out, {"lookup": {"fetched": 5}, "measure": {"probed": 2}})
+
+    def test_the_nights_skip_list_reaches_the_measuring_step(self):
+        got = []
+
+        def measure(heartbeat=None, skip_accounts=None):
+            got.append(skip_accounts)
+            return {}
+
+        patch.enrich_run_impl(True, lambda heartbeat=None: {}, measure,
+                              skip_accounts={7})
+        self.assertEqual(got, [{7}])
 
     def test_measuring_off_means_lookup_only(self):
         out, calls, _ = self._run(probe_enabled=False)
@@ -2574,6 +2585,248 @@ class BusyProviderTests(unittest.TestCase):
                        "measure": {"probed": 0, "busy": ["ProviderX"]}}})
         self.assertIn("ProviderX", out)
         self.assertIn("busy", out)
+
+
+class RunGuardTests(unittest.TestCase):
+    """Called before every lookup and probe. It must stop a nightly run at its
+    time limit and say so, distinctly from losing the run lock."""
+
+    def test_carries_on_with_time_and_the_lock(self):
+        g = patch.RunGuard(lambda: True, deadline=100, clock=lambda: 50)
+        self.assertTrue(g())
+        self.assertIsNone(g.reason)
+
+    def test_stops_at_the_time_limit_without_touching_the_lock(self):
+        refreshed = []
+        g = patch.RunGuard(lambda: refreshed.append(1) or True,
+                           deadline=100, clock=lambda: 100)
+        self.assertFalse(g())
+        self.assertEqual(g.reason, "time limit reached")
+        self.assertEqual(refreshed, [])
+
+    def test_a_lost_lock_is_reported_as_such(self):
+        g = patch.RunGuard(lambda: False, deadline=100, clock=lambda: 1)
+        self.assertFalse(g())
+        self.assertEqual(g.reason, "lost the run lock")
+
+    def test_a_manual_run_has_no_time_limit(self):
+        g = patch.RunGuard(lambda: True, clock=lambda: 10 ** 12)
+        self.assertTrue(g.time_left())
+        self.assertTrue(g())
+
+    def test_the_stop_reason_reaches_the_record(self):
+        g = patch.RunGuard(lambda: True, deadline=0, clock=lambda: 1)
+        g()
+        self.assertEqual(patch._stop_reason(g), "time limit reached")
+        self.assertEqual(patch._stop_reason(lambda: False), "lost the run lock")
+
+
+class NightlyBatchTests(unittest.TestCase):
+    """A nightly run repeats batches. Every way it can end has to end it, and a
+    provider that stopped answering must not be asked again all night."""
+
+    def _batches(self, results, time_ok=None):
+        calls = []
+        it = iter(results)
+
+        def batch(skip):
+            calls.append(set(skip))
+            return next(it)
+
+        clock = iter(time_ok) if time_ok is not None else None
+        time_left = (lambda: next(clock)) if clock else (lambda: True)
+        return patch.run_batches(batch, time_left), calls
+
+    def _res(self, fetched=0, probed=0, **meas):
+        out = {"lookup": {"fetched": fetched, "got_essentials": 0}}
+        if probed is not None:
+            out["measure"] = dict({"probed": probed, "gained": probed}, **meas)
+        return out
+
+    def test_repeats_until_a_batch_finds_nothing_to_do(self):
+        tot, calls = self._batches([self._res(25, 3), self._res(10, 3),
+                                    self._res(0, 0)])
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(tot["batches"], 3)
+        self.assertEqual(tot["lookup"]["fetched"], 35)
+        self.assertEqual(tot["measure"]["probed"], 6)
+        self.assertEqual(tot["ended"], "nothing left to try")
+
+    def test_no_batch_starts_after_the_time_limit(self):
+        tot, calls = self._batches([self._res(25, 3)] * 5,
+                                   time_ok=[True, True, False])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(tot["ended"], "time limit reached")
+
+    def test_a_batch_stopped_mid_way_ends_the_night_with_its_reason(self):
+        tot, calls = self._batches([self._res(5, None) | {"lookup": {
+            "fetched": 5, "stopped": "time limit reached"}}, self._res(1, 1)])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(tot["ended"], "time limit reached")
+
+    def test_a_refused_wanted_set_ends_the_night(self):
+        tot, calls = self._batches([{"lookup": {"aborted": "wanted set stale"}},
+                                    self._res(1, 1)])
+        self.assertEqual(len(calls), 1)
+        self.assertIn("wanted set stale", tot["ended"])
+
+    def test_a_provider_that_stopped_answering_is_skipped_for_the_night(self):
+        # Its failures are deliberately not stamped, so nothing else would
+        # stop the next batch picking exactly the same copies again.
+        tot, calls = self._batches([
+            self._res(5, 1, broken=["ProviderX"], broken_ids=[7], errors=3),
+            self._res(5, 1), self._res(0, 0)])
+        self.assertEqual(calls[0], set())
+        self.assertEqual(calls[1], {7})
+        self.assertEqual(calls[2], {7})
+        self.assertEqual(tot["measure"]["broken"], ["ProviderX"])
+
+    def test_ending_blocked_by_busy_providers_is_said(self):
+        tot, _ = self._batches([self._res(0, 0, busy=["ProviderY"])])
+        self.assertIn("busy", tot["ended"])
+        self.assertEqual(tot["measure"]["busy"], ["ProviderY"])
+
+    def test_a_provider_busy_earlier_does_not_mislabel_a_finished_backlog(self):
+        tot, _ = self._batches([self._res(5, 0, busy=["ProviderY"]),
+                                self._res(0, 0)])
+        self.assertEqual(tot["ended"], "nothing left to try")
+
+    def test_unstamped_copies_do_not_count_as_progress(self):
+        # A copy with no stream URL is never stamped, so it is picked again
+        # every batch; counting it as progress would loop all night.
+        tot, calls = self._batches([self._res(0, 0, no_url=3)] * 3)
+        self.assertEqual(len(calls), 1)
+
+    def test_a_safety_cap_bounds_the_batches(self):
+        n = []
+
+        def batch(skip):
+            n.append(1)
+            return self._res(1, 0)
+
+        tot = patch.run_batches(batch, lambda: True, max_batches=4)
+        self.assertEqual(len(n), 4)
+        self.assertIn("safety", tot["ended"])
+
+    def test_measuring_off_leaves_no_measure_totals(self):
+        tot, _ = self._batches([self._res(3, None), self._res(0, None)])
+        self.assertNotIn("measure", tot)
+
+
+class NightlyScheduleTests(unittest.TestCase):
+
+    def _cfg(self, **kw):
+        cfg = {"enrich_nightly": True, "probe_movies": True, "enrich_minutes": 60,
+               "enrich_delay_ms": 0, "probe_delay_ms": 0}
+        cfg.update(kw)
+        return cfg
+
+    def test_nights_estimate(self):
+        # 3600 lookups at 1s = one hour = one night of 60 minutes.
+        self.assertEqual(patch.estimate_nights(3600, 0, self._cfg()), 1)
+        self.assertEqual(patch.estimate_nights(3601, 0, self._cfg()), 2)
+        self.assertEqual(patch.estimate_nights(0, 600, self._cfg()), 1)
+        self.assertEqual(patch.estimate_nights(0, 0, self._cfg()), 0)
+
+    def test_measuring_off_adds_nothing(self):
+        self.assertEqual(patch.estimate_nights(
+            0, 10 ** 6, self._cfg(probe_movies=False)), 0)
+
+    def test_no_estimate_when_nightly_is_off(self):
+        self.assertIsNone(patch.estimate_nights(10, 10, self._cfg(enrich_nightly=False)))
+
+    def test_spacing_counts(self):
+        self.assertEqual(patch.estimate_nights(
+            1800, 0, self._cfg(enrich_delay_ms=1000)), 1)
+        self.assertEqual(patch.estimate_nights(
+            1801, 0, self._cfg(enrich_delay_ms=1000)), 2)
+
+    def test_time_limit_setting_is_bounded_and_never_unlimited(self):
+        f = patch._enrich_minutes
+        self.assertEqual(f(30), 30)
+        for junk in (0, -5, patch.MAX_ENRICH_MINUTES + 1, "abc", None):
+            self.assertEqual(f(junk), patch.DEFAULT_ENRICH_MINUTES, junk)
+
+    def test_start_hour_setting(self):
+        self.assertEqual(patch._sweep_hour(2, patch.DEFAULT_ENRICH_HOUR), 2)
+        self.assertEqual(patch._sweep_hour(24, patch.DEFAULT_ENRICH_HOUR),
+                         patch.DEFAULT_ENRICH_HOUR)
+        self.assertEqual(patch._sweep_hour("x"), patch.DEFAULT_SWEEP_HOUR)
+
+    def _fn(self, name):
+        tree = ast.parse(open(patch.__file__, encoding="utf-8").read())
+        return next(n for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef) and n.name == name)
+
+    def test_only_the_nightly_run_has_a_deadline_and_the_guard_gets_it(self):
+        fn = self._fn("_run_enrichment")
+        src = ast.unparse(fn)
+        self.assertRegex(src, r"deadline = .*enrich_minutes.* if nightly else None")
+        guards = [c for c in ast.walk(fn) if isinstance(c, ast.Call)
+                  and getattr(c.func, "id", None) == "RunGuard"]
+        self.assertEqual(len(guards), 1)
+        kw = {k.arg: k.value for k in guards[0].keywords}
+        self.assertEqual(getattr(kw.get("deadline"), "id", None), "deadline")
+
+    def test_the_nightly_run_repeats_batches_with_the_guards_clock(self):
+        fn = self._fn("_run_enrichment")
+        src = ast.unparse(fn)
+        self.assertIn("run_batches(one_batch, guard.time_left)", src)
+        self.assertIn("heartbeat=guard", src)
+        # The single-batch shortcut must be taken ONLY for a manual run.
+        shortcut = [n for n in ast.walk(fn) if isinstance(n, ast.If)
+                    and any(isinstance(s, ast.Return)
+                            and "one_batch()" in ast.unparse(s) for s in n.body)]
+        self.assertEqual(len(shortcut), 1)
+        self.assertEqual(ast.unparse(shortcut[0].test), "not nightly")
+
+    def test_the_nightly_task_rechecks_its_switch_when_it_fires(self):
+        fn = self._fn("run_nightly_enrichment")
+        ifs = [n for n in fn.body if isinstance(n, ast.If)]
+        self.assertTrue(ifs, "expected a switch check before running")
+        self.assertIn("enrich_nightly", ast.unparse(ifs[0].test))
+        self.assertIn("enrich_movies", ast.unparse(ifs[0].test))
+        run_line = next(c.lineno for c in ast.walk(fn) if isinstance(c, ast.Call)
+                        and getattr(c.func, "id", None) == "_run_enrichment")
+        self.assertLess(ifs[0].lineno, run_line)
+
+    def test_both_timers_are_removed_on_disable(self):
+        src = ast.unparse(self._fn("remove_schedule"))
+        self.assertIn("SWEEP_PERIODIC_NAME", src)
+        self.assertIn("ENRICH_PERIODIC_NAME", src)
+
+    def test_the_enrichment_timer_needs_enrichment_itself_on(self):
+        src = ast.unparse(self._fn("ensure_schedule"))
+        self.assertRegex(src, r"ENRICH_NIGHTLY_TASK_PATH,\s*cfg\['enrich_nightly'\] "
+                              r"and cfg\['enrich_movies'\]")
+
+    def test_status_reports_a_nightly_run_and_how_it_ended(self):
+        import plugin as plugin_mod
+        out = plugin_mod._format_last_run({
+            "state": "finished", "nightly": True,
+            "finished_at": "2030-01-02T03:04:05+00:00",
+            "result": {"lookup": {"fetched": 40, "got_essentials": 9},
+                       "measure": {"probed": 12, "gained": 11},
+                       "batches": 5, "ended": "time limit reached"}})
+        self.assertIn("last nightly run finished 2030-01-02 03:04 UTC "
+                      "(5 batches, time limit reached)", out)
+        self.assertEqual(len(out.splitlines()), 1)
+
+    def test_status_shows_the_nights_estimate_only_when_there_is_one(self):
+        import plugin as plugin_mod
+        base = EnrichStatusMessageTests()._st()
+        self.assertIn("nightly: ~4 nights",
+                      plugin_mod._format_enrich_status(dict(base, nights=4)))
+        self.assertIn("nightly: ~1 night\n",
+                      plugin_mod._format_enrich_status(dict(base, nights=1)))
+        for none in (None, 0):
+            self.assertNotIn("nightly:",
+                             plugin_mod._format_enrich_status(dict(base, nights=none)))
+
+    def test_the_probe_pass_honors_the_skip_list(self):
+        fn = self._fn("probe_movies_impl")
+        self.assertIn("without_accounts(per_movie, set(skip_accounts or ()))",
+                      ast.unparse(fn))
 
 
 class ManifestParityTests(unittest.TestCase):

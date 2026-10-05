@@ -117,7 +117,10 @@ def _format_enrich_status(st):
         f"have video+audio {st['have_essentials']} | need lookup "
         f"{st['need_fetch']} ({st['runs_at_current_limit']} runs) | need "
         f"measuring {st['need_measure']} "
-        f"({st['measure_runs_at_current_limit']} runs)\n"
+        f"({st['measure_runs_at_current_limit']} runs)"
+        + (f" | nightly: ~{st['nights']} night{'' if st['nights'] == 1 else 's'}"
+           if st.get("nights") else "")
+        + "\n"
         + _format_last_run(st.get("last_enrich_run"))
         + (f"\ncopies/lookup/measure: {per}" if per else "")
     )
@@ -128,18 +131,23 @@ def _format_last_run(lp):
     if not lp:
         return "last run: none yet"
     state = lp.get("state")
+    kind = "nightly run" if lp.get("nightly") else "run"
     if state == "running":
-        return (f"enrichment run IN PROGRESS, started "
+        return (f"enrichment {kind} IN PROGRESS, started "
                 f"{_short_time(lp.get('started_at'))}")
     when = _short_time(lp.get("finished_at") or lp.get("started_at"))
     if state != "finished":
-        return f"last run {state} at {when}" + (
+        return f"last {kind} {state} at {when}" + (
             f" -- {lp['error']}" if lp.get("error") else "")
     res = lp.get("result") or {}
     look = res.get("lookup") or {}
     if look.get("aborted"):
-        return f"last run finished {when}: nothing done -- {look['aborted']}"
-    line = (f"last run finished {when}: looked up {look.get('fetched', 0)} "
+        return f"last {kind} finished {when}: nothing done -- {look['aborted']}"
+    # A nightly run says how far it got and why it ended, on the same line --
+    # "time limit reached" is the normal end of a night with a backlog.
+    how = (f" ({res.get('batches', 0)} batches, {res['ended']})"
+           if res.get("ended") else "")
+    line = (f"last {kind} finished {when}{how}: looked up {look.get('fetched', 0)} "
             f"(gained {look.get('got_essentials', 0)})")
     meas = res.get("measure")
     if meas is None:
@@ -187,7 +195,7 @@ def _format_log(data, limit=60):
 class Plugin:
     # UI title only; "Dispatcharr" is redundant inside the Dispatcharr UI.
     name = "VOD Merge"
-    version = "1.5.2"
+    version = "1.5.3"
     description = (
         "Durably merges duplicate VOD titles from providers that omit TMDB ids, "
         "by matching metadata like poster artwork and plot text to a title you "
@@ -385,6 +393,37 @@ class Plugin:
                 "Path, inside the container, to the list of wanted movies. See "
                 "README for details on the format. Blank disables enrichment. "
                 "If the file is missing, stale or malformed, nothing happens."
+            ),
+        },
+        {
+            "id": "enrich_nightly",
+            "label": "Enrich wanted movies nightly",
+            "type": "boolean",
+            "default": False,
+            "help_text": (
+                "Run \"Enrich now\" automatically each night, repeating batches "
+                "until nothing is left or the time limit is reached. A new start "
+                "hour takes effect after Enable or a restart."
+            ),
+        },
+        {
+            "id": "enrich_hour",
+            "label": "Nightly enrichment start hour (0-23)",
+            "type": "number",
+            "default": 1,
+            "help_text": (
+                "System timezone. Pick an hour clear of backups, provider "
+                "refreshes and recordings."
+            ),
+        },
+        {
+            "id": "enrich_minutes",
+            "label": "Nightly enrichment time limit (minutes)",
+            "type": "number",
+            "default": 90,
+            "help_text": (
+                "No new lookup or measurement starts after this; the rest "
+                "continues the next night. 1 to 720."
             ),
         },
         {

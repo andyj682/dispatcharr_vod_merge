@@ -7,6 +7,32 @@ Everything through 0.8.3 landed during initial development against a single
 large live library; the entries below record *why* each change was needed, since
 several were driven by failures that were invisible from the outside.
 
+## 1.5.3 — 2026-10-04
+
+**Added — enrich the wanted set nightly**
+
+- New settings **Enrich wanted movies nightly** (off by default), **Nightly
+  enrichment start hour** (default 1) and **Nightly enrichment time limit**
+  (default 90 minutes). Each night the run repeats the same batches as **Enrich
+  movies** — lookups first, then measurements, under the same lock and the same
+  busy-provider check — until the backlog is done, the time limit is reached, or
+  what remains is on providers that are busy or not answering.
+
+- **Enrichment status** says how a nightly run ended and shows roughly how many
+  nights the current backlog needs at the current settings, so a large wanted
+  set is a visible choice rather than weeks of provider traffic by surprise.
+
+- A provider that stops answering during the night is left alone for the rest
+  of it. Its failures are deliberately not recorded against its copies, so
+  without this every later batch would choose the same copies and keep asking.
+
+- The time limit is always bounded (1 to 720 minutes). A batch someone starts
+  by hand can sensibly be unlimited; a run nobody is watching cannot.
+
+- Turning the nightly run off takes effect at once: the run checks the switch
+  when it fires. A new start hour, like the merge sweep's, is written into the
+  scheduler on **Enable** or a restart.
+
 ## 1.5.2 — 2026-10-04
 
 **Added — a provider that is busy with playback is not measured**

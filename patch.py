@@ -365,13 +365,24 @@ def _as_int(value, default):
     return out if out >= 0 else default
 
 
-def _sweep_hour(value):
-    """Hour of day for the nightly sweep, clamped to a valid hour."""
+def _sweep_hour(value, default=None):
+    """Hour of day for a nightly timer; anything invalid falls back to default."""
+    default = DEFAULT_SWEEP_HOUR if default is None else default
     try:
         hour = int(value)
     except (TypeError, ValueError):
-        return DEFAULT_SWEEP_HOUR
-    return hour if 0 <= hour <= 23 else DEFAULT_SWEEP_HOUR
+        return default
+    return hour if 0 <= hour <= 23 else default
+
+
+def _enrich_minutes(value):
+    """Nightly time limit. No "0 means unlimited" here: an unbounded night runs
+    into the provider refreshes and anything else scheduled after it."""
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_ENRICH_MINUTES
+    return minutes if 1 <= minutes <= MAX_ENRICH_MINUTES else DEFAULT_ENRICH_MINUTES
 
 
 def _csv_set(value):
@@ -482,6 +493,11 @@ def _load_config(force: bool = False) -> dict:
                             or DEFAULT_WANTED_SET_PATH),
         "enrich_movies": _as_bool(
             settings.get("enrich_movies"), DEFAULT_ENRICH_MOVIES),
+        "enrich_nightly": _as_bool(
+            settings.get("enrich_nightly"), DEFAULT_ENRICH_NIGHTLY),
+        "enrich_hour": _sweep_hour(settings.get("enrich_hour"),
+                                   DEFAULT_ENRICH_HOUR),
+        "enrich_minutes": _enrich_minutes(settings.get("enrich_minutes")),
         "enrich_limit": _as_int(settings.get("enrich_limit"), DEFAULT_ENRICH_LIMIT),
         "enrich_delay_ms": _as_int(
             settings.get("enrich_delay_ms"), DEFAULT_ENRICH_DELAY_MS),
@@ -2089,7 +2105,10 @@ def enrich_status(cfg=None):
                     else -(-todo // cfg["enrich_limit"])),
                 "measure_runs_at_current_limit": (
                     0 if not cfg["probe_limit"]
-                    else -(-measure // cfg["probe_limit"]))})
+                    else -(-measure // cfg["probe_limit"])),
+                # Disclosure, not a guard: a big wanted set is legitimate, but
+                # how many nights it takes should never be a surprise.
+                "nights": estimate_nights(todo, measure, cfg)})
     return out
 
 
@@ -2178,9 +2197,9 @@ def enrich_movies_impl(limit=None, delay=None, heartbeat=None):
         with client:
             for rel in rels:
                 if heartbeat is not None and not heartbeat():
-                    stats["stopped"] = "lost the run lock"
-                    logger.warning("[VOD-MERGE] enrichment stopped early -- lost "
-                                   "the run lock, so another run may be active")
+                    stats["stopped"] = _stop_reason(heartbeat)
+                    logger.info("[VOD-MERGE] enrichment stopped early -- %s",
+                                stats["stopped"])
                     break
                 props = rel.custom_properties or {}
                 outcome = "none"
@@ -2538,8 +2557,13 @@ def _probe_profile(account, has_capacity):
         return None
 
 
-def probe_movies_impl(limit=None, delay=None, heartbeat=None):
+def probe_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=None):
     """Measure the wanted copies no provider would describe.
+
+    `skip_accounts`: account ids to leave out entirely -- a nightly run passes
+    the ones whose breaker tripped in an earlier batch. Their failures are not
+    stamped, so without this every later batch would pick the same copies and
+    probe a provider that has already shown it is not answering.
 
     Scope comes from the same wanted-set file as step 2 and fails closed the
     same way. Candidates are what step 2 could not fill.
@@ -2603,6 +2627,7 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None):
         logger.info("[VOD-MERGE] busy with playback, not probing this run: %s",
                     ", ".join(stats["busy"]))
     per_movie = without_accounts(per_movie, busy_ids)
+    per_movie = without_accounts(per_movie, set(skip_accounts or ()))
 
     # allow_oversized=False: here the limit is a SAFETY ceiling, not a target.
     chosen = take_whole_movies(per_movie, limit, allow_oversized=False)
@@ -2616,9 +2641,9 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None):
         if name in stats["broken"] or name in stats["busy"]:
             continue
         if heartbeat is not None and not heartbeat():
-            stats["stopped"] = "lost the run lock"
-            logger.warning("[VOD-MERGE] stream probe stopped early -- lost the "
-                           "run lock, so another run may be measuring")
+            stats["stopped"] = _stop_reason(heartbeat)
+            logger.info("[VOD-MERGE] stream probe stopped early -- %s",
+                        stats["stopped"])
             break
         # Checked before EVERY probe, not once per run: playback can start at
         # any point. A busy account is left alone for the rest of the run and
@@ -2662,6 +2687,7 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None):
             deferred_errors.setdefault(name, []).append(rel)
             if consecutive[name] >= PROBE_BREAKER:
                 stats["broken"].append(name)
+                stats.setdefault("broken_ids", []).append(rel.m3u_account_id)
                 logger.warning(
                     "[VOD-MERGE] probe circuit breaker tripped for %r after %d "
                     "consecutive failures -- abandoning it for this run and "
@@ -2733,6 +2759,18 @@ DEFAULT_SCHEDULE_QUEUE = "dvr"
 DEFAULT_SWEEP_HOUR = 4
 DEFAULT_SCHEDULED_SWEEP = False   # opt-in, like everything else here
 
+# Nightly enrichment: its own timer, separate from the merge sweep, because it
+# is a separate feature with a separate cost and someone may want either alone.
+ENRICH_PERIODIC_NAME = "dispatcharr_vod_merge_enrichment"
+ENRICH_NIGHTLY_TASK_PATH = "dispatcharr_vod_merge.run_nightly_enrichment"
+DEFAULT_ENRICH_NIGHTLY = False
+DEFAULT_ENRICH_HOUR = 1
+DEFAULT_ENRICH_MINUTES = 90
+MAX_ENRICH_MINUTES = 720
+# Safety cap on batches in one night, far above anything a time limit allows,
+# so a bug that stops a batch from making progress cannot spin for ever.
+MAX_NIGHTLY_BATCHES = 5000
+
 
 @shared_task(name=SWEEP_TASK_PATH)
 def run_movie_sweep():
@@ -2760,16 +2798,31 @@ def ensure_schedule() -> bool:
     """
     try:
         cfg = _load_config(force=True)
-        if not cfg["scheduled_sweep"]:
-            remove_schedule()
+    except Exception as exc:
+        logger.warning("[VOD-MERGE] could not read settings for the schedule: %s", exc)
+        return False
+    queue = cfg["schedule_queue"]
+    sweep = _sync_periodic(SWEEP_PERIODIC_NAME, SWEEP_TASK_PATH,
+                           cfg["scheduled_sweep"], cfg["sweep_hour"], queue,
+                           "nightly movie detail sweep")
+    enrich = _sync_periodic(ENRICH_PERIODIC_NAME, ENRICH_NIGHTLY_TASK_PATH,
+                            cfg["enrich_nightly"] and cfg["enrich_movies"],
+                            cfg["enrich_hour"], queue, "nightly enrichment")
+    return sweep or enrich
+
+
+def _sync_periodic(name, path, enabled, hour, queue, what) -> bool:
+    """Create/update one beat task, or delete it when off. Each timer is
+    handled on its own, so a problem with one never blocks the other."""
+    try:
+        if not enabled:
+            _delete_periodic(name)
             return False
 
         from core.scheduling import create_or_update_periodic_task
-        hour = cfg["sweep_hour"]
-        queue = cfg["schedule_queue"]
         task = create_or_update_periodic_task(
-            task_name=SWEEP_PERIODIC_NAME,
-            celery_task_path=SWEEP_TASK_PATH,
+            task_name=name,
+            celery_task_path=path,
             cron_expression=f"0 {hour} * * *",
             enabled=True,
         )
@@ -2779,25 +2832,30 @@ def ensure_schedule() -> bool:
                 task.save(update_fields=["queue"])
         except Exception as exc:
             logger.warning(
-                "[VOD-MERGE] could not route schedule to queue %r: %s", queue, exc)
-        logger.info(
-            "[VOD-MERGE] scheduled nightly movie detail sweep at %02d:00 "
-            "(system TZ) on queue %r", hour, queue,
-        )
+                "[VOD-MERGE] could not route %s to queue %r: %s", what, queue, exc)
+        logger.info("[VOD-MERGE] scheduled %s at %02d:00 (system TZ) on queue %r",
+                    what, hour, queue)
         return True
     except Exception as exc:
-        logger.warning("[VOD-MERGE] could not create beat schedule: %s", exc)
+        logger.warning("[VOD-MERGE] could not schedule %s: %s", what, exc)
+        return False
+
+
+def _delete_periodic(name) -> bool:
+    try:
+        from core.scheduling import delete_periodic_task
+        delete_periodic_task(name)
+        return True
+    except Exception as exc:
+        logger.debug("[VOD-MERGE] could not remove beat task %s: %s", name, exc)
         return False
 
 
 def remove_schedule() -> bool:
-    try:
-        from core.scheduling import delete_periodic_task
-        delete_periodic_task(SWEEP_PERIODIC_NAME)
-        return True
-    except Exception as exc:
-        logger.debug("[VOD-MERGE] could not remove beat schedule: %s", exc)
-        return False
+    """Remove BOTH timers (on disable)."""
+    a = _delete_periodic(SWEEP_PERIODIC_NAME)
+    b = _delete_periodic(ENRICH_PERIODIC_NAME)
+    return a and b
 
 
 # --------------------------------------------------------------------------- #
@@ -2816,7 +2874,7 @@ def remove_schedule() -> bool:
 #
 # Exactly one run at a time, enforced by a Redis lock taken INSIDE the task
 # rather than at the button: a check at enqueue time cannot stop two clicks
-# from queueing two runs. On a provider that allows one connection, two runs
+# from queuing two runs. On a provider that allows one connection, two runs
 # at once collide with each other just as surely as with playback.
 #
 # The lock is short-lived and refreshed before every lookup and every probe,
@@ -2911,26 +2969,146 @@ def _redis_client():
     return client
 
 
-def enrich_run_impl(probe_enabled, lookup, measure, heartbeat=None):
+def enrich_run_impl(probe_enabled, lookup, measure, heartbeat=None,
+                    skip_accounts=None):
     """-> {"lookup": stats, "measure": stats?}. Lookup first, then measuring.
 
     The steps are passed in so the ordering and the stop conditions are
     testable without Django. Measuring is skipped when it is off, when the
     lookup declined to run at all (an untrustworthy wanted set must stop BOTH
-    steps -- fail closed on scope), and when the lookup lost the run lock.
+    steps -- fail closed on scope), and when the lookup was stopped early.
     """
     out = {"lookup": lookup(heartbeat=heartbeat)}
     if not probe_enabled:
         return out
     if out["lookup"].get("aborted") or out["lookup"].get("stopped"):
         return out
-    out["measure"] = measure(heartbeat=heartbeat)
+    out["measure"] = measure(heartbeat=heartbeat, skip_accounts=skip_accounts)
     return out
 
 
-@shared_task(name=ENRICH_TASK_PATH)
-def run_enrichment():
-    """Background entry point for 'Enrich now'. Each step bounded by its limit."""
+class RunGuard:
+    """Called before every lookup and every probe; True means carry on.
+
+    Keeps the run lock alive and, for a nightly run, enforces the time limit.
+    Remembers WHY it said stop, so the record can tell "time limit reached"
+    (expected, every night with a backlog) from "lost the run lock" (not).
+    """
+
+    def __init__(self, refresh, deadline=None, clock=time.time):
+        self.refresh, self.deadline, self.clock = refresh, deadline, clock
+        self.reason = None
+
+    def time_left(self):
+        return self.deadline is None or self.clock() < self.deadline
+
+    def __call__(self):
+        if not self.time_left():
+            self.reason = "time limit reached"
+            return False
+        if not self.refresh():
+            self.reason = "lost the run lock"
+            logger.warning("[VOD-MERGE] enrichment lost its run lock -- another "
+                           "run may be active, so this one is stopping")
+            return False
+        return True
+
+
+def _stop_reason(heartbeat):
+    return getattr(heartbeat, "reason", None) or "lost the run lock"
+
+
+_LOOKUP_SUMS = ("fetched", "got_essentials", "empty", "errors")
+_MEASURE_SUMS = ("probed", "gained", "nothing", "errors", "no_url")
+
+
+def _attempted(result):
+    """Copies a batch actually tried. Not `no_url`: those are never stamped,
+    so counting them as progress would let a run re-pick them for ever."""
+    look = result.get("lookup") or {}
+    meas = result.get("measure") or {}
+    return (sum(look.get(k, 0) for k in ("fetched", "empty", "errors"))
+            + meas.get("probed", 0) + meas.get("errors", 0))
+
+
+def run_batches(batch, time_left, max_batches=MAX_NIGHTLY_BATCHES):
+    """Repeat `batch(skip_accounts)` for a nightly run. -> totals with `ended`.
+
+    Pure apart from `batch`. Stops when the time is up, when a batch made no
+    progress (backlog done, or all that is left is on busy providers -- the
+    status says which), when anything stopped a batch early, or when the
+    wanted set was refused. Providers whose breaker tripped stay skipped for
+    the rest of the night.
+    """
+    totals = {"lookup": {k: 0 for k in _LOOKUP_SUMS},
+              "measure": {k: 0 for k in _MEASURE_SUMS},
+              "batches": 0}
+    busy, broken, skip = set(), set(), set()
+    measured = False
+    ended = "safety limit on batches reached"
+    for _ in range(max_batches):
+        if not time_left():
+            ended = "time limit reached"
+            break
+        res = batch(set(skip))
+        totals["batches"] += 1
+        look = res.get("lookup") or {}
+        meas = res.get("measure")
+        for k in _LOOKUP_SUMS:
+            totals["lookup"][k] += look.get(k, 0)
+        if meas is not None:
+            measured = True
+            for k in _MEASURE_SUMS:
+                totals["measure"][k] += meas.get(k, 0)
+            busy.update(meas.get("busy") or ())
+            broken.update(meas.get("broken") or ())
+            skip.update(meas.get("broken_ids") or ())
+        if look.get("aborted"):
+            totals["lookup"]["aborted"] = look["aborted"]
+            ended = "nothing done -- %s" % look["aborted"]
+            break
+        stopped = look.get("stopped") or (meas or {}).get("stopped")
+        if stopped:
+            ended = stopped
+            break
+        if not _attempted(res):
+            # Judged on THIS batch: a provider busy at 01:00 and free by 02:00
+            # must not make a finished backlog read as blocked.
+            blocked = (meas or {}).get("busy") or skip
+            ended = ("the rest is on providers that are busy or not answering"
+                     if blocked else "nothing left to try")
+            break
+    if not measured:
+        totals.pop("measure")
+    else:
+        totals["measure"]["busy"] = sorted(busy)
+        totals["measure"]["broken"] = sorted(broken)
+    totals["ended"] = ended
+    return totals
+
+
+# Rough per-copy costs for the nights estimate: a lookup is one light request
+# (about a second with the default spacing), a measurement a few seconds of
+# reading. Spacing settings are added on top. An estimate to disclose the size
+# of a backlog, not a promise.
+LOOKUP_EST_S = 1.0
+PROBE_EST_S = 6.0
+
+
+def estimate_nights(need_lookup, need_measure, cfg):
+    """Pure. Nights the current backlog needs at the current settings, or None
+    when nightly enrichment is off. Rounded up; 0 when nothing is left."""
+    if not cfg.get("enrich_nightly"):
+        return None
+    secs = need_lookup * (LOOKUP_EST_S + cfg.get("enrich_delay_ms", 0) / 1000.0)
+    if cfg.get("probe_movies"):
+        secs += need_measure * (PROBE_EST_S + cfg.get("probe_delay_ms", 0) / 1000.0)
+    window = max(1, cfg.get("enrich_minutes") or DEFAULT_ENRICH_MINUTES) * 60
+    return int(-(-secs // window))
+
+
+def _run_enrichment(nightly=False):
+    """Shared body of the manual and nightly runs: one lock, one record."""
     import uuid
     from django.utils import timezone
 
@@ -2939,18 +3117,28 @@ def run_enrichment():
         client = _redis_client()
         cfg = _load_config(force=True)
         ttl = run_lock_ttl(max(cfg["probe_delay_ms"], cfg["enrich_delay_ms"]))
+        deadline = (time.time() + cfg["enrich_minutes"] * 60) if nightly else None
 
-        def work(heartbeat):
-            write_run_status({"state": "running", "started_at": started})
-            return enrich_run_impl(cfg["probe_movies"], enrich_movies_impl,
-                                   probe_movies_impl, heartbeat=heartbeat)
+        def work(refresh):
+            guard = RunGuard(refresh, deadline=deadline)
+            write_run_status({"state": "running", "started_at": started,
+                              "nightly": nightly})
+
+            def one_batch(skip_accounts=None):
+                return enrich_run_impl(cfg["probe_movies"], enrich_movies_impl,
+                                       probe_movies_impl, heartbeat=guard,
+                                       skip_accounts=skip_accounts)
+
+            if not nightly:
+                return one_batch()
+            return run_batches(one_batch, guard.time_left)
 
         ran, stats = run_locked(client, uuid.uuid4().hex, ttl, work)
     except Exception as exc:
         logger.exception("[VOD-MERGE] enrichment run failed")
         write_run_status({"state": "failed", "started_at": started,
                           "finished_at": timezone.now().isoformat(),
-                          "error": str(exc)})
+                          "nightly": nightly, "error": str(exc)})
         return "Error: %s" % (exc,)
     if not ran:
         # Deliberately leaves the status record alone: it describes the run
@@ -2958,10 +3146,35 @@ def run_enrichment():
         logger.info("[VOD-MERGE] enrichment not started -- another run is "
                     "in progress")
         return {"skipped": "another enrichment run is in progress"}
+    logger.info("[VOD-MERGE] enrichment run%s: %s",
+                " (nightly)" if nightly else "", stats)
     write_run_status({"state": "finished", "started_at": started,
                       "finished_at": timezone.now().isoformat(),
-                      "result": stats})
+                      "nightly": nightly, "result": stats})
     return stats
+
+
+@shared_task(name=ENRICH_TASK_PATH)
+def run_enrichment():
+    """Background entry point for 'Enrich now': one batch, each step bounded
+    by its per-run limit."""
+    return _run_enrichment(nightly=False)
+
+
+@shared_task(name=ENRICH_NIGHTLY_TASK_PATH)
+def run_nightly_enrichment():
+    """Beat entry point: batches until the backlog is done or the time limit.
+
+    Re-reads the switch when it fires. The timer itself is only rewritten on
+    Enable or a restart, so without this check turning the feature off would
+    not take effect until then.
+    """
+    cfg = _load_config(force=True)
+    if not (cfg["enrich_nightly"] and cfg["enrich_movies"]):
+        logger.info("[VOD-MERGE] nightly enrichment fired but is switched off "
+                    "-- doing nothing")
+        return {"skipped": "nightly enrichment is off"}
+    return _run_enrichment(nightly=True)
 
 
 def enqueue_enrichment(cfg=None):

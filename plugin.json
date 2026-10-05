@@ -1,6 +1,6 @@
 {
   "name": "VOD Merge",
-  "version": "1.5.2",
+  "version": "1.5.3",
   "description": "Durably merges duplicate VOD titles from providers that omit TMDB ids, by matching metadata like poster artwork and plot text to a title you already have. Works only with XC accounts.",
   "author": "andyj682",
   "help_url": "https://github.com/andyj682/dispatcharr_vod_merge",
@@ -116,6 +116,27 @@
       "type": "string",
       "default": "",
       "help_text": "Path, inside the container, to the list of wanted movies. See README for details on the format. Blank disables enrichment. If the file is missing, stale or malformed, nothing happens."
+    },
+    {
+      "id": "enrich_nightly",
+      "label": "Enrich wanted movies nightly",
+      "type": "boolean",
+      "default": false,
+      "help_text": "Run \"Enrich now\" automatically each night, repeating batches until nothing is left or the time limit is reached. A new start hour takes effect after Enable or a restart."
+    },
+    {
+      "id": "enrich_hour",
+      "label": "Nightly enrichment start hour (0-23)",
+      "type": "number",
+      "default": 1,
+      "help_text": "System timezone. Pick an hour clear of backups, provider refreshes and recordings."
+    },
+    {
+      "id": "enrich_minutes",
+      "label": "Nightly enrichment time limit (minutes)",
+      "type": "number",
+      "default": 90,
+      "help_text": "No new lookup or measurement starts after this; the rest continues the next night. 1 to 720."
     },
     {
       "id": "enrich_limit",
