@@ -1,6 +1,6 @@
 {
   "name": "VOD Merge",
-  "version": "1.4.0",
+  "version": "1.5.1",
   "description": "Durably merges duplicate VOD titles from providers that omit TMDB ids, by matching metadata like poster artwork and plot text to a title you already have. Works only with XC accounts.",
   "author": "andyj682",
   "help_url": "https://github.com/andyj682/dispatcharr_vod_merge",
@@ -69,34 +69,6 @@
       "help_text": "Inject a TMDB tag even for movies no other provider has, to reduce future churn and let later copies merge properly. Changes those movies' Dispatcharr ids now, and they revert if this is turned off."
     },
     {
-      "id": "wanted_set_path",
-      "label": "Wanted-set file (enrichment)",
-      "type": "string",
-      "default": "",
-      "help_text": "Path, inside the container, to the wanted-set file your .strm generator publishes. Blank disables enrichment. If the file is missing, stale or malformed nothing happens -- it never falls back to enriching your whole library."
-    },
-    {
-      "id": "enrich_movies",
-      "label": "Enrich wanted movies",
-      "type": "boolean",
-      "default": false,
-      "help_text": "Fetch provider detail for every candidate copy of the movies in the wanted-set file, so quality ranking has something to compare. Use 'Enrichment status' first to see the size."
-    },
-    {
-      "id": "enrich_limit",
-      "label": "Enrichment lookups per run",
-      "type": "number",
-      "default": 25,
-      "help_text": "How many relations 'Enrich movies' fetches in one go. 0 means no limit."
-    },
-    {
-      "id": "enrich_delay_ms",
-      "label": "Delay between enrichment calls (ms)",
-      "type": "number",
-      "default": 500,
-      "help_text": "Spacing between provider calls during enrichment."
-    },
-    {
       "id": "scheduled_sweep",
       "label": "Fetch movie details nightly",
       "type": "boolean",
@@ -130,6 +102,55 @@
       "type": "string",
       "default": "\\[[^\\]]*(?:b\\s*&\\s*w|black\\s*/?\\s*white|colou?ri[sz]ed)[^\\]]*\\]",
       "help_text": "Entries whose name matches are never merged, so an alternate edition stays its own library entry even when metadata signals match another title. Empty disables the check."
+    },
+    {
+      "id": "enrich_movies",
+      "label": "Enrich wanted movies",
+      "type": "boolean",
+      "default": false,
+      "help_text": "Fetch available audio/video details for every candidate copy of the movies in the wanted set file below (first by fetching provider details, and if necessary/enabled below, analyzing streams with ffprobe). Use \"Enrichment status\" first to see the size."
+    },
+    {
+      "id": "wanted_set_path",
+      "label": "Movie wanted set file",
+      "type": "string",
+      "default": "",
+      "help_text": "Path, inside the container, to the list of wanted movies. See README for details on the format. Blank disables enrichment. If the file is missing, stale or malformed, nothing happens."
+    },
+    {
+      "id": "enrich_limit",
+      "label": "Enrichment lookups per run",
+      "type": "number",
+      "default": 25,
+      "help_text": "Maximum number of individual movie copies one \"Enrich now\" run looks up. 0 means no limit."
+    },
+    {
+      "id": "enrich_delay_ms",
+      "label": "Delay between enrichment calls (ms)",
+      "type": "number",
+      "default": 500,
+      "help_text": "Spacing between provider calls during enrichment."
+    },
+    {
+      "id": "probe_movies",
+      "label": "Use ffprobe to analyze streams with no provider details",
+      "type": "boolean",
+      "default": false,
+      "help_text": "Measure audio/video details directly for any streams for which provider details don't include video/audio information. Also the only way to get information about Dolby Vision. Each probe uses a provider slot."
+    },
+    {
+      "id": "probe_limit",
+      "label": "Ffprobe lookups per run",
+      "type": "number",
+      "default": 3,
+      "help_text": "Maximum number of streams ffprobe analyzes during one \"Enrich now\" run. 0 means no limit."
+    },
+    {
+      "id": "probe_delay_ms",
+      "label": "Delay between ffprobe calls (ms)",
+      "type": "number",
+      "default": 2000,
+      "help_text": "Spacing between stream measurements."
     },
     {
       "id": "sweep_limit",
@@ -199,7 +220,7 @@
     {
       "id": "enrich_now",
       "label": "Enrich movies",
-      "description": "Fetch provider detail for the candidate copies of wanted movies that still lack measured video and audio. Use 'Enrichment lookups per run' to adjust the batch size. Resumable, so run it again to continue.",
+      "description": "Fill in video and audio for the next batch of wanted copies: provider detail first, then -- if measuring is on -- measure what no provider described. Runs in the background; 'Enrichment status' shows the result. Resumable, so run it again to continue.",
       "button_label": "Enrich now",
       "button_variant": "filled"
     },

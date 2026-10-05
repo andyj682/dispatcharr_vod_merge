@@ -449,18 +449,107 @@ A movie with more copies than the batch size is taken whole anyway. The
 alternative is that it never gets enriched at all -- and a title with many
 copies is precisely the one where ranking matters most.
 
+### Measuring: a different cost class, and what follows from it
+
+A detail call is one request, kilobytes, milliseconds, and no contention worth
+modeling. A measurement opens the media and holds a provider connection slot
+for seconds — the resource playback competes for, and the one a sibling plugin
+exists entirely to manage. Plausibly a hundred to a thousand times the cost per
+copy, which is why scope matters here far more than it did for merging, where
+one call settled one relation for ever.
+
+Everything structural follows from that. Reads are bounded so a measurement
+describes the stream without pulling the file. The per-run cap defaults to three
+rather than twenty-five. And repeated failure against one provider stops that
+provider for the run rather than continuing to spend slots on something that is
+not answering.
+
+### Repeated failure is a fact about the provider
+
+The subtle part is not stopping, it is what gets recorded.
+
+Treating each failure as a fact about its stream would be reasonable in
+isolation and wrong in aggregate: during an outage every copy that happened to
+be queued gets stamped as failed, and the retry rule then declines all of them
+for a week. A bad hour becomes a week of missing data, invisibly, and the longer
+the outage the more copies it poisons.
+
+So failures are held rather than written. If the breaker trips for an account,
+they are discarded — that account simply was not measured this run. If it does
+not, they are written and the normal retry applies. The rule is one pure
+function so it can be tested directly, because it is the kind of logic that
+looks like bookkeeping and is actually the difference between an outage costing
+an hour and costing a week.
+
+### Two destinations for one measurement
+
+Results go to a key of our own and are mirrored into the detail Dispatcharr
+already reads.
+
+The separate key is the durable record: nothing else writes it, so a later
+provider refresh cannot destroy a DV record — the one thing only a measurement
+produces. The mirror is what makes the data usable today, by the readers that
+already exist, with no change to the plugin that consumes it. It only ever fills
+a gap, so a value a provider actually sent still wins.
+
+Writing only to the mirror would have been simpler and was rejected: a provider
+that *sometimes* returns a video block could overwrite a measured DV record with
+one that lacks it, and nothing would report the loss.
+
+### One action, two steps, cheapest first
+
+Lookup and measurement began as separate actions, and that let them run in the
+wrong order: the measuring pass picked any copy without video and audio,
+including copies whose provider had simply not been asked yet — spending a
+connection-holding measurement where a light request would have filled the gap
+for free. On a provider that supplies detail nearly always, every copy it
+carried was being counted as needing measurement.
+
+The fix is a rule and a shape. The rule: a copy is measured only once its
+lookup has been **tried** — any attempt, including an error, since a provider
+whose detail endpoint always fails must still be measurable. The shape: one
+action that runs the lookup batch and then, if measuring is on, measures what
+the lookup could not fill. Ordering stops being something a user has to know.
+
+The two batch sizes stay separate because the two costs are different in kind,
+and measuring keeps its own switch because that is the one real decision —
+whether to spend provider connections at all. An untrustworthy wanted set
+stops both steps, not just the first.
+
+### Enrichment runs in the background, one run at a time
+
+The first version measured inside the web request, and timed one out: a probe
+may hold a connection for thirty seconds, so even a batch of three can outlast
+a request, and a batch of lookups at about a second each comes close on its
+own. The button now only enqueues, on the same queue as the nightly sweep and
+for the same routing reason.
+
+Moving the work off the request created a problem the request had been hiding:
+nothing stopped two runs. A button that waits cannot easily be pressed twice; one
+that returns at once can. On a one-connection account two concurrent runs are
+the same collision as a probe against playback, so overlap is excluded by a lock.
+
+Two choices in it are deliberate. The lock is taken **inside the task**, not
+checked at the button — a check at enqueue time cannot stop two queued runs, and
+a future scheduled run must respect it too. And it is **short-lived and renewed
+before every lookup and every probe** rather than sized to the whole run, so a
+killed worker frees it in minutes, while a run that cannot confirm it still
+holds it stops. That last rule fails closed for the same reason scope does: a
+missed run costs data, a collision costs someone's stream.
+
 ### What is deliberately not here
 
-Measuring streams directly — opening them and reading the bitstream — is the
-only way to reach what providers never send, and it is absent from this release
-on purpose. It costs a real connection slot per copy rather than a light API
-call, which brings in throttling, provider health checks, and a retry ladder
-with a circuit breaker. Bundling that with the contract and the harvest would
-mean shipping two risk profiles as one change.
+Measuring was built second, after the harvest, so that the harvest could report
+exactly how many copies it could not fill and size the expensive pass from
+measurement instead of estimate. Two pieces are still missing, in this order:
 
-It also benefits from going second: this pass reports exactly how many copies it
-could not fill, which sizes the expensive one from measurement instead of
-estimate.
+- **Pausing when a provider is busy with real playback.** Dispatcharr's own
+  connection counters see playback even though they never see our probes, so
+  this is buildable, and it is a prerequisite for any unattended run rather than
+  a refinement: on a one-connection account a probe during playback is a
+  certain collision, not a risk.
+- **A schedule.** Until the check above exists, every run is started by hand at
+  a moment someone chose.
 
 ## Manual approvals
 

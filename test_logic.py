@@ -1625,10 +1625,13 @@ class EssentialsAndEnrichDecisionTests(unittest.TestCase):
         # THE point of stamping an attempt rather than a success: otherwise the
         # relations whose providers never answer are re-asked every single run,
         # and those are exactly the ones a later probe pass pays most for.
+        # OLD timestamp on purpose -- with a recent one this passes even if the
+        # "not an error" branch is deleted, because the retry window declines it
+        # anyway, and the test would be asserting nothing.
+        old = (NOW - timedelta(days=90)).isoformat()
         for got in ("none", "partial", "full"):
             should, _ = patch.decide_enrich(
-                self._props(mark={"at": NOW.isoformat(), "got": got}),
-                NOW.isoformat())
+                self._props(mark={"at": old, "got": got}), NOW.isoformat())
             self.assertFalse(should, got)
 
     def test_an_error_retries_but_only_after_the_window(self):
@@ -1682,6 +1685,30 @@ class TakeWholeMoviesTests(unittest.TestCase):
         got = patch.take_whole_movies(self._g(9), 5)
         self.assertEqual(len(got), 9)
 
+    def test_oversized_is_truncated_when_the_limit_is_a_safety_ceiling(self):
+        # For stream measurement the limit is not a target. Taking an oversized
+        # title whole meant a setting that said three did several times that --
+        # over a minute of continuous connections on a one-connection provider,
+        # which timed out the request that started it.
+        got = patch.take_whole_movies(self._g(14), 3, allow_oversized=False)
+        self.assertEqual(len(got), 3)
+
+    def test_a_capped_run_fills_its_budget_exactly(self):
+        # 2 whole + 3 of the next. Stopping at 2 to avoid splitting would waste
+        # the run for nothing: exactly one title ends up partial either way.
+        got = patch.take_whole_movies(self._g(2, 14), 5, allow_oversized=False)
+        self.assertEqual(len(got), 5)
+
+    def test_at_most_one_title_is_ever_partial(self):
+        # Titles are filled in order, so only the one straddling the boundary
+        # is incomplete -- and stable ordering means it is resumed first.
+        got = patch.take_whole_movies(self._g(2, 2, 2, 9), 7, allow_oversized=False)
+        self.assertEqual(len(got), 7)      # three whole titles, then 1 of the next
+
+    def test_no_limit_still_takes_everything_when_capped(self):
+        self.assertEqual(
+            len(patch.take_whole_movies(self._g(9, 4), 0, allow_oversized=False)), 13)
+
     def test_an_oversized_movie_does_not_drag_in_the_next_one(self):
         got = patch.take_whole_movies(self._g(9, 2), 5)
         self.assertEqual(len(got), 9)
@@ -1697,7 +1724,7 @@ class EnrichmentPreservesEssentialTests(unittest.TestCase):
     guard wraps CORE's refresh and does not reach this path, so the same rule
     has to be applied here explicitly.
 
-    Structural rather than behavioural, because the bug is an OMISSION: a later
+    Structural rather than behavioral, because the bug is an OMISSION: a later
     rewrite of the write path that simply forgot the call would pass any test
     that did not happen to construct the drop case. This fails on absence.
     """
@@ -1710,6 +1737,38 @@ class EnrichmentPreservesEssentialTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef) and node.name == "enrich_movies_impl":
                 return node
         self.fail("enrich_movies_impl not found")
+
+    def _fn(self, name):
+        import ast
+        tree = ast.parse(open(patch.__file__, encoding="utf-8").read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return node
+        self.fail("%s not found" % name)
+
+    def test_the_probe_pass_treats_its_limit_as_a_hard_ceiling(self):
+        """The call site, not the function -- this is where it actually broke.
+
+        `take_whole_movies` defaults to taking an oversized title whole, which
+        is right for cheap detail lookups and wrong for measurement. With the
+        default, a setting of three ran several times that many probes: over a
+        minute of continuous connections on a provider that allows one, and a
+        timed-out request. The policy lives in the keyword at the call site, so
+        that is what has to be asserted; every test of the function itself
+        passed throughout.
+        """
+        import ast
+        fn = self._fn("probe_movies_impl")
+        calls = [c for c in ast.walk(fn)
+                 if isinstance(c, ast.Call)
+                 and getattr(c.func, "id", None) == "take_whole_movies"]
+        self.assertEqual(len(calls), 1, "expected exactly one batching call")
+        kw = {k.arg: k.value for k in calls[0].keywords}
+        self.assertIn("allow_oversized", kw,
+                      "the probe pass must pass allow_oversized explicitly")
+        self.assertIsInstance(kw["allow_oversized"], ast.Constant)
+        self.assertFalse(kw["allow_oversized"].value,
+                         "allow_oversized must be False for stream measurement")
 
     def test_the_write_path_restores_essential_keys(self):
         fn = self._impl()
@@ -1737,6 +1796,613 @@ class EnrichmentPreservesEssentialTests(unittest.TestCase):
         merged, restored = patch.restore_essential(old, new)
         self.assertEqual(merged["tmdb_id"], "222")
         self.assertNotIn("tmdb_id", restored)
+
+
+class ParseFfprobeTests(unittest.TestCase):
+    """ffprobe output is reshaped into the form providers already use, rather
+    than having fields picked out of it -- a provider's `detailed_info.video`
+    IS an ffprobe stream object, so copying it wholesale carries anything
+    useful along without enumerating it here."""
+
+    def _payload(self, *streams, **fmt):
+        return {"streams": list(streams), "format": fmt}
+
+    def test_first_video_and_audio_are_taken(self):
+        out = patch.parse_ffprobe(self._payload(
+            {"codec_type": "video", "width": 3840, "height": 2160},
+            {"codec_type": "video", "width": 99},
+            {"codec_type": "audio", "codec_name": "ac3", "channels": 6},
+            {"codec_type": "audio", "codec_name": "aac"},
+        ))
+        self.assertEqual(out["video"]["width"], 3840)
+        self.assertEqual(out["audio"]["codec_name"], "ac3")
+
+    def test_the_dovi_record_survives(self):
+        # The entire reason probing beats the API: no provider payload has ever
+        # carried side_data_list, and avoid-DV cannot work without it.
+        out = patch.parse_ffprobe(self._payload({
+            "codec_type": "video", "width": 3840,
+            "side_data_list": [{"side_data_type": "DOVI configuration record",
+                                "dv_profile": 5, "dv_bl_signal_compatibility_id": 0}],
+        }))
+        self.assertEqual(out["video"]["side_data_list"][0]["dv_profile"], 5)
+
+    def test_format_duration_and_bitrate_are_carried(self):
+        out = patch.parse_ffprobe(self._payload(
+            {"codec_type": "video", "width": 1},
+            duration="5400.0", bit_rate="12000000"))
+        self.assertEqual(out["duration_secs"], "5400.0")
+        self.assertEqual(out["bitrate"], "12000000")
+
+    def test_junk_and_empties_do_not_raise(self):
+        self.assertEqual(patch.parse_ffprobe(None), {})
+        self.assertEqual(patch.parse_ffprobe("nope"), {})
+        self.assertEqual(patch.parse_ffprobe({"streams": [None, "x"]}), {})
+
+
+class ClassifyProbeTests(unittest.TestCase):
+    """'none' means ffprobe RAN and the stream has nothing -- permanent for
+    that stream. 'error' means we never got an answer, and is the only outcome
+    worth retrying. Collapsing them would either re-probe dead streams for ever
+    or abandon good ones after one bad moment."""
+
+    def test_full(self):
+        self.assertEqual(patch.classify_probe(
+            0, {"video": {"width": 1920}, "audio": {"codec_name": "ac3"}}), "full")
+
+    def test_ran_but_nothing_useful(self):
+        self.assertEqual(patch.classify_probe(0, {"video": {"width": 1920}}), "none")
+        self.assertEqual(patch.classify_probe(0, {"audio": {"c": 1}}), "none")
+
+    def test_a_video_stream_with_no_dimensions_is_a_truncated_read(self):
+        # Every real video stream has dimensions, so their absence is not a
+        # property of the media -- it is a read that was cut short. On a
+        # provider capped at one connection that happens whenever a probe
+        # collides with playback. Recording it as "none" would turn a transient
+        # collision into a permanently unmeasurable copy.
+        self.assertEqual(
+            patch.classify_probe(0, {"video": {"codec_name": "hevc"}}), "error")
+        self.assertEqual(
+            patch.classify_probe(0, {"video": {}, "audio": {"c": 1}}), "error")
+
+    def test_failure_is_an_error_not_an_absence(self):
+        self.assertEqual(patch.classify_probe(1, None), "error")
+        self.assertEqual(patch.classify_probe(0, None), "error")
+        self.assertEqual(patch.classify_probe(255, {"video": {"width": 1}}), "error")
+
+
+class StoreProbeTests(unittest.TestCase):
+    """Two destinations on purpose: our own key is durable and nothing else
+    writes it, and the mirror into detailed_info is what makes the data usable
+    with no change to the plugin that consumes it."""
+
+    def test_writes_our_key_and_mirrors_into_detail(self):
+        parsed = {"video": {"width": 1920}, "audio": {"codec_name": "ac3"}}
+        props = patch.store_probe({}, parsed)
+        self.assertEqual(props[patch.PROBE_KEY], parsed)
+        self.assertEqual(props["detailed_info"]["video"]["width"], 1920)
+        self.assertEqual(props["detailed_info"]["audio"]["codec_name"], "ac3")
+
+    def test_a_value_the_provider_sent_is_not_overwritten(self):
+        props = {"detailed_info": {"video": {"width": 1280, "from": "provider"}}}
+        props = patch.store_probe(props, {"video": {"width": 3840},
+                                          "audio": {"codec_name": "ac3"}})
+        self.assertEqual(props["detailed_info"]["video"]["from"], "provider")
+        self.assertEqual(props["detailed_info"]["audio"]["codec_name"], "ac3")
+        # but our measurement is still recorded in full
+        self.assertEqual(props[patch.PROBE_KEY]["video"]["width"], 3840)
+
+    def test_an_empty_block_counts_as_absent(self):
+        props = patch.store_probe({"detailed_info": {"video": {}}},
+                                  {"video": {"width": 3840}})
+        self.assertEqual(props["detailed_info"]["video"]["width"], 3840)
+
+    def test_junk_detail_is_replaced_not_crashed_on(self):
+        props = patch.store_probe({"detailed_info": "nope"},
+                                  {"video": {"width": 1}})
+        self.assertEqual(props["detailed_info"]["video"]["width"], 1)
+
+
+class ProbeDecisionAndBreakerTests(unittest.TestCase):
+
+    def _props(self, mark=None, essentials=False, lookup="partial"):
+        d = ({"video": {"width": 1}, "audio": {"c": 1}} if essentials else {})
+        p = {"detailed_info": d}
+        own = {}
+        if lookup is not None:
+            own["enrich"] = {"at": NOW.isoformat(), "got": lookup}
+        if mark is not None:
+            own["probe"] = mark
+        if own:
+            p[patch.OWN_PROPS_KEY] = own
+        return p
+
+    def test_a_copy_that_already_has_data_is_not_probed(self):
+        self.assertFalse(patch.decide_probe(
+            self._props(essentials=True), NOW.isoformat())[0])
+
+    def test_never_probed_is_probed(self):
+        self.assertTrue(patch.decide_probe(self._props(), NOW.isoformat())[0])
+
+    def test_nothing_is_measured_before_the_provider_lookup_has_tried(self):
+        # A measurement holds the connection for seconds; the lookup is a light
+        # request that often fills the gap for free. Never spend the expensive
+        # one first.
+        should, why = patch.decide_probe(self._props(lookup=None), NOW.isoformat())
+        self.assertFalse(should)
+        self.assertIn("lookup", why)
+
+    def test_a_failed_lookup_still_counts_as_tried(self):
+        # Otherwise a provider whose detail endpoint always fails could never
+        # be measured at all.
+        self.assertTrue(patch.decide_probe(
+            self._props(lookup="error"), NOW.isoformat())[0])
+
+    def test_a_stream_with_nothing_is_not_probed_again(self):
+        # The most expensive possible mistake: a connection slot per re-ask,
+        # for the streams guaranteed to yield nothing.
+        # The timestamp is deliberately OLD. With a recent one this assertion
+        # passes even when the "not an error" branch is removed, because the
+        # retry window would decline it anyway -- so it would not actually test
+        # the rule it claims to.
+        old = (NOW - timedelta(days=90)).isoformat()
+        self.assertFalse(patch.decide_probe(
+            self._props({"at": old, "got": "none"}), NOW.isoformat())[0])
+
+    def test_errors_retry_only_after_the_window(self):
+        recent = (NOW - timedelta(days=1)).isoformat()
+        self.assertFalse(patch.decide_probe(
+            self._props({"at": recent, "got": "error"}), NOW.isoformat())[0])
+        old = (NOW - timedelta(days=30)).isoformat()
+        self.assertTrue(patch.decide_probe(
+            self._props({"at": old, "got": "error"}), NOW.isoformat())[0])
+
+    def test_a_tripped_breaker_blames_the_provider_not_the_streams(self):
+        # An outage must not put every queued copy into a week-long retry
+        # window. That is how a bad hour becomes permanently missing data.
+        deferred = {"good": ["r1", "r2"], "down": ["r3", "r4", "r5"]}
+        self.assertEqual(patch.errors_to_stamp(deferred, ["down"]), ["r1", "r2"])
+
+    def test_with_no_breaker_every_failure_is_the_streams(self):
+        deferred = {"a": ["r1"], "b": ["r2"]}
+        self.assertEqual(patch.errors_to_stamp(deferred, []), ["r1", "r2"])
+
+    def test_nothing_deferred(self):
+        self.assertEqual(patch.errors_to_stamp({}, ["x"]), [])
+
+
+class _FakeRedis:
+    """Just enough of redis-py for the run lock: SET NX EX, GET, EXPIRE, DELETE."""
+
+    def __init__(self, fail=False):
+        self.store = {}
+        self.ttl = {}
+        self.fail = fail
+
+    def _check(self):
+        if self.fail:
+            raise ConnectionError("redis down")
+
+    def set(self, key, value, nx=False, ex=None):
+        self._check()
+        if nx and key in self.store:
+            return None
+        self.store[key] = value
+        self.ttl[key] = ex
+        return True
+
+    def get(self, key):
+        self._check()
+        return self.store.get(key)
+
+    def expire(self, key, ttl):
+        self._check()
+        self.ttl[key] = ttl
+        return key in self.store
+
+    def delete(self, key):
+        self._check()
+        self.store.pop(key, None)
+
+    def exists(self, key):
+        self._check()
+        return int(key in self.store)
+
+
+class ProbeRunLockTests(unittest.TestCase):
+    """One measuring run at a time. On a provider that allows a single
+    connection, two runs probing at once collide with each other exactly as a
+    probe collides with playback."""
+
+    def test_a_second_run_does_not_start_while_one_holds_the_lock(self):
+        r = _FakeRedis()
+        calls = []
+
+        def inner(_hb):
+            calls.append("inner")
+            return "inner"
+
+        def outer(_hb):
+            calls.append("outer")
+            # A second run arriving mid-run must do nothing at all.
+            self.assertEqual(patch.run_locked(r, "b", 60, inner), (False, None))
+            return "outer"
+
+        self.assertEqual(patch.run_locked(r, "a", 60, outer), (True, "outer"))
+        self.assertEqual(calls, ["outer"])
+
+    def test_the_lock_is_released_however_the_run_ends(self):
+        r = _FakeRedis()
+
+        def boom(_hb):
+            raise RuntimeError("probe blew up")
+
+        with self.assertRaises(RuntimeError):
+            patch.run_locked(r, "a", 60, boom)
+        self.assertNotIn(patch.RUN_LOCK_KEY, r.store)
+        # ...so the next run is not locked out.
+        self.assertEqual(patch.run_locked(r, "b", 60, lambda hb: 1), (True, 1))
+
+    def test_release_never_deletes_another_runs_lock(self):
+        r = _FakeRedis()
+        r.set(patch.RUN_LOCK_KEY, "other")
+        patch.release_run_lock(r, "mine")
+        self.assertEqual(r.store[patch.RUN_LOCK_KEY], "other")
+
+    def test_heartbeat_stops_the_run_when_another_has_taken_over(self):
+        r = _FakeRedis()
+        r.set(patch.RUN_LOCK_KEY, "other")
+        self.assertFalse(patch.refresh_run_lock(r, "mine", 60))
+
+    def test_heartbeat_extends_our_own_lock(self):
+        r = _FakeRedis()
+        patch.acquire_run_lock(r, "mine", 10)
+        self.assertTrue(patch.refresh_run_lock(r, "mine", 99))
+        self.assertEqual(r.ttl[patch.RUN_LOCK_KEY], 99)
+
+    def test_heartbeat_retakes_a_lapsed_lock_nobody_else_took(self):
+        r = _FakeRedis()
+        self.assertTrue(patch.refresh_run_lock(r, "mine", 60))
+        self.assertEqual(r.store[patch.RUN_LOCK_KEY], "mine")
+
+    def test_heartbeat_reads_bytes_replies(self):
+        r = _FakeRedis()
+        r.set(patch.RUN_LOCK_KEY, b"mine")
+        self.assertTrue(patch.refresh_run_lock(r, "mine", 60))
+
+    def test_heartbeat_fails_closed_when_redis_errors(self):
+        # Unable to confirm the lock means unable to rule out a second run.
+        self.assertFalse(patch.refresh_run_lock(_FakeRedis(fail=True), "x", 60))
+
+    def test_ttl_outlasts_the_longest_gap_between_heartbeats(self):
+        for delay_ms in (0, 2000, 60000):
+            gap = patch.PROBE_TIMEOUT_S + delay_ms / 1000.0
+            self.assertGreater(patch.run_lock_ttl(delay_ms), gap)
+
+    def test_ttl_stays_short_so_a_killed_worker_frees_it_soon(self):
+        self.assertLessEqual(patch.run_lock_ttl(patch.DEFAULT_PROBE_DELAY_MS), 300)
+
+    def test_ttl_tolerates_junk_delay(self):
+        self.assertGreater(patch.run_lock_ttl(None), patch.PROBE_TIMEOUT_S)
+        self.assertGreater(patch.run_lock_ttl(-5), patch.PROBE_TIMEOUT_S)
+
+
+class ProbeEnqueueTests(unittest.TestCase):
+    """The button queues work; it must never do it. A probe can hold a provider
+    connection for 30 seconds, and the inline version timed out a request."""
+
+    class _Task:
+        def __init__(self):
+            self.calls = []
+
+        def apply_async(self, **kw):
+            self.calls.append(kw)
+
+    def setUp(self):
+        self._saved = (patch.run_enrichment, patch._redis_client)
+        self.task = self._Task()
+        self.redis = _FakeRedis()
+        patch.run_enrichment = self.task
+        patch._redis_client = lambda: self.redis
+
+    def tearDown(self):
+        patch.run_enrichment, patch._redis_client = self._saved
+
+    def _cfg(self, on=True, queue="dvr"):
+        return {"enrich_movies": on, "schedule_queue": queue}
+
+    def test_routes_to_the_configured_queue(self):
+        started, _ = patch.enqueue_enrichment(self._cfg(queue="dvr"))
+        self.assertTrue(started)
+        self.assertEqual(self.task.calls, [{"queue": "dvr"}])
+
+    def test_off_means_nothing_is_queued(self):
+        started, why = patch.enqueue_enrichment(self._cfg(on=False))
+        self.assertFalse(started)
+        self.assertIn("off", why)
+        self.assertEqual(self.task.calls, [])
+
+    def test_a_run_in_progress_is_reported_not_queued_behind(self):
+        self.redis.set(patch.RUN_LOCK_KEY, "someone")
+        started, why = patch.enqueue_enrichment(self._cfg())
+        self.assertFalse(started)
+        self.assertIn("in progress", why)
+        self.assertEqual(self.task.calls, [])
+
+    def test_an_unreadable_lock_still_queues(self):
+        # The pre-check is only for a nicer message; the task takes the lock
+        # itself and fails closed, so overlap is still impossible.
+        self.redis.fail = True
+        started, _ = patch.enqueue_enrichment(self._cfg())
+        self.assertTrue(started)
+
+
+class ProbeCallSiteTests(unittest.TestCase):
+    """Policy chosen by an argument at a call site is invisible to tests of the
+    function. Two bugs this project shipped lived exactly there, so each such
+    choice here is asserted structurally."""
+
+    def _tree(self, module):
+        return ast.parse(open(module.__file__, encoding="utf-8").read())
+
+    def _fn(self, name):
+        for node in ast.walk(self._tree(patch)):
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return node
+        self.fail("%s not found" % name)
+
+    @staticmethod
+    def _called_names(node):
+        out = set()
+        for c in ast.walk(node):
+            if isinstance(c, ast.Call):
+                f = c.func
+                out.add(f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", None))
+        return out
+
+    def _action_branch(self, action):
+        import plugin as plugin_mod
+        for node in ast.walk(self._tree(plugin_mod)):
+            if (isinstance(node, ast.If) and isinstance(node.test, ast.Compare)
+                    and any(isinstance(c, ast.Constant) and c.value == action
+                            for c in node.test.comparators)):
+                return node
+        return None
+
+    def test_the_button_never_works_inline(self):
+        branch = self._action_branch("enrich_now")
+        self.assertIsNotNone(branch, "enrich_now branch not found")
+        called = self._called_names(ast.Module(body=branch.body, type_ignores=[]))
+        for inline in ("enrich_movies_impl", "probe_movies_impl", "enrich_run_impl"):
+            self.assertNotIn(inline, called,
+                             "the button must enqueue, not work inside the request")
+        self.assertIn("enqueue_enrichment", called)
+
+    def test_there_is_no_separate_measuring_button(self):
+        # Measuring is a step of 'Enrich now'. A button of its own would let it
+        # run without the lookup first -- the expensive step before the free one.
+        import plugin as plugin_mod
+        ids = [a["id"] for a in plugin_mod.Plugin.actions]
+        self.assertNotIn("probe_now", ids)
+        self.assertIsNone(self._action_branch("probe_now"))
+
+    def test_the_task_runs_lookup_before_measuring(self):
+        calls = [c for c in ast.walk(self._fn("run_enrichment"))
+                 if isinstance(c, ast.Call)
+                 and getattr(c.func, "id", None) == "enrich_run_impl"]
+        self.assertEqual(len(calls), 1)
+        args = [getattr(a, "id", None) for a in calls[0].args]
+        self.assertEqual(args[1:3], ["enrich_movies_impl", "probe_movies_impl"],
+                         "lookup must be passed as the first step, measuring second")
+
+    def test_the_enqueue_names_its_queue(self):
+        # Without an explicit queue the task goes to the default prefork worker,
+        # which never imports plugins and silently drops it.
+        calls = [c for c in ast.walk(self._fn("enqueue_enrichment"))
+                 if isinstance(c, ast.Call)
+                 and getattr(c.func, "attr", None) == "apply_async"]
+        self.assertEqual(len(calls), 1)
+        self.assertIn("queue", {k.arg for k in calls[0].keywords})
+
+    def test_the_task_hands_the_run_a_heartbeat(self):
+        calls = [c for c in ast.walk(self._fn("run_enrichment"))
+                 if isinstance(c, ast.Call)
+                 and getattr(c.func, "id", None) == "enrich_run_impl"]
+        self.assertEqual(len(calls), 1)
+        self.assertIn("heartbeat", {k.arg for k in calls[0].keywords},
+                      "without a heartbeat the lock lapses mid-run and a second "
+                      "run can start alongside this one")
+
+    def test_the_probe_loop_checks_the_heartbeat(self):
+        loops = [n for n in ast.walk(self._fn("probe_movies_impl"))
+                 if isinstance(n, ast.For) and getattr(n.iter, "id", None) == "chosen"]
+        self.assertEqual(len(loops), 1)
+        self.assertIn("heartbeat", self._called_names(loops[0]),
+                      "the heartbeat must be checked before each probe")
+
+    def test_the_lookup_loop_checks_the_heartbeat(self):
+        loops = [n for n in ast.walk(self._fn("enrich_movies_impl"))
+                 if isinstance(n, ast.For) and getattr(n.iter, "id", None) == "rels"]
+        self.assertEqual(len(loops), 1)
+        self.assertIn("heartbeat", self._called_names(loops[0]),
+                      "the heartbeat must be checked before each lookup")
+
+
+class EnrichRunOrderTests(unittest.TestCase):
+    """One run, two steps: the free lookup always first, the connection-holding
+    measurement only for what it could not fill."""
+
+    def _run(self, probe_enabled=True, lookup_result=None):
+        calls = []
+
+        def lookup(heartbeat=None):
+            calls.append(("lookup", heartbeat))
+            return lookup_result if lookup_result is not None else {"fetched": 5}
+
+        def measure(heartbeat=None):
+            calls.append(("measure", heartbeat))
+            return {"probed": 2}
+
+        hb = object()
+        out = patch.enrich_run_impl(probe_enabled, lookup, measure, heartbeat=hb)
+        return out, calls, hb
+
+    def test_lookup_then_measure_both_with_the_heartbeat(self):
+        out, calls, hb = self._run()
+        self.assertEqual(calls, [("lookup", hb), ("measure", hb)])
+        self.assertEqual(out, {"lookup": {"fetched": 5}, "measure": {"probed": 2}})
+
+    def test_measuring_off_means_lookup_only(self):
+        out, calls, _ = self._run(probe_enabled=False)
+        self.assertEqual([c[0] for c in calls], ["lookup"])
+        self.assertNotIn("measure", out)
+
+    def test_an_untrusted_wanted_set_stops_both_steps(self):
+        # Fail closed on scope: if the lookup refused the wanted set, measuring
+        # must not go on to use it.
+        _, calls, _ = self._run(lookup_result={"aborted": "wanted set stale"})
+        self.assertEqual([c[0] for c in calls], ["lookup"])
+
+    def test_losing_the_lock_during_lookup_stops_measuring(self):
+        _, calls, _ = self._run(lookup_result={"stopped": "lost the run lock"})
+        self.assertEqual([c[0] for c in calls], ["lookup"])
+
+
+class LastProbeReportTests(unittest.TestCase):
+    """The button no longer waits, so this line is the only way to tell a run
+    that is still going from one that ended. It has to say which, outright."""
+
+    def setUp(self):
+        import plugin as plugin_mod
+        self.fmt = plugin_mod._format_last_run
+        self.short = plugin_mod._short_time
+
+    def test_no_run_yet(self):
+        self.assertIn("none yet", self.fmt(None))
+
+    def test_a_running_run_says_so(self):
+        out = self.fmt({"state": "running",
+                        "started_at": "2030-01-02T03:00:00.1+00:00"})
+        self.assertIn("IN PROGRESS", out)
+        self.assertNotIn("finished", out)
+
+    def _finished(self, result):
+        return self.fmt({"state": "finished",
+                         "finished_at": "2030-01-02T03:04:05.123456+00:00",
+                         "result": result})
+
+    def test_a_finished_run_reports_both_steps(self):
+        out = self._finished({
+            "lookup": {"fetched": 25, "got_essentials": 4, "errors": 1},
+            "measure": {"probed": 3, "gained": 3, "errors": 2}})
+        self.assertIn("finished 2030-01-02 03:04 UTC", out)
+        self.assertIn("looked up 25 (gained 4)", out)
+        self.assertIn("measured 3 (gained 3)", out)
+        self.assertIn("errors 3", out)          # summed across both steps
+        self.assertEqual(len(out.splitlines()), 1)
+
+    def test_measuring_off_is_said(self):
+        out = self._finished({"lookup": {"fetched": 25, "got_essentials": 4}})
+        self.assertIn("measuring off", out)
+
+    def test_a_refused_wanted_set_is_said(self):
+        out = self._finished({"lookup": {"aborted": "wanted set stale (old)"}})
+        self.assertIn("nothing done -- wanted set stale", out)
+
+    def test_a_tripped_breaker_and_a_lost_lock_are_said(self):
+        out = self._finished({
+            "lookup": {"fetched": 1},
+            "measure": {"probed": 1, "broken": ["ProviderX"],
+                        "stopped": "lost the run lock"}})
+        self.assertIn("ProviderX", out)
+        self.assertIn("lost the run lock", out)
+
+    def test_a_failed_run_shows_why(self):
+        out = self.fmt({"state": "failed", "finished_at": "x",
+                        "error": "Redis is unavailable"})
+        self.assertIn("failed", out)
+        self.assertIn("Redis is unavailable", out)
+
+    def test_short_time(self):
+        self.assertEqual(self.short("2030-01-02T03:04:05.12+00:00"),
+                         "2030-01-02 03:04 UTC")
+        self.assertEqual(self.short("2030-01-02T03:04:05-07:00"),
+                         "2030-01-02 03:04")
+        self.assertEqual(self.short(None), "None")
+
+
+class EnrichStatusMessageTests(unittest.TestCase):
+    """The action popup does not scroll. The first version of this message ran
+    past it, so its size is a requirement, not a style choice."""
+
+    def _st(self, accounts=4, on=True):
+        return {
+            "enrich_movies": on, "generated_at": "2030-01-01T00:00:00Z",
+            "movies": 10, "tmdb_resolved": 6, "tmdb_total": 6,
+            "unid_resolved": 4, "unid_total": 4, "relations": 100,
+            "have_essentials": 20, "need_fetch": 50, "runs_at_current_limit": 2,
+            "need_measure": 30, "measure_runs_at_current_limit": 10,
+            "last_enrich_run": {
+                "state": "finished",
+                "finished_at": "2030-01-02T03:04:05+00:00",
+                "result": {"lookup": {"fetched": 25, "got_essentials": 4,
+                                      "errors": 0},
+                           "measure": {"probed": 3, "gained": 3, "errors": 1}}},
+            "per_account": {"Provider%d" % i: {"relations": 30, "need": 20,
+                                               "measure": 25}
+                            for i in range(accounts)},
+        }
+
+    def _fmt(self, st):
+        import plugin as plugin_mod
+        return plugin_mod._format_enrich_status(st)
+
+    def test_fits_in_four_lines_however_many_providers(self):
+        for n in (1, 4, 12):
+            self.assertLessEqual(len(self._fmt(self._st(n)).splitlines()), 4, n)
+
+    def test_carries_the_numbers_that_matter(self):
+        out = self._fmt(self._st())
+        for needle in ("need measuring 30", "(10 runs)", "need lookup 50",
+                       "have video+audio 20", "finished 2030-01-02 03:04 UTC",
+                       "Provider0 30/20/25"):
+            self.assertIn(needle, out)
+
+    def test_off_is_said_first(self):
+        self.assertTrue(self._fmt(self._st(on=False)).startswith("ENRICHMENT IS OFF"))
+        self.assertNotIn("OFF", self._fmt(self._st()))
+
+
+class ProbeStatusIsDurableTests(unittest.TestCase):
+    """Uploading a zip replaces the plugin folder, so anything stored beside the
+    plugin is erased by every upgrade. The run record lost its first version
+    exactly that way."""
+
+    def test_the_run_record_is_not_a_file_beside_the_plugin(self):
+        tree = ast.parse(open(patch.__file__, encoding="utf-8").read())
+        for name in ("write_run_status", "read_run_status"):
+            fn = next(n for n in ast.walk(tree)
+                      if isinstance(n, ast.FunctionDef) and n.name == name)
+            called = {getattr(c.func, "id", None) for c in ast.walk(fn)
+                      if isinstance(c, ast.Call)}
+            self.assertFalse(called & {"open", "_write_json_file", "_plugin_file"},
+                             "%s must not store the record in the plugin folder"
+                             % name)
+            names = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
+            self.assertIn("RUN_STATUS_KEY", names)
+
+
+class MeasureBacklogTests(unittest.TestCase):
+
+    def test_status_counts_the_backlog_with_the_runs_own_decision(self):
+        # A status that estimated the backlog its own way would drift from what
+        # a run actually does, and nothing would notice.
+        tree = ast.parse(open(patch.__file__, encoding="utf-8").read())
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "enrich_status")
+        called = {getattr(c.func, "id", None) for c in ast.walk(fn)
+                  if isinstance(c, ast.Call)}
+        self.assertIn("decide_probe", called)
 
 
 class ManifestParityTests(unittest.TestCase):

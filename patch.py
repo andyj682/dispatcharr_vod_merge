@@ -485,6 +485,11 @@ def _load_config(force: bool = False) -> dict:
         "enrich_limit": _as_int(settings.get("enrich_limit"), DEFAULT_ENRICH_LIMIT),
         "enrich_delay_ms": _as_int(
             settings.get("enrich_delay_ms"), DEFAULT_ENRICH_DELAY_MS),
+        "probe_movies": _as_bool(
+            settings.get("probe_movies"), DEFAULT_PROBE_MOVIES),
+        "probe_limit": _as_int(settings.get("probe_limit"), DEFAULT_PROBE_LIMIT),
+        "probe_delay_ms": _as_int(
+            settings.get("probe_delay_ms"), DEFAULT_PROBE_DELAY_MS),
     }
     with _cfg_lock:
         _cfg_cache = cfg
@@ -1982,17 +1987,46 @@ def enrich_candidates(movie_ids):
             .order_by("movie_id", "id"))
 
 
-def take_whole_movies(groups, limit):
+def take_whole_movies(groups, limit, allow_oversized=True):
     """Pick whole movies up to `limit` relations. Pure.
 
-    `groups` is an ordered sequence of `(movie_id, [items])`. A movie is never
-    split across runs, for the reason above. A single movie LARGER than the
-    limit is still taken whole rather than skipped for ever -- otherwise a
-    title with more copies than the batch size could never be enriched at all,
-    and those are exactly the titles ranking matters most for.
+    `groups` is an ordered sequence of `(movie_id, [items])`. A movie is not
+    split across runs, for the coverage reason above.
+
+    `allow_oversized` decides what happens when a SINGLE movie exceeds the
+    limit on its own, and the right answer differs by how expensive the work
+    is:
+
+    * True (detail lookups) -- take it whole. The calls are light, and the
+      alternative is that a title with more copies than the batch size never
+      gets enriched at all, which are exactly the titles ranking matters most
+      for.
+
+    * False (stream measurement) -- truncate it to the limit and resume next
+      run. Here the limit is a SAFETY ceiling, not a target: every item costs a
+      provider connection slot for seconds, so honoring the coverage
+      preference would mean a setting that says three quietly doing several
+      times that. In practice that was over a minute of continuous
+      connections on a provider that allows one, and it timed out the
+      request that started it.
+
+      Only the FIRST movie of a run can ever be split, and ordering is stable,
+      so at most ONE title is partially covered at any moment and it is the
+      first thing resumed. That is a far smaller version of the problem than
+      the one whole-movie batching exists to prevent.
     """
     chosen = []
     for _mid, items in groups:
+        if limit and not allow_oversized:
+            # Hard ceiling: fill the budget exactly, splitting whichever title
+            # straddles the boundary. Stopping short to avoid a split would
+            # waste the run for nothing -- exactly one title ends up partial
+            # either way, and it is the first thing the next run resumes.
+            room = limit - len(chosen)
+            if room <= 0:
+                break
+            chosen.extend(items[:room])
+            continue
         if limit and chosen and len(chosen) + len(items) > limit:
             break
         chosen.extend(items)
@@ -2008,7 +2042,9 @@ def enrich_status(cfg=None):
 
     cfg = cfg or _load_config(force=True)
     out = {"enrich_movies": cfg["enrich_movies"],
-           "path": cfg["wanted_set_path"] or "<unset>"}
+           "path": cfg["wanted_set_path"] or "<unset>",
+           # Measuring runs in the background, so this is where its result shows.
+           "last_enrich_run": read_run_status()}
     doc, status, detail = read_wanted_set(cfg["wanted_set_path"],
                                           now=timezone.now())
     out["file_status"] = status
@@ -2022,16 +2058,22 @@ def enrich_status(cfg=None):
     out["movies"] = len(ids)
 
     now_iso = timezone.now().isoformat()
-    todo = have = attempted = 0
+    todo = have = attempted = measure = 0
     per_account = {}
     for rel in enrich_candidates(ids).iterator(chunk_size=500):
         props = rel.custom_properties or {}
         name = rel.m3u_account.name
-        slot = per_account.setdefault(name, {"relations": 0, "need": 0})
+        slot = per_account.setdefault(name, {"relations": 0, "need": 0,
+                                             "measure": 0})
         slot["relations"] += 1
         if relation_has_essentials(props):
             have += 1
             continue
+        # The same decision a run makes when measuring, so this is its backlog
+        # exactly rather than an estimate of it.
+        if decide_probe(props, now_iso)[0]:
+            measure += 1
+            slot["measure"] += 1
         should, _ = decide_enrich(props, now_iso)
         if should:
             todo += 1
@@ -2040,15 +2082,22 @@ def enrich_status(cfg=None):
             attempted += 1
     out.update({"relations": have + todo + attempted, "have_essentials": have,
                 "need_fetch": todo, "already_attempted": attempted,
+                "need_measure": measure,
                 "per_account": per_account,
                 "runs_at_current_limit": (
                     0 if not cfg["enrich_limit"]
-                    else -(-todo // cfg["enrich_limit"]))})
+                    else -(-todo // cfg["enrich_limit"])),
+                "measure_runs_at_current_limit": (
+                    0 if not cfg["probe_limit"]
+                    else -(-measure // cfg["probe_limit"]))})
     return out
 
 
-def enrich_movies_impl(limit=None, delay=None):
+def enrich_movies_impl(limit=None, delay=None, heartbeat=None):
     """Fetch provider detail for every relation of every wanted movie.
+
+    `heartbeat` works as in `probe_movies_impl`: checked before every lookup,
+    and the run stops if it returns False.
 
     Writes `detailed_info` -- the same key core writes and vod_preferences
     reads -- but never core's `detailed_fetched` or `last_advanced_refresh`.
@@ -2107,6 +2156,8 @@ def enrich_movies_impl(limit=None, delay=None):
 
     per_account = {}
     for rels in by_account.values():
+        if stats.get("stopped"):
+            break
         account = rels[0].m3u_account
         name = account.name
         slot = per_account.setdefault(
@@ -2126,6 +2177,11 @@ def enrich_movies_impl(limit=None, delay=None):
 
         with client:
             for rel in rels:
+                if heartbeat is not None and not heartbeat():
+                    stats["stopped"] = "lost the run lock"
+                    logger.warning("[VOD-MERGE] enrichment stopped early -- lost "
+                                   "the run lock, so another run may be active")
+                    break
                 props = rel.custom_properties or {}
                 outcome = "none"
                 try:
@@ -2192,6 +2248,338 @@ def enrich_movies_impl(limit=None, delay=None):
     stats["remaining"] = remaining
     stats["per_account"] = per_account
     logger.info("[VOD-MERGE] movie enrichment: %s", stats)
+    return stats
+
+
+# --------------------------------------------------------------------------- #
+# Enrichment, step 3: measure what no provider will tell us
+# --------------------------------------------------------------------------- #
+# Step 2 harvests what providers already know. On a real library that is a
+# minority of copies, because many providers return a detail payload with no
+# video or audio block at all, consistently, with no errors. The gap is
+# structural, not operational, so no amount of re-asking closes it.
+#
+# The only remaining source is the stream itself. A live spike confirmed this
+# works and, more importantly, yields something the API never does: the DOVI
+# configuration record that identifies Dolby Vision without a fallback layer.
+# That field has not been seen in a single provider payload, and appeared in
+# the very first probe. Avoid-DV goes from unreachable to measurable.
+#
+# THE COST IS A DIFFERENT CLASS AND THE DESIGN IS SHAPED AROUND IT. A detail
+# call is one request, kilobytes, milliseconds. A probe opens the actual media
+# and holds a provider CONNECTION SLOT for seconds -- the same scarce resource
+# playback competes for. So: bounded reads, a delay between probes, a hard
+# per-run cap, and a circuit breaker that treats repeated failure as a fact
+# about the provider rather than about each stream.
+
+DEFAULT_PROBE_MOVIES = False
+DEFAULT_PROBE_LIMIT = 3             # deliberately tiny; this is not a sweep yet
+DEFAULT_PROBE_DELAY_MS = 2000
+
+PROBE_KEY = "ffprobe_info"
+PROBE_TIMEOUT_S = 30
+# Consecutive failures against ONE account before we stop blaming the streams.
+PROBE_BREAKER = 3
+PROBE_ERROR_RETRY_DAYS = 7
+PROBED = "probed"
+TIER_PROBE = "probe"
+
+
+def parse_ffprobe(payload):
+    """Pure. ffprobe JSON -> the shape providers use, so existing readers work.
+
+    Takes the first video and first audio stream verbatim rather than picking
+    fields out: a provider's `detailed_info.video` IS an ffprobe stream object,
+    so copying the shape means `side_data_list` and anything else useful comes
+    along without being enumerated here.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    out = {}
+    for stream in payload.get("streams") or []:
+        if not isinstance(stream, dict):
+            continue
+        kind = stream.get("codec_type")
+        if kind == "video" and "video" not in out:
+            out["video"] = stream
+        elif kind == "audio" and "audio" not in out:
+            out["audio"] = stream
+    fmt = payload.get("format")
+    if isinstance(fmt, dict):
+        if fmt.get("duration"):
+            out["duration_secs"] = fmt.get("duration")
+        if fmt.get("bit_rate"):
+            out["bitrate"] = fmt.get("bit_rate")
+    return out
+
+
+def classify_probe(returncode, parsed):
+    """Pure. -> 'full' | 'none' | 'error'.
+
+    The distinction that matters: 'none' means ffprobe RAN and the stream has
+    nothing useful, which is permanent for that stream. 'error' means we never
+    got an answer, which may be transient and is the only outcome worth
+    retrying.
+    """
+    if returncode != 0 or not parsed:
+        return "error"
+    video = parsed.get("video") or {}
+    if video.get("width") and parsed.get("audio"):
+        return "full"
+    # A video stream with no dimensions is not a property of the media -- every
+    # real one has them. It is the signature of a read that was cut short, and
+    # on a provider capped at one connection that happens whenever a probe
+    # collides with playback. Calling it "none" would record a transient
+    # collision as a permanent fact and never look again, so it is retryable.
+    # Presence of the key, not truthiness of its contents: an empty block is
+    # just as suspicious, and keying on contents would make this depend on how
+    # `parse_ffprobe` happens to represent a stream it could not read.
+    if "video" in parsed and not video.get("width"):
+        return "error"
+    return "none"
+
+
+def decide_probe(props, now_iso, retry_days=PROBE_ERROR_RETRY_DAYS):
+    """Pure. -> (should_probe, reason). Same attempt-not-success rule as step 2,
+    and it matters more here: a probe costs a connection slot, so re-asking for
+    the streams that never answer is the most expensive possible mistake."""
+    if relation_has_essentials(props):
+        return False, "already has video and audio"
+    own = ((props or {}).get(OWN_PROPS_KEY) or {})
+    if not isinstance(own, dict):
+        own = {}
+    # Measure only what the provider lookup could not fill. The lookup is a
+    # light request; a measurement holds the connection for seconds. Spending
+    # one on a copy whose provider would have described it for free is the
+    # waste this whole ordering exists to avoid. Any attempt counts, including
+    # an error -- the lookup has its own retry, and a provider whose detail
+    # endpoint always fails must still be measurable.
+    if not isinstance(own.get("enrich"), dict):
+        return False, "provider lookup not tried yet"
+    mark = own.get("probe")
+    if not isinstance(mark, dict):
+        return True, "never probed"
+    got = mark.get("got")
+    if got != "error":
+        return False, "probed, stream had nothing more (%s)" % got
+    when = _parse_iso_z(mark.get("at"))
+    if when is None:
+        return True, "previous error, unreadable timestamp"
+    from datetime import timedelta
+    now = _parse_iso_z(now_iso)
+    if now is not None and (now - when) < timedelta(days=retry_days):
+        return False, "previous error, still inside retry window"
+    return True, "previous error, retry window elapsed"
+
+
+def run_ffprobe(url, user_agent=None, timeout=PROBE_TIMEOUT_S):
+    """Probe one stream. -> (returncode, parsed_or_None).
+
+    Reads are bounded on purpose. Without `-probesize`/`-analyzeduration`
+    ffprobe will happily pull far more of the file than it needs to describe
+    it, and every byte is provider bandwidth on a slot something else wants.
+    `-rw_timeout` is in microseconds and stops a stalled connection holding the
+    slot until the outer timeout fires.
+    """
+    import subprocess
+
+    cmd = ["ffprobe", "-v", "error", "-print_format", "json",
+           "-show_streams", "-show_format",
+           "-probesize", "5M", "-analyzeduration", "5M",
+           "-rw_timeout", "15000000"]
+    if user_agent:
+        cmd += ["-user_agent", user_agent]
+    cmd.append(url)
+    try:
+        done = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    except Exception as exc:
+        logger.warning("[VOD-MERGE] ffprobe could not run: %s", exc)
+        return 1, None
+    if done.returncode != 0:
+        return done.returncode, None
+    try:
+        import json as _json
+        return 0, parse_ffprobe(_json.loads(done.stdout.decode("utf-8", "replace")))
+    except Exception as exc:
+        logger.warning("[VOD-MERGE] ffprobe output unparseable: %s", exc)
+        return 1, None
+
+
+def store_probe(props, parsed):
+    """Pure-ish: put the measurement where it is durable AND where today's
+    readers already look. Returns the mutated props.
+
+    Two places on purpose. `ffprobe_info` is ours, carries provenance, and
+    nothing else writes it -- so a provider refresh can never destroy a DOVI
+    record, which is the one thing only a probe produces. The mirror into
+    `detailed_info` is what makes the data usable with no change to the plugin
+    that consumes it, and it only ever FILLS A HOLE: a value a provider
+    actually sent always wins, exactly as everywhere else here.
+    """
+    props[PROBE_KEY] = parsed
+    detail = props.get("detailed_info")
+    if not isinstance(detail, dict):
+        detail = {}
+    for key in ("video", "audio"):
+        # `{}` is falsy, which is what we want -- an empty block reaches
+        # storage looking like data and must be treated as absent.
+        if parsed.get(key) and not detail.get(key):
+            detail[key] = parsed[key]
+    props["detailed_info"] = detail
+    return props
+
+
+def errors_to_stamp(deferred, broken):
+    """Pure. Which failed probes are a fact about the STREAM, not the provider.
+
+    A failure against an account that then tripped the breaker says nothing
+    about the individual stream -- the provider was not answering. Stamping it
+    anyway would put every copy that happened to be queued during a bad hour
+    into a week-long retry window, which is the quiet way an outage turns into
+    permanently missing data.
+    """
+    out = []
+    for name in sorted(deferred):
+        if name in broken:
+            continue
+        out.extend(deferred[name])
+    return out
+
+
+def probe_movies_impl(limit=None, delay=None, heartbeat=None):
+    """Measure the wanted copies no provider would describe.
+
+    Scope comes from the same wanted-set file as step 2 and fails closed the
+    same way. Candidates are what step 2 could not fill.
+
+    `heartbeat`, if given, is called before every probe and must return True
+    to continue. The background task uses it to keep its run lock alive, and
+    to stop if the lock was lost -- at that point another run may hold it, and
+    two runs probing at once is exactly the collision the lock exists to stop.
+    """
+    from django.utils import timezone
+
+    cfg = _load_config(force=True)
+    limit = cfg["probe_limit"] if limit is None else limit
+    delay = (cfg["probe_delay_ms"] if delay is None else delay) / 1000.0
+
+    stats = {"probed": 0, "gained": 0, "nothing": 0, "errors": 0,
+             "skipped": 0, "no_url": 0, "broken": []}
+    if not cfg["probe_movies"]:
+        stats["aborted"] = "stream probing is off"
+        return stats
+
+    doc, status, detail = read_wanted_set(cfg["wanted_set_path"],
+                                          now=timezone.now())
+    if doc is None:
+        stats["aborted"] = "wanted set %s (%s)" % (status, detail)
+        logger.info("[VOD-MERGE] probing skipped -- wanted set %s: %s",
+                    status, detail)
+        return stats
+
+    movie_ids, _res = wanted_movie_ids(doc)
+    now_iso = timezone.now().isoformat()
+
+    per_movie = []
+    for rel in enrich_candidates(movie_ids).iterator(chunk_size=500):
+        should, _why = decide_probe(rel.custom_properties or {}, now_iso)
+        if not should:
+            stats["skipped"] += 1
+            continue
+        if per_movie and per_movie[-1][0] == rel.movie_id:
+            per_movie[-1][1].append(rel)
+        else:
+            per_movie.append((rel.movie_id, [rel]))
+
+    # allow_oversized=False: here the limit is a SAFETY ceiling, not a target.
+    chosen = take_whole_movies(per_movie, limit, allow_oversized=False)
+    per_account = {}
+    consecutive = {}
+    deferred_errors = {}
+
+    for rel in chosen:
+        account = rel.m3u_account
+        name = account.name
+        if name in stats["broken"]:
+            continue
+        if heartbeat is not None and not heartbeat():
+            stats["stopped"] = "lost the run lock"
+            logger.warning("[VOD-MERGE] stream probe stopped early -- lost the "
+                           "run lock, so another run may be measuring")
+            break
+        slot = per_account.setdefault(
+            name, {"probed": 0, "gained": 0, "nothing": 0, "errors": 0})
+
+        try:
+            url = rel.get_stream_url()
+        except Exception:
+            logger.exception("[VOD-MERGE] could not build stream URL rel=%s", rel.id)
+            url = None
+        if not url:
+            stats["no_url"] += 1
+            continue
+
+        try:
+            ua = account.get_user_agent_string()
+        except Exception:
+            ua = None
+
+        rc, parsed = run_ffprobe(url, ua)
+        outcome = classify_probe(rc, parsed)
+
+        if outcome == "error":
+            stats["errors"] += 1
+            slot["errors"] += 1
+            consecutive[name] = consecutive.get(name, 0) + 1
+            # Hold the stamp. Repeated failure against one account is a fact
+            # about the PROVIDER, not about each stream, and recording it per
+            # stream would put every queued copy into a week-long retry window
+            # because the provider had a bad hour.
+            deferred_errors.setdefault(name, []).append(rel)
+            if consecutive[name] >= PROBE_BREAKER:
+                stats["broken"].append(name)
+                logger.warning(
+                    "[VOD-MERGE] probe circuit breaker tripped for %r after %d "
+                    "consecutive failures -- abandoning it for this run and "
+                    "recording nothing against its streams", name, consecutive[name])
+            if delay:
+                time.sleep(delay)
+            continue
+
+        consecutive[name] = 0
+        props = rel.custom_properties or {}
+        if outcome == "full":
+            props = store_probe(props, parsed)
+            stats["gained"] += 1
+            slot["gained"] += 1
+        else:
+            stats["nothing"] += 1
+            slot["nothing"] += 1
+        stats["probed"] += 1
+        slot["probed"] += 1
+        _stamp_own(props, probe={"at": now_iso, "got": outcome})
+        rel.custom_properties = props
+        try:
+            rel.save(update_fields=["custom_properties"])
+        except Exception:
+            logger.exception("[VOD-MERGE] could not store probe for rel=%s", rel.id)
+        if delay:
+            time.sleep(delay)
+
+    # Only now do we know whether each account's failures were about the
+    # streams or about the provider.
+    for rel in errors_to_stamp(deferred_errors, stats["broken"]):
+        props = rel.custom_properties or {}
+        _stamp_own(props, probe={"at": now_iso, "got": "error"})
+        rel.custom_properties = props
+        try:
+            rel.save(update_fields=["custom_properties"])
+        except Exception:
+            logger.exception(
+                "[VOD-MERGE] could not store probe error for rel=%s", rel.id)
+
+    stats["per_account"] = per_account
+    logger.info("[VOD-MERGE] stream probe: %s", stats)
     return stats
 
 
@@ -2286,6 +2674,189 @@ def remove_schedule() -> bool:
     except Exception as exc:
         logger.debug("[VOD-MERGE] could not remove beat schedule: %s", exc)
         return False
+
+
+# --------------------------------------------------------------------------- #
+# Enrichment runs in the background, both steps in one run
+# --------------------------------------------------------------------------- #
+# One run does everything that can be done for the next batch: look up
+# provider detail, then -- if measuring is on -- measure the copies the lookup
+# could not describe. Lookup always goes first, because it is a light request
+# and a measurement holds the provider connection for seconds.
+#
+# Neither step belongs inside a web request: a probe can hold a connection for
+# up to PROBE_TIMEOUT_S, and a batch of lookups at about a second each gets
+# close to a request timeout on its own. The button therefore only ENQUEUES;
+# the work runs on the same queue as the nightly sweep, for the same routing
+# reason.
+#
+# Exactly one run at a time, enforced by a Redis lock taken INSIDE the task
+# rather than at the button: a check at enqueue time cannot stop two clicks
+# from queueing two runs. On a provider that allows one connection, two runs
+# at once collide with each other just as surely as with playback.
+#
+# The lock is short-lived and refreshed before every lookup and every probe,
+# so a worker killed mid-run frees it within minutes instead of blocking
+# enrichment for hours. Anything that stops us confirming we hold it -- Redis
+# down, lock taken over -- stops the run: a missed run costs a night of
+# enrichment, a collision can cost someone their stream.
+
+ENRICH_TASK_PATH = "dispatcharr_vod_merge.run_enrichment"
+RUN_LOCK_KEY = "dispatcharr_vod_merge:enrich_lock"
+
+
+def run_lock_ttl(delay_ms) -> int:
+    """Pure. Seconds the run lock lives between heartbeats.
+
+    A heartbeat comes before every lookup and every probe, so the longest gap
+    between two is one probe (the slower step) plus the spacing after it --
+    pass the larger of the two delays. Double the probe timeout and add a
+    minute of slack for the URL lookup and the save, so a slow-but-healthy run
+    never lets its lock lapse.
+    """
+    try:
+        delay_s = max(0, int(delay_ms)) / 1000.0
+    except (TypeError, ValueError):
+        delay_s = 0
+    return int(PROBE_TIMEOUT_S * 2 + delay_s + 60)
+
+
+def _as_text(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return value
+
+
+def acquire_run_lock(client, token, ttl) -> bool:
+    return bool(client.set(RUN_LOCK_KEY, token, nx=True, ex=ttl))
+
+
+def refresh_run_lock(client, token, ttl) -> bool:
+    """Extend our lock. -> False if we cannot confirm we still hold it.
+
+    A lock that lapsed while nobody else took it is re-taken, since nothing ran
+    in between. One held by a different token means another run is active,
+    and this one must stop.
+    """
+    try:
+        held = _as_text(client.get(RUN_LOCK_KEY))
+        if held is None:
+            return acquire_run_lock(client, token, ttl)
+        if held != token:
+            return False
+        client.expire(RUN_LOCK_KEY, ttl)
+        return True
+    except Exception as exc:
+        logger.warning("[VOD-MERGE] could not refresh the enrichment run lock: %s", exc)
+        return False
+
+
+def release_run_lock(client, token) -> None:
+    """Delete the lock only if it is still ours.
+
+    Read-then-delete is not atomic, but the gap only matters if our lock lapsed
+    and another run took it within that instant, which needs a heartbeat to
+    have been missed by minutes first.
+    """
+    try:
+        if _as_text(client.get(RUN_LOCK_KEY)) == token:
+            client.delete(RUN_LOCK_KEY)
+    except Exception as exc:
+        logger.warning("[VOD-MERGE] could not release the enrichment run lock: %s", exc)
+
+
+def run_locked(client, token, ttl, work):
+    """-> (ran, result). Runs `work(heartbeat)` only while holding the lock.
+
+    Pure apart from the client, so the lock discipline is testable with a fake:
+    no lock, no work; the lock is released however `work` ends.
+    """
+    if not acquire_run_lock(client, token, ttl):
+        return False, None
+    try:
+        return True, work(lambda: refresh_run_lock(client, token, ttl))
+    finally:
+        release_run_lock(client, token)
+
+
+def _redis_client():
+    from core.utils import RedisClient
+    client = RedisClient.get_client()
+    if client is None:
+        raise RuntimeError("Redis is unavailable")
+    return client
+
+
+def enrich_run_impl(probe_enabled, lookup, measure, heartbeat=None):
+    """-> {"lookup": stats, "measure": stats?}. Lookup first, then measuring.
+
+    The steps are passed in so the ordering and the stop conditions are
+    testable without Django. Measuring is skipped when it is off, when the
+    lookup declined to run at all (an untrustworthy wanted set must stop BOTH
+    steps -- fail closed on scope), and when the lookup lost the run lock.
+    """
+    out = {"lookup": lookup(heartbeat=heartbeat)}
+    if not probe_enabled:
+        return out
+    if out["lookup"].get("aborted") or out["lookup"].get("stopped"):
+        return out
+    out["measure"] = measure(heartbeat=heartbeat)
+    return out
+
+
+@shared_task(name=ENRICH_TASK_PATH)
+def run_enrichment():
+    """Background entry point for 'Enrich now'. Each step bounded by its limit."""
+    import uuid
+    from django.utils import timezone
+
+    started = timezone.now().isoformat()
+    try:
+        client = _redis_client()
+        cfg = _load_config(force=True)
+        ttl = run_lock_ttl(max(cfg["probe_delay_ms"], cfg["enrich_delay_ms"]))
+
+        def work(heartbeat):
+            write_run_status({"state": "running", "started_at": started})
+            return enrich_run_impl(cfg["probe_movies"], enrich_movies_impl,
+                                   probe_movies_impl, heartbeat=heartbeat)
+
+        ran, stats = run_locked(client, uuid.uuid4().hex, ttl, work)
+    except Exception as exc:
+        logger.exception("[VOD-MERGE] enrichment run failed")
+        write_run_status({"state": "failed", "started_at": started,
+                          "finished_at": timezone.now().isoformat(),
+                          "error": str(exc)})
+        return "Error: %s" % (exc,)
+    if not ran:
+        # Deliberately leaves the status record alone: it describes the run
+        # that IS in progress, and overwriting it would hide that run.
+        logger.info("[VOD-MERGE] enrichment not started -- another run is "
+                    "in progress")
+        return {"skipped": "another enrichment run is in progress"}
+    write_run_status({"state": "finished", "started_at": started,
+                      "finished_at": timezone.now().isoformat(),
+                      "result": stats})
+    return stats
+
+
+def enqueue_enrichment(cfg=None):
+    """-> (started, message). Queues an enrichment run; NEVER works inline.
+
+    The busy check here only produces a better message. The task re-checks
+    under its own lock, which is what actually prevents overlap.
+    """
+    cfg = cfg or _load_config(force=True)
+    if not cfg["enrich_movies"]:
+        return False, "enrichment is off"
+    try:
+        if _redis_client().exists(RUN_LOCK_KEY):
+            return False, "an enrichment run is already in progress"
+    except Exception:
+        pass
+    queue = cfg["schedule_queue"]
+    run_enrichment.apply_async(queue=queue)
+    return True, "started on queue %r" % (queue,)
 
 
 # A first run against a large untagged provider can produce thousands of
@@ -2880,6 +3451,38 @@ def write_log_file(payload) -> str:
 
 def write_movie_status_file(payload) -> str:
     return _write_json_file("movie_status.json", payload)
+
+
+# The last enrichment run lives in its own CoreSettings row, NOT in a file beside
+# the plugin: uploading a new zip replaces the plugin folder's contents, so a
+# file there is erased by every upgrade -- which is how the first version of
+# this lost its record.
+RUN_STATUS_KEY = "dispatcharr_vod_merge_enrich_run"
+RUN_STATUS_NAME = "Dispatcharr VOD Merge - last enrichment run"
+
+
+def write_run_status(payload) -> None:
+    try:
+        from core.models import CoreSettings
+        CoreSettings.objects.update_or_create(
+            key=RUN_STATUS_KEY,
+            defaults={"name": RUN_STATUS_NAME,
+                      "value": json.loads(json.dumps(payload, default=str))})
+    except Exception:
+        # A missing report is not worth failing a run over.
+        logger.exception("[VOD-MERGE] could not record the enrichment run")
+
+
+def read_run_status():
+    """The last background enrichment run, or None if there has not been one."""
+    try:
+        from core.models import CoreSettings
+        row = (CoreSettings.objects.filter(key=RUN_STATUS_KEY)
+               .values("value").first())
+    except Exception:
+        return None
+    val = (row or {}).get("value")
+    return val if isinstance(val, dict) else None
 
 
 # --------------------------------------------------------------------------- #

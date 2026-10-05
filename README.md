@@ -195,15 +195,18 @@ the other. Listed in the order the UI shows them.
 | **Limit series merging to accounts** | *(empty = all)* | Account names to merge series **from**. The canonical can live on any account. |
 | **Limit movie merging to accounts** | *(empty = all)* | The movie equivalent, **independent of the series list**. Also bounds which accounts the detail sweep looks up, so scope and sweep stay in step. |
 | **Tag movies no other providers have** | off | Lets the detail tier *create* a newly tagged movie rather than only merging into an existing one. Changes those movies' Dispatcharr ids now, and they revert if it is turned off. |
-| **Wanted-set file (enrichment)** | *(empty = off)* | Path, inside the container, to the file your `.strm` generator publishes listing the movies it syncs. See [Enriching the movies you sync](#enriching-the-movies-you-sync). |
-| **Enrich wanted movies** | off | Fetch provider detail for every candidate copy of those movies, so quality ranking has something to compare. |
-| **Enrichment lookups per run** | 25 | Batch size for the manual **Enrich movies** action. 0 means no limit. |
-| **Delay between enrichment calls (ms)** | 500 | Spacing between provider calls during enrichment. |
 | **Fetch movie details nightly** | off | Creates the beat schedule. |
 | **Nightly sweep hour (0-23)** | 4 | System timezone. |
 | **Approve manually** | *(empty)* | `<account>:<id>=<tmdb_id>`, for duplicates no signal reaches. Series and movies — see [Manual approvals](#manual-approvals). |
 | **Never merge** | *(empty)* | `tmdb:<id>` or `<account>:<id>`. Overrides everything, including approvals. |
 | **Variant edition pattern (regex)** | `[B&W]`, `[Black/White]`, `[Colorized]` | Matching entries are never merged (see below). |
+| **Enrich wanted movies** | off | Fetch audio/video details for every candidate copy of the movies in the wanted set file: provider details first, then — if enabled — ffprobe for what providers did not describe. |
+| **Movie wanted set file** | *(empty = off)* | Path, inside the container, to the file your `.strm` generator publishes listing the movies it syncs. See [Enriching the movies you sync](#enriching-the-movies-you-sync). |
+| **Enrichment lookups per run** | 25 | Maximum number of movie copies one **Enrich movies** run looks up. 0 means no limit. |
+| **Delay between enrichment calls (ms)** | 500 | Spacing between provider calls during enrichment. |
+| **Use ffprobe to analyze streams with no provider details** | off | Adds a second step to **Enrich movies**: open each copy the lookup could not describe and measure it. The only source of Dolby Vision information. Costs a provider connection slot per copy. |
+| **Ffprobe lookups per run** | 3 | Maximum number of streams one **Enrich movies** run analyzes. Deliberately small. |
+| **Delay between ffprobe calls (ms)** | 2000 | Spacing between ffprobe calls. |
 | **Movie details per manual run** | 50 | Bounds the **manual** sweep only — it runs inside a web request and would otherwise time out. The nightly sweep is unbounded by design. |
 | **Delay between detail calls (ms)** | 200 | Provider rate-limit throttle. Raise before adding several large categories at once. |
 | **Schedule queue (advanced)** | `dvr` | See [Why the sweep runs on the `dvr` queue](#why-the-sweep-runs-on-the-dvr-queue). Change only if you know why. |
@@ -401,6 +404,8 @@ it can go stale quietly.
 | **Series merge status** | Read-only, no provider calls. What would be merged for series, by which signal. Full list written to `series_status.json`. |
 | **Movie merge status** | Read-only, no provider calls. What would be merged for movies and how much detail backlog is left. Full list written to `movie_status.json`. |
 | **Fetch movie details** | Runs the sweep manually, bounded by *Movie details per manual run*. |
+| **Enrichment status** | Read-only, no provider calls. How much of the wanted set resolves, how many copies still need a lookup or a measurement, and whether the last enrichment run is still going or how it ended. |
+| **Enrich movies** | Starts a background run: provider detail for the next batch of wanted copies, then — if measuring is on — measures the ones no provider described. Returns at once; the result appears under **Enrichment status**. |
 | **Show injection log** | The audit trail. |
 | **Clear injection log** | Resets it. |
 
@@ -593,10 +598,12 @@ catalog is content you will never watch. The useful set is the few thousand
 titles you actually sync — and only your `.strm` generator knows which those
 are.
 
-So it publishes them, and this reads them. Point **Wanted-set file
-(enrichment)** at the file, turn on **Enrich wanted movies**, and run **Enrich
+So it publishes them, and this reads them. Point **Movie wanted set
+file** at the file, turn on **Enrich wanted movies**, and run **Enrich
 movies**. It fetches provider detail for every candidate copy of every wanted
-title, directly per copy.
+title, directly per copy, and measures what that could not fill if you have
+turned measuring on (below). Each run takes the next batch, in the background;
+run it again to continue.
 
 **Run Enrichment status first.** It makes no provider calls and tells you how
 many titles resolve, how many copies they have between them, and how many still
@@ -624,11 +631,47 @@ Genuine errors retry after a week.
 So the first run does the work, and later runs cost almost nothing until you add
 titles.
 
-### What this does not do yet
+### Measuring the rest
 
-It harvests what providers already know. On libraries where most providers
-return no technical detail at all, that leaves a lot unfilled — the remedy for
-which is measuring the streams directly, and that is not in this release.
+Harvesting only reaches what providers are willing to say, which on a real
+library is a minority of copies. **Use ffprobe to analyze streams with no
+provider details** handles the remainder by opening each one briefly and reading it. It
+is a second step of **Enrich movies**, not an action of its own, and it only
+ever takes copies whose provider lookup has already been tried and come back
+without video and audio — the free step always goes first.
+
+This is also the only way to learn whether a copy is Dolby Vision without a
+fallback layer — information no provider payload has ever contained, and which
+decides whether a stream renders correctly on non-DV hardware.
+
+**Treat it as a different kind of operation from everything else here.** A
+detail lookup is one request and milliseconds. A measurement opens the actual
+media and holds a provider connection slot for several seconds, competing with
+playback for it. The batch size defaults to three for that reason.
+
+Enrichment **runs in the background**: the button returns immediately, and the
+result of both steps appears under **Enrichment status** (and in the log as
+`[VOD-MERGE] stream probe:` for the measuring step). The record of the last run
+is kept in Dispatcharr's database, so it survives a plugin upgrade. Only one
+enrichment run is ever active — starting another while one is going reports that
+and does nothing, since two runs on a one-connection account would collide with
+each other.
+
+> **Do not run this while anything is streaming from that provider.** Many IPTV
+> accounts permit only one simultaneous connection. On such an account a
+> measurement and a playing stream cannot coexist, and depending on how the
+> provider resolves it you may lose the measurement, the playback, or both.
+> There is no automatic protection against this yet — it is on you to pick a
+> quiet moment.
+
+A measurement that gets cut off part-way is recorded as a retryable error
+rather than as "this stream has nothing", so a collision costs you a retry and
+not a permanently unmeasurable copy.
+
+If several measurements against one provider fail in a row, the rest are
+abandoned for that run and nothing is recorded against those streams — repeated
+failure says the provider is not answering, not that each individual stream is
+bad.
 
 ## Surviving an empty provider listing
 

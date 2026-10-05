@@ -7,6 +7,142 @@ Everything through 0.8.3 landed during initial development against a single
 large live library; the entries below record *why* each change was needed, since
 several were driven by failures that were invisible from the outside.
 
+## 1.5.1 — 2026-10-04
+
+**Changed — one Enrich action does both steps, in the background, one run at a
+time**
+
+- **Measuring is now a step of Enrich movies, not an action of its own.** One
+  run looks up provider detail for the next batch of wanted copies and then,
+  if **Use ffprobe to analyze streams with no provider details** is on,
+  measures the
+  copies the lookup could not describe. The separate **Measure streams** action
+  is gone.
+
+  As two actions they could run in the wrong order. The measuring pass took
+  any copy without video and audio — including copies whose provider simply
+  had not been asked yet — so it could spend a connection-holding measurement
+  where a light request would have filled the gap for free. A copy is now
+  measured only after its lookup has been tried (an attempt that errored
+  counts, so a provider whose detail endpoint always fails can still be
+  measured). The two batch sizes stay separate settings because the two costs
+  are so different.
+
+- **Enrich movies now queues the work and returns at once**, instead of working
+  inside the web request. A measurement can hold a provider connection for up
+  to thirty seconds, so even three of them could outlast the request — and in
+  practice did, timing it out part-way — and a batch of lookups comes close on
+  its own. The run goes to the same worker queue as the nightly sweep, for the
+  same reason: it is the one that can see plugin tasks.
+
+- **Only one enrichment run can be active at a time.** A button that returns at
+  once can be pressed twice, and on an account that allows a single connection
+  two runs collide with each other exactly as a measurement collides with
+  playback. A second request now reports that a run is in progress instead of
+  starting.
+
+  The lock is held by the run itself, not checked at the button, so it holds
+  however the run was started. It is short-lived and renewed before every
+  lookup and every measurement, so a worker killed mid-run frees it within
+  minutes rather than blocking enrichment for hours. Anything that prevents the
+  run confirming it still holds the lock — the lock store unreachable, or
+  another run having taken over — stops it: a skipped run costs some missing
+  data, a collision can cost someone their stream.
+
+- Because the button no longer waits, **Enrichment status** now reports:
+  - whether the last run is **in progress** or **finished**, and when (in UTC,
+    the container's clock), with what each step looked up, measured and
+    gained, and whether a provider was abandoned for repeated failure;
+  - **how many copies still need measuring**, in total and per provider, and how
+    many runs that is at the current batch size. The count uses the same
+    decision a run makes, so it is the run's backlog exactly rather than an
+    estimate.
+
+  The record of the last run is kept in its own row in Dispatcharr's settings
+  table, like the audit log, rather than in a file beside the plugin — uploading
+  a new zip replaces the plugin folder's contents and would erase it.
+
+- **Enrichment settings reworded and reordered.** **Enrich wanted movies** now
+  comes first, since it is the switch for everything below it. *Wanted-set
+  file (enrichment)* is now **Movie wanted set file**, and the measuring
+  settings name the tool they use: **Use ffprobe to analyze streams with no
+  provider details**, **Ffprobe lookups per run** and **Delay between ffprobe
+  calls (ms)**. Every merging setting — including the nightly sweep, manual
+  approvals, the never-merge list and the variant pattern — now comes before
+  enrichment, with the rarely touched tuning settings last. Stored values are
+  unaffected — only labels, help text and order changed.
+
+- The status message is restructured to fit the action popup, which does not
+  scroll: a few dense lines, most important first, per-provider detail last.
+
+- Still not here: pausing when a provider is busy with real playback. **With
+  measuring on, do not start an enrichment run while something is streaming
+  from that provider.**
+
+## 1.5.0 — 2026-10-04
+
+**Added — measure the streams no provider will describe**
+
+- Enrichment, step two of two. New setting **Use ffprobe to analyze streams
+  with no provider details** (at first named *Measure streams that providers do
+  not describe*), off by default, and a **Measure streams** action.
+
+  Step one harvests what providers already know, and on a real library that is
+  a minority of copies. It is strongly provider-dependent — some providers
+  supply technical detail nearly always, some sometimes, and some never — and
+  the ones that never do answer normally, with no errors and no empty replies.
+  The gap is structural, not a provider having a bad day, so no amount of
+  re-asking closes it.
+
+  The only remaining source is the stream itself. This opens it briefly and
+  reads what is actually there.
+
+- **It is the only way to get Dolby Vision information at all.** The record
+  that identifies DV without a fallback layer has not been seen in a single
+  provider payload, and appeared in the very first measurement. A
+  profile 5 stream with no fallback renders wrong on non-DV hardware, and
+  until now there was no way to know which copies those were.
+
+- **The cost is a different kind from everything else here, and the design
+  reflects that.** A detail lookup is one request and milliseconds. Measuring
+  opens the actual media and holds a provider connection slot for seconds —
+  the same scarce resource playback needs. So reads are bounded, there is a
+  delay between measurements, the per-run cap defaults to three rather than
+  twenty-five, and repeated failure against one provider stops that provider
+  for the run.
+
+- **Repeated failure is treated as a fact about the provider, not about each
+  stream.** If several measurements against the same provider fail in a row,
+  the rest are abandoned for that run and **nothing is recorded against those
+  streams**. Recording it would put every copy that happened to be queued
+  during a bad hour into a week-long retry window — which is how a brief
+  outage quietly becomes permanently missing data.
+
+- **The per-run cap is a hard ceiling here, unlike for detail lookups.** The
+  batching rule that keeps a title from being measured in halves takes an
+  oversized title whole, which is right when each lookup is one cheap request
+  and wrong when each one holds a provider connection for seconds. Measurement
+  fills its budget exactly instead, splitting whichever title straddles the
+  boundary and resuming it first next run. Exactly one title is ever partially
+  done, which is the same guarantee, without a setting of three quietly doing
+  several times that.
+
+- **A measurement cut off part-way is retried, not believed.** Many accounts
+  allow only one simultaneous connection, so a measurement that collides with
+  playback can be dropped mid-read — and ffprobe may still exit cleanly having
+  seen a video stream with no dimensions. Every real stream has dimensions, so
+  their absence is treated as a truncated read rather than as a fact about the
+  media. Without that, one unlucky collision would mark a copy permanently
+  unmeasurable and never look at it again.
+
+  **There is no automatic protection against colliding with playback yet.** Do
+  not run this while something is streaming from that provider.
+
+- Results are stored in their own place, which nothing else writes, **and**
+  mirrored into the detail Dispatcharr already reads, so quality ranking picks
+  them up with no other change. The mirror only ever fills a gap: a value a
+  provider actually sent always wins.
+
 ## 1.4.0 — 2026-10-04
 
 **Added — fill in video and audio for the movies you actually sync**

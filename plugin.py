@@ -86,6 +86,81 @@ def _format_preview(report):
     )
 
 
+def _short_time(iso):
+    """'2030-01-02T03:04:05.123456+00:00' -> '2030-01-02 03:04 UTC'.
+
+    Timestamps come from the container, whose clock is UTC, so say so rather
+    than let it be read as local time.
+    """
+    if not isinstance(iso, str) or len(iso) < 16:
+        return str(iso)
+    suffix = " UTC" if iso.endswith(("+00:00", "Z")) else ""
+    return iso[:16].replace("T", " ") + suffix
+
+
+def _format_enrich_status(st):
+    """Enrichment status in a few dense lines, most important first.
+
+    The popup does not scroll, and the first version of this ran well past it.
+    Per-provider detail goes last, on ONE line, because it is what grows with
+    the number of accounts.
+    """
+    per = " | ".join(
+        f"{a} {v['relations']}/{v['need']}/{v['measure']}"
+        for a, v in sorted(st.get("per_account", {}).items()))
+    return (
+        ("" if st.get("enrich_movies") else "ENRICHMENT IS OFF\n")
+        + f"wanted: {st['movies']} movies (TMDB {st['tmdb_resolved']}/"
+        f"{st['tmdb_total']}, unidentified {st['unid_resolved']}/"
+        f"{st['unid_total']}), {st['relations']} copies, set from "
+        f"{_short_time(st.get('generated_at'))}\n"
+        f"have video+audio {st['have_essentials']} | need lookup "
+        f"{st['need_fetch']} ({st['runs_at_current_limit']} runs) | need "
+        f"measuring {st['need_measure']} "
+        f"({st['measure_runs_at_current_limit']} runs)\n"
+        + _format_last_run(st.get("last_enrich_run"))
+        + (f"\ncopies/lookup/measure: {per}" if per else "")
+    )
+
+
+def _format_last_run(lp):
+    """One line (two if something stopped early) on the last enrichment run."""
+    if not lp:
+        return "last run: none yet"
+    state = lp.get("state")
+    if state == "running":
+        return (f"enrichment run IN PROGRESS, started "
+                f"{_short_time(lp.get('started_at'))}")
+    when = _short_time(lp.get("finished_at") or lp.get("started_at"))
+    if state != "finished":
+        return f"last run {state} at {when}" + (
+            f" -- {lp['error']}" if lp.get("error") else "")
+    res = lp.get("result") or {}
+    look = res.get("lookup") or {}
+    if look.get("aborted"):
+        return f"last run finished {when}: nothing done -- {look['aborted']}"
+    line = (f"last run finished {when}: looked up {look.get('fetched', 0)} "
+            f"(gained {look.get('got_essentials', 0)})")
+    meas = res.get("measure")
+    if meas is None:
+        line += ", measuring off"
+    elif meas.get("aborted"):
+        line += f", measuring skipped -- {meas['aborted']}"
+    else:
+        line += (f", measured {meas.get('probed', 0)} "
+                 f"(gained {meas.get('gained', 0)})")
+    errors = look.get("errors", 0) + ((meas or {}).get("errors", 0))
+    line += f", errors {errors}"
+    notes = []
+    if (meas or {}).get("broken"):
+        notes.append("stopped measuring " + ", ".join(meas["broken"])
+                     + " (not answering; nothing recorded)")
+    stopped = look.get("stopped") or (meas or {}).get("stopped")
+    if stopped:
+        notes.append(f"stopped: {stopped}")
+    return line + ("\n   " + "; ".join(notes) if notes else "")
+
+
 def _format_log(data, limit=60):
     entries = (data or {}).get("entries") or []
     if not entries:
@@ -109,7 +184,7 @@ def _format_log(data, limit=60):
 class Plugin:
     # UI title only; "Dispatcharr" is redundant inside the Dispatcharr UI.
     name = "VOD Merge"
-    version = "1.4.0"
+    version = "1.5.1"
     description = (
         "Durably merges duplicate VOD titles from providers that omit TMDB ids, "
         "by matching metadata like poster artwork and plot text to a title you "
@@ -221,46 +296,6 @@ class Plugin:
             ),
         },
         {
-            "id": "wanted_set_path",
-            "label": "Wanted-set file (enrichment)",
-            "type": "string",
-            "default": "",
-            "help_text": (
-                "Path, inside the container, to the wanted-set file your .strm "
-                "generator publishes. Blank disables enrichment. If the file is "
-                "missing, stale or malformed nothing happens -- it never falls "
-                "back to enriching your whole library."
-            ),
-        },
-        {
-            "id": "enrich_movies",
-            "label": "Enrich wanted movies",
-            "type": "boolean",
-            "default": False,
-            "help_text": (
-                "Fetch provider detail for every candidate copy of the movies "
-                "in the wanted-set file, so quality ranking has something to "
-                "compare. Use 'Enrichment status' first to see the size."
-            ),
-        },
-        {
-            "id": "enrich_limit",
-            "label": "Enrichment lookups per run",
-            "type": "number",
-            "default": 25,
-            "help_text": (
-                "How many relations 'Enrich movies' fetches in one go. 0 means "
-                "no limit."
-            ),
-        },
-        {
-            "id": "enrich_delay_ms",
-            "label": "Delay between enrichment calls (ms)",
-            "type": "number",
-            "default": 500,
-            "help_text": "Spacing between provider calls during enrichment.",
-        },
-        {
             "id": "scheduled_sweep",
             "label": "Fetch movie details nightly",
             "type": "boolean",
@@ -324,6 +359,76 @@ class Plugin:
                 "edition stays its own library entry even when metadata signals "
                 "match another title. Empty disables the check."
             ),
+        },
+        {
+            "id": "enrich_movies",
+            "label": "Enrich wanted movies",
+            "type": "boolean",
+            "default": False,
+            "help_text": (
+                "Fetch available audio/video details for every candidate copy "
+                "of the movies in the wanted set file below (first by fetching "
+                "provider details, and if necessary/enabled below, analyzing "
+                "streams with ffprobe). Use \"Enrichment status\" first to see "
+                "the size."
+            ),
+        },
+        {
+            "id": "wanted_set_path",
+            "label": "Movie wanted set file",
+            "type": "string",
+            "default": "",
+            "help_text": (
+                "Path, inside the container, to the list of wanted movies. See "
+                "README for details on the format. Blank disables enrichment. "
+                "If the file is missing, stale or malformed, nothing happens."
+            ),
+        },
+        {
+            "id": "enrich_limit",
+            "label": "Enrichment lookups per run",
+            "type": "number",
+            "default": 25,
+            "help_text": (
+                "Maximum number of individual movie copies one \"Enrich now\" "
+                "run looks up. 0 means no limit."
+            ),
+        },
+        {
+            "id": "enrich_delay_ms",
+            "label": "Delay between enrichment calls (ms)",
+            "type": "number",
+            "default": 500,
+            "help_text": "Spacing between provider calls during enrichment.",
+        },
+        {
+            "id": "probe_movies",
+            "label": "Use ffprobe to analyze streams with no provider details",
+            "type": "boolean",
+            "default": False,
+            "help_text": (
+                "Measure audio/video details directly for any streams for "
+                "which provider details don't include video/audio information. "
+                "Also the only way to get information about Dolby Vision. Each "
+                "probe uses a provider slot."
+            ),
+        },
+        {
+            "id": "probe_limit",
+            "label": "Ffprobe lookups per run",
+            "type": "number",
+            "default": 3,
+            "help_text": (
+                "Maximum number of streams ffprobe analyzes during one "
+                "\"Enrich now\" run. 0 means no limit."
+            ),
+        },
+        {
+            "id": "probe_delay_ms",
+            "label": "Delay between ffprobe calls (ms)",
+            "type": "number",
+            "default": 2000,
+            "help_text": "Spacing between stream measurements.",
         },
         {
             "id": "sweep_limit",
@@ -427,11 +532,12 @@ class Plugin:
         {
             "id": "enrich_now",
             "label": "Enrich movies",
-            "description": "Fetch provider detail for the candidate copies of "
-                           "wanted movies that still lack measured video and "
-                           "audio. Use 'Enrichment lookups per run' to adjust "
-                           "the batch size. Resumable, so run it again to "
-                           "continue.",
+            "description": "Fill in video and audio for the next batch of "
+                           "wanted copies: provider detail first, then -- if "
+                           "measuring is on -- measure what no provider "
+                           "described. Runs in the background; 'Enrichment "
+                           "status' shows the result. Resumable, so run it "
+                           "again to continue.",
             "button_label": "Enrich now",
             "button_variant": "filled",
         },
@@ -601,61 +707,36 @@ class Plugin:
                             f" ({st.get('file_detail')})\n"
                             f"path: {st['path']}\n"
                             "Nothing would be enriched. This never falls back "
-                            "to enriching the whole library."
+                            "to enriching the whole library.\n"
+                            + _format_last_run(st.get("last_enrich_run"))
                         ),
                         "report": st,
                     }
-                per = "\n".join(
-                    f"   {a}: {v['relations']} copies, {v['need']} need a lookup"
-                    for a, v in sorted(st.get("per_account", {}).items()))
-                return {
-                    "status": "ok",
-                    "message": (
-                        f"enrich_movies={st['enrich_movies']}  "
-                        f"generated {st.get('generated_at')}\n"
-                        f"wanted: {st['tmdb_resolved']}/{st['tmdb_total']} by TMDB id, "
-                        f"{st['unid_resolved']}/{st['unid_total']} unidentified "
-                        f"-> {st['movies']} movies\n"
-                        f"candidate copies: {st['relations']} "
-                        f"({st['relations'] / st['movies']:.1f} per movie)\n"
-                        f"already have video+audio: {st['have_essentials']}, "
-                        f"need a lookup: {st['need_fetch']}, "
-                        f"previously attempted: {st['already_attempted']}\n"
-                        f"runs at the current limit: {st['runs_at_current_limit']}"
-                        + ("\n" + per if per else "")
-                    ),
-                    "report": st,
-                }
+                return {"status": "ok", "message": _format_enrich_status(st),
+                        "report": st}
             except Exception as exc:
                 logger.exception("[VOD-MERGE] enrich_status failed")
                 return {"status": "error", "message": f"Enrichment status failed: {exc}"}
 
         if action == "enrich_now":
+            # Enqueue only. Lookups run about a second each and a measurement
+            # can hold a provider connection for 30s, so a batch outlives a
+            # web request.
             try:
-                st = _patch.enrich_movies_impl()
-                if st.get("aborted"):
-                    return {"status": "ok",
-                            "message": f"Nothing done: {st['aborted']}",
-                            "report": st}
-                per = "\n".join(
-                    f"   {a}: fetched={v['fetched']}, with video+audio={v['essentials']}, "
-                    f"empty={v['empty']}, errors={v['errors']}"
-                    for a, v in sorted(st.get("per_account", {}).items()))
+                started, why = _patch.enqueue_enrichment()
+                if not started:
+                    return {"status": "ok", "message": f"Not started: {why}"}
                 return {
                     "status": "ok",
                     "message": (
-                        f"fetched={st['fetched']} "
-                        f"(gained video+audio={st['got_essentials']}), "
-                        f"empty={st['empty']}, errors={st['errors']}, "
-                        f"skipped={st['skipped']}\n"
-                        f"remaining: {st['remaining']}"
-                        + ("\n" + per if per else "")
+                        f"Enrichment {why}. Results appear under 'Enrichment "
+                        f"status' when it finishes."
                     ),
-                    "report": st,
                 }
             except Exception as exc:
                 logger.exception("[VOD-MERGE] enrich_now failed")
-                return {"status": "error", "message": f"Enrichment failed: {exc}"}
+                return {"status": "error",
+                        "message": f"Could not start enrichment: {exc}"}
 
         if action == "list_log":
             data = _patch.get_log()
