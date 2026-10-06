@@ -1320,6 +1320,159 @@ def movie_sweep_status() -> dict:
     }
 
 
+# --------------------------------------------------------------------------- #
+# "What if": merging an account that is not in scope yet
+# --------------------------------------------------------------------------- #
+# Adding an account to `movie_accounts` merges for real at its next scan, and
+# there is no way to rehearse it: dry run is not a preview, because turning it
+# on UNWINDS every existing merge at the next scan (merges persist only while
+# the wrapper keeps re-injecting them). So this projects it instead, read-only,
+# with the same decision function, index and approvals a real scan would use.
+#
+# The number that matters is not how many copies would merge but what happens
+# to the TITLE they leave. An id-less title whose every copy moves is left
+# empty and pruned, so its Dispatcharr id dies -- and a synced .strm points at
+# that id. A title that keeps other copies keeps its id. Both are counted, and
+# against the wanted set when there is one, because "synced titles that would
+# get a new id" is the risk worth knowing before saying yes.
+
+
+def whatif_summary(decisions, relation_counts, wanted_ids=None):
+    """Pure. Summarize projected decisions for one account.
+
+    `decisions`: dicts with movie_id, name, action, tier, canonical_id and
+    creates_new_row, one per id-less copy. `relation_counts`: {movie_id: copies
+    in total, across every account}. `wanted_ids`: set of wanted Movie ids, or
+    None when there is no usable wanted set (the wanted counts are then None).
+    """
+    out = {"copies": len(decisions), "projected": {}, "by_tier": {},
+           "merge": 0, "create": 0, "titles_emptied": 0, "titles_keep_id": 0,
+           "wanted_renumbered": None, "wanted_into_wanted": None,
+           "wanted_lose_copy": None, "wanted_examples": []}
+    moves = {}
+    for d in decisions:
+        action = d.get("action")
+        out["projected"][action] = out["projected"].get(action, 0) + 1
+        if action != INJECT:
+            continue
+        tier = d.get("tier")
+        out["by_tier"][tier] = out["by_tier"].get(tier, 0) + 1
+        if d.get("creates_new_row"):
+            out["create"] += 1
+        else:
+            out["merge"] += 1
+        moves.setdefault(d.get("movie_id"), []).append(d)
+
+    if wanted_ids is not None:
+        out["wanted_renumbered"] = out["wanted_into_wanted"] = 0
+        out["wanted_lose_copy"] = 0
+    for mid, moved in moves.items():
+        # Every copy leaving means nothing holds the row up any more.
+        emptied = len(moved) >= relation_counts.get(mid, len(moved))
+        out["titles_emptied" if emptied else "titles_keep_id"] += 1
+        if wanted_ids is None or mid not in wanted_ids:
+            continue
+        if not emptied:
+            out["wanted_lose_copy"] += 1
+            continue
+        out["wanted_renumbered"] += 1
+        targets = {d.get("canonical_id") for d in moved} - {None}
+        into_wanted = bool(targets & wanted_ids)
+        if into_wanted:
+            # Already synced twice -- one of them under the id-less row. The
+            # merge collapses a duplicate in the library, and leaves the
+            # id-less one's file pointing at a dead id until the next sync.
+            out["wanted_into_wanted"] += 1
+        out["wanted_examples"].append({
+            "movie_id": mid, "name": moved[0].get("name"),
+            "into": sorted(targets), "into_synced_title": into_wanted})
+    return out
+
+
+def merge_whatif(cfg=None) -> dict:
+    """Read-only projection of adding each out-of-scope XC account to
+    `movie_accounts`. Writes nothing to the database."""
+    from django.db.models import Count
+    from django.utils import timezone
+    from apps.m3u.models import M3UAccount
+    from apps.vod.models import M3UMovieRelation
+
+    cfg = cfg or _load_config(force=True)
+    scoped = cfg["movie_accounts"]
+    if not scoped:
+        return {"accounts": {}, "note": (
+            "Every account is already in scope: 'Limit movie merging to "
+            "accounts' is empty, which means all of them.")}
+
+    # Classify as a real scan would with merging on. Dry run only changes the
+    # verdict's NAME, but folding it in keeps the counting in one place.
+    sim = dict(cfg, dry_run=False)
+    idx = _get_movie_indexes(force=True)
+
+    wanted_ids, wanted_state = None, "no wanted set configured"
+    if cfg["wanted_set_path"]:
+        doc, status, detail = read_wanted_set(cfg["wanted_set_path"],
+                                              now=timezone.now())
+        if doc is None:
+            wanted_state = "wanted set %s (%s)" % (status, detail)
+        else:
+            ids, _ = wanted_movie_ids(doc)
+            wanted_ids, wanted_state = set(ids), "ok"
+
+    accounts = [a for a in M3UAccount.objects.filter(is_active=True)
+                .exclude(name__in=scoped)
+                if getattr(a, "account_type", None) == "XC"]
+
+    rows_by = {}
+    found = set()
+    for acct in accounts:
+        rows = list(
+            M3UMovieRelation.objects
+            .filter(m3u_account=acct, movie__tmdb_id=None, movie__imdb_id=None)
+            .values_list("movie_id", "stream_id", "custom_properties", "movie__name"))
+        rows_by[acct.name] = rows
+        for _mid, _sid, props, _name in rows:
+            got = detail_tmdb(props or {})
+            if got:
+                found.add(got)
+    # One canonical lookup for every id any tier might land on, as in status.
+    canon = _canonical_map(found | set((idx.get("poster") or {}).values())
+                           | set((idx.get("plot") or {}).values()))
+
+    report = {}
+    for name, rows in sorted(rows_by.items()):
+        decisions, not_looked_up = [], 0
+        for mid, sid, props, title in rows:
+            props = props or {}
+            basic = dict(props.get("basic_data") or {})
+            basic.setdefault("name", title)
+            got = detail_tmdb(props)
+            detail_map = {str(sid): (got, None)} if got else {}
+            action, tmdb_id, tier, _ = decide_movie(
+                basic, name, sid, detail_map, canon, idx, sim)
+            target = canon.get(tmdb_id) or {}
+            decisions.append({
+                "movie_id": mid, "name": title, "action": action, "tier": tier,
+                "canonical_id": target.get("id"),
+                "creates_new_row": action == INJECT and not target})
+            # Once in scope, the nightly detail sweep would look these up and
+            # may find more merges. Unknown until then, so counted, not guessed.
+            if action != INJECT and not props.get("detailed_info"):
+                not_looked_up += 1
+        moving = {d["movie_id"] for d in decisions if d["action"] == INJECT}
+        counts = {r["movie_id"]: r["n"] for r in
+                  M3UMovieRelation.objects.filter(movie_id__in=moving)
+                  .values("movie_id").annotate(n=Count("id"))}
+        summary = whatif_summary(decisions, counts, wanted_ids)
+        summary["not_looked_up"] = not_looked_up
+        report[name] = summary
+    return {"accounts": report, "scoped": sorted(scoped), "wanted": wanted_state}
+
+
+def write_whatif_file(payload) -> str:
+    return _write_json_file("merge_whatif.json", payload)
+
+
 def sweep_movies_impl(limit=None, delay=None, refetch=False) -> dict:
     """Fetch `get_vod_info` for id-less movie relations and store the detail.
 

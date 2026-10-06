@@ -7,6 +7,24 @@ Everything through 0.8.3 landed during initial development against a single
 large live library; the entries below record *why* each change was needed, since
 several were driven by failures that were invisible from the outside.
 
+## 1.5.6 — 2026-10-05
+
+**Added — preview adding an account to movie merging**
+
+- New action **Preview adding accounts to movie merging**: read-only, no
+  provider calls. For each active account not yet in **Limit movie merging to
+  accounts**, it projects what adding it would merge, using the same decision,
+  index and manual approvals a real scan would.
+
+- It reports how many titles would get a new Dispatcharr id — a title whose
+  every copy merges elsewhere is removed, and anything that stored its id breaks
+  — and, with a wanted set configured, how many of those are titles you sync and
+  how many fold into a title you also sync. The affected titles are listed in
+  `merge_whatif.json`.
+
+- Until now there was no safe way to rehearse this: dry run undoes existing
+  merges at the next scan, so it cannot serve as a preview.
+
 ## 1.5.5 — 2026-10-05
 
 **Changed — renamed to VOD Merge & Enrich**

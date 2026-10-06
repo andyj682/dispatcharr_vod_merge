@@ -179,6 +179,32 @@ def _format_last_run(lp):
     return line + ("\n   " + "; ".join(notes) if notes else "")
 
 
+def _format_whatif(rep):
+    """One line per out-of-scope account; the titles go to the file."""
+    if rep.get("note"):
+        return rep["note"]
+    accounts = rep.get("accounts") or {}
+    if not accounts:
+        return "No other active XC accounts to preview."
+    lines = ["Read-only preview -- nothing was changed."]
+    for name, s in sorted(accounts.items()):
+        tiers = ", ".join(f"{k} {v}" for k, v in sorted(s["by_tier"].items()))
+        line = (f"{name}: {s['copies']} id-less copies, {s['merge']} would merge"
+                + (f" ({tiers})" if tiers else "")
+                + (f", {s['create']} would become newly tagged titles"
+                   if s["create"] else "")
+                + f"; {s['titles_emptied']} titles would get a new id")
+        if s.get("wanted_renumbered") is not None:
+            line += (f", {s['wanted_renumbered']} of them synced"
+                     f" ({s['wanted_into_wanted']} into another synced title)")
+        if s.get("not_looked_up"):
+            line += f"; {s['not_looked_up']} not yet looked up"
+        lines.append(line)
+    if rep.get("wanted") != "ok":
+        lines.append(f"synced-title counts unavailable: {rep.get('wanted')}")
+    return "\n".join(lines)
+
+
 def _format_log(data, limit=60):
     entries = (data or {}).get("entries") or []
     if not entries:
@@ -202,7 +228,7 @@ def _format_log(data, limit=60):
 class Plugin:
     # UI title only; "Dispatcharr" is redundant inside the Dispatcharr UI.
     name = "VOD Merge & Enrich"
-    version = "1.5.5"
+    version = "1.5.6"
     description = (
         "Merges duplicate VOD titles from providers that omit TMDB ids, by "
         "matching other details to an existing title. Adds video and audio specs "
@@ -570,6 +596,17 @@ class Plugin:
             "button_variant": "outline",
         },
         {
+            "id": "merge_whatif",
+            "label": "Preview adding accounts to movie merging",
+            "description": "For each account not in 'Limit movie merging to "
+                           "accounts', what adding it would merge, and how many "
+                           "synced movies would get a new Dispatcharr id. "
+                           "Read-only, no provider calls. The affected titles "
+                           "are written to merge_whatif.json.",
+            "button_label": "Preview",
+            "button_variant": "outline",
+        },
+        {
             "id": "sweep_movies",
             "label": "Fetch movie details",
             "description": "Look up provider detail for id-less movies and store "
@@ -699,6 +736,15 @@ class Plugin:
                 }
             except Exception as exc:
                 logger.exception("[VOD-MERGE] preview failed")
+                return {"status": "error", "message": f"Preview failed: {exc}"}
+
+        if action == "merge_whatif":
+            try:
+                rep = _patch.merge_whatif()
+                _patch.write_whatif_file(rep)
+                return {"status": "ok", "message": _format_whatif(rep)}
+            except Exception as exc:
+                logger.exception("[VOD-MERGE] merge_whatif failed")
                 return {"status": "error", "message": f"Preview failed: {exc}"}
 
         if action == "movie_status":

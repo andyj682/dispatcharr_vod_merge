@@ -624,6 +624,25 @@ The timer is written into Dispatcharr's scheduler on Enable and at startup, the
 same as the merge sweep's. Rather than leave a switched-off feature running
 until the next restart, the task re-reads the switch when it fires.
 
+## Previewing an account before adding it
+
+Scope is a setting whose undo is itself a change: adding an account merges at
+its next scan, removing it unwinds those merges, and dry run cannot stand in
+for a preview because it unwinds *existing* merges too. The
+preview therefore runs the real decision function over the account's id-less
+copies with merging switched on in a copy of the settings, and writes nothing.
+
+What it counts is chosen for the risk, not the activity. A copy moving is not
+the event that matters; the title it leaves is. An id-less title whose every
+copy moves is left empty and pruned, so its id dies, and anything outside
+Dispatcharr that stored that id breaks. That is decided by the copies left
+behind across *every* account, so the count of a title's copies is taken over
+all of them, not just the account being previewed.
+
+With no usable wanted set the synced counts are reported as unavailable rather
+than as zero: "nothing you sync is affected" is the reassuring answer, and it
+must never be given by default.
+
 ## Manual approvals
 
 Some entries are unreachable by every signal: a provider can ship a title as a

@@ -3002,6 +3002,101 @@ class DolbyVisionCheckTests(unittest.TestCase):
         self.assertEqual(tot["measure"]["dv_found"], 2)
 
 
+class MergeWhatIfTests(unittest.TestCase):
+    """The preview has to answer one question correctly: which synced titles
+    would get a new Dispatcharr id. A title keeps its id while anything still
+    holds its row up; it loses it only when every copy moves away."""
+
+    def _d(self, mid, action=None, tier="poster", into=100, new=False, name="T"):
+        return {"movie_id": mid, "name": name, "action": action or patch.INJECT,
+                "tier": tier, "canonical_id": None if new else into,
+                "creates_new_row": new}
+
+    def test_merges_and_new_titles_are_counted_by_tier(self):
+        s = patch.whatif_summary(
+            [self._d(1), self._d(2, tier="detail"), self._d(3, tier="detail", new=True),
+             self._d(4, action=patch.NO_MATCH, tier=None)],
+            {1: 1, 2: 1, 3: 1})
+        self.assertEqual((s["copies"], s["merge"], s["create"]), (4, 2, 1))
+        self.assertEqual(s["by_tier"], {"poster": 1, "detail": 2})
+        self.assertEqual(s["projected"][patch.NO_MATCH], 1)
+
+    def test_a_title_dies_only_when_every_copy_leaves(self):
+        s = patch.whatif_summary(
+            [self._d(1), self._d(1),           # both of movie 1's copies move
+             self._d(2)],                      # one of movie 2's three
+            {1: 2, 2: 3})
+        self.assertEqual((s["titles_emptied"], s["titles_keep_id"]), (1, 1))
+
+    def test_copies_on_other_accounts_keep_the_title_alive(self):
+        # The count is of ALL copies, any account -- an in-scope provider's
+        # unmatched copy still holds the row up.
+        s = patch.whatif_summary([self._d(1)], {1: 2})
+        self.assertEqual(s["titles_emptied"], 0)
+
+    def test_synced_titles_that_would_be_renumbered(self):
+        wanted = {1, 2, 3, 100}
+        s = patch.whatif_summary(
+            [self._d(1, into=100, name="A"),   # synced, into a synced title
+             self._d(2, into=200, name="B"),   # synced, into an unsynced one
+             self._d(3, into=100),             # synced but keeps its id
+             self._d(9, into=100)],            # not synced at all
+            {1: 1, 2: 1, 3: 2, 9: 1}, wanted)
+        self.assertEqual(s["wanted_renumbered"], 2)
+        self.assertEqual(s["wanted_into_wanted"], 1)
+        self.assertEqual(s["wanted_lose_copy"], 1)
+        names = {e["name"]: e["into_synced_title"] for e in s["wanted_examples"]}
+        self.assertEqual(names, {"A": True, "B": False})
+
+    def test_a_newly_tagged_title_is_never_already_synced(self):
+        s = patch.whatif_summary([self._d(1, new=True)], {1: 1}, {1})
+        self.assertEqual((s["wanted_renumbered"], s["wanted_into_wanted"]), (1, 0))
+
+    def test_no_wanted_set_means_no_wanted_counts_not_zero(self):
+        # "0 synced titles affected" would be a reassuring lie.
+        s = patch.whatif_summary([self._d(1)], {1: 1}, None)
+        self.assertIsNone(s["wanted_renumbered"])
+
+    def _fn(self, name):
+        tree = ast.parse(open(patch.__file__, encoding="utf-8").read())
+        return next(n for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef) and n.name == name)
+
+    def test_the_preview_uses_the_real_decision_with_merging_on(self):
+        src = ast.unparse(self._fn("merge_whatif"))
+        self.assertIn("sim = dict(cfg, dry_run=False)", src)
+        self.assertRegex(src, r"decide_movie\(basic, name, sid, detail_map, canon, idx, sim\)")
+
+    def test_the_preview_only_looks_at_accounts_not_yet_in_scope(self):
+        self.assertIn(".exclude(name__in=scoped)", ast.unparse(self._fn("merge_whatif")))
+
+    def test_the_preview_writes_nothing(self):
+        src = ast.unparse(self._fn("merge_whatif"))
+        for verb in (".save(", ".update(", ".delete(", "bulk_", ".create(",
+                     "_append_log", "write_run_status"):
+            self.assertNotIn(verb, src, verb)
+
+    def test_popup_text(self):
+        import plugin as plugin_mod
+        s = patch.whatif_summary([self._d(1, into=100), self._d(2, tier="detail")],
+                                 {1: 1, 2: 2}, {1, 100})
+        s["not_looked_up"] = 7
+        out = plugin_mod._format_whatif({"accounts": {"ProviderX": s}, "wanted": "ok"})
+        self.assertIn("ProviderX: 2 id-less copies, 2 would merge (detail 1, poster 1)", out)
+        self.assertIn("1 titles would get a new id, 1 of them synced "
+                      "(1 into another synced title)", out)
+        self.assertIn("7 not yet looked up", out)
+        none = patch.whatif_summary([self._d(1)], {1: 1}, None)
+        none["not_looked_up"] = 0
+        out = plugin_mod._format_whatif({"accounts": {"P": none},
+                                         "wanted": "no wanted set configured"})
+        self.assertNotIn("synced (", out)
+        self.assertIn("synced-title counts unavailable", out)
+        self.assertIn("already in scope",
+                      plugin_mod._format_whatif({"accounts": {}, "note":
+                          "Every account is already in scope: x"}))
+
+
 class ManifestParityTests(unittest.TestCase):
     """plugin.json and the Plugin class both declare the UI, so they must agree.
 

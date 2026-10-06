@@ -417,6 +417,7 @@ it can go stale quietly.
 | **Show status** | Config, wrapper state, index sizes. |
 | **Series merge status** | Read-only, no provider calls. What would be merged for series, by which signal. Full list written to `series_status.json`. |
 | **Movie merge status** | Read-only, no provider calls. What would be merged for movies and how much detail backlog is left. Full list written to `movie_status.json`. |
+| **Preview adding accounts to movie merging** | Read-only, no provider calls. For each account not yet in *Limit movie merging to accounts*, what adding it would merge and how many synced movies would get a new Dispatcharr id. Affected titles written to `merge_whatif.json`. See [Adding another account](#adding-another-account). |
 | **Fetch movie details** | Runs the sweep manually, bounded by *Movie details per manual run*. |
 | **Enrichment status** | Read-only, no provider calls. How much of the wanted set resolves, how many copies still need a lookup or a measurement, and whether the last enrichment run is still going or how it ended. |
 | **Enrich movies** | Starts a background run: provider detail for the next batch of wanted copies, then analyzes any streams still without information with ffprobe (if enabled). Returns at once; the result appears under **Enrichment status**. |
@@ -433,6 +434,37 @@ it can go stale quietly.
    merges persist.
 5. For movies, **enable the nightly sweep** and check *Movie merge status* the
    next day.
+
+### Adding another account
+
+Adding an account to **Limit movie merging to accounts** merges its duplicates
+for real at that account's next refresh, and there is no rehearsal for it:
+turning **Dry run** on is *not* a preview, because it undoes every existing merge
+at the next scan (merges last only while the plugin keeps re-applying them).
+Taking the account back out again undoes its merges the same way.
+
+So before adding one, run **Preview adding accounts to movie merging**. For
+every active XC account not yet in scope it runs the same decision a real scan
+would, against the same index and manual approvals, and changes nothing. It
+reports, per account:
+
+- how many of its id-less copies would merge, and by which signal, and how many
+  would become newly tagged titles;
+- **how many titles would get a new Dispatcharr id.** When every copy of an
+  id-less title moves into another title, nothing holds the old one up any
+  more, so it is removed — and anything that pointed at its id, such as a synced
+  `.strm` file, points at nothing until it is re-pointed. A title that keeps
+  other copies keeps its id;
+- with a wanted set configured, **how many of those are titles you sync**, and
+  how many of them fold into a title you *also* sync — a duplicate in your
+  library that the merge would collapse;
+- how many copies have not been looked up yet. Once the account is in scope the
+  nightly sweep fetches their detail, which can find more merges than the
+  preview can see today.
+
+The titles behind the synced counts are written to `merge_whatif.json`, so you
+can check them, or decide the ones to keep apart with **Never merge**, before
+switching anything on.
 
 ## Movies: what to expect
 
