@@ -732,6 +732,23 @@ abandoned for that run and nothing is recorded against those streams — repeate
 failure says the provider is not answering, not that each individual stream is
 bad.
 
+### When a provider is down
+
+A provider that is not answering at all is skipped, not hammered. Before each
+batch every provider with work waiting gets one quick sign-in check, tried
+twice; one that fails both is left out of that batch — before the batch is
+chosen, so the healthy providers still get a full batch — and nothing is
+recorded against its copies. The next batch checks again, so a provider that
+comes back during the night is picked up.
+
+A provider that stops answering *part-way* through is caught by a breaker:
+after several failed lookups in a row it is left alone for the rest of the
+night, and those failures are not recorded either. Recording them would put
+every copy that happened to be queued during the outage into a week-long retry
+wait. An isolated failure on a provider that is otherwise answering is still
+recorded and retried after a week, as before. **Enrichment status** names any
+provider skipped or stopped this way.
+
 ### Checking 4K copies for Dolby Vision
 
 A copy whose provider supplied resolution and audio is normally never measured

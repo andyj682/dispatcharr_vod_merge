@@ -2270,7 +2270,70 @@ def enrich_status(cfg=None):
     return out
 
 
-def enrich_movies_impl(limit=None, delay=None, heartbeat=None):
+# A provider that is not answering at all is one fact about the PROVIDER, not
+# N facts about N copies. Asking anyway costs a doomed request per copy, and --
+# the part that matters -- each failure is recorded against its copy with a
+# week-long retry, so one outage night would park a whole provider's backlog
+# for a week. Two defenses, as on the measuring side: a pre-flight that skips a
+# provider whose panel does not answer, and a breaker for one that stops
+# answering part-way, whose held failures are then discarded.
+LOOKUP_BREAKER = 3
+PREFLIGHT_ATTEMPTS = 2
+
+
+def panel_answers(client, attempts=PREFLIGHT_ATTEMPTS):
+    """-> (answered, last_error). Pure apart from the client: one cheap
+    authentication call, retried, so a single dropped packet is not an outage."""
+    last = None
+    for _ in range(max(1, int(attempts))):
+        try:
+            client.authenticate()
+            return True, None
+        except Exception as exc:
+            last = exc
+    return False, last
+
+
+def _account_panel_answers(account):
+    """Pre-flight for a provider the caller has no client for yet.
+
+    FAILS OPEN on anything that is not a clear answer from the provider --
+    unable to load the client, unable to build one. Wrongly skipping a healthy
+    provider costs it a night; the per-request handling copes with the rest.
+    """
+    try:
+        from core.xtream_codes import Client as XtreamCodesClient
+        client = XtreamCodesClient(
+            server_url=account.server_url, username=account.username,
+            password=account.password,
+            user_agent=account.get_user_agent_string())
+    except Exception:
+        return True
+    try:
+        with client:
+            ok, why = panel_answers(client)
+    except Exception:
+        return True
+    if not ok:
+        logger.warning("[VOD-MERGE] %r is not answering (%s) -- skipping it "
+                       "for this batch", getattr(account, "name", account), why)
+    return ok
+
+
+def down_account_ids(groups):
+    """Ids of the accounts in `groups` whose panel does not answer. Each
+    account is asked once."""
+    return busy_account_ids(
+        groups, lambda acc: acc if _account_panel_answers(acc) else None)
+
+
+def account_names(groups, account_ids):
+    """Pure. Sorted names of the given accounts, as they appear in `groups`."""
+    return sorted({r.m3u_account.name for _m, rels in groups for r in rels
+                   if r.m3u_account_id in account_ids})
+
+
+def enrich_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=None):
     """Fetch provider detail for every relation of every wanted movie.
 
     `heartbeat` works as in `probe_movies_impl`: checked before every lookup,
@@ -2289,7 +2352,7 @@ def enrich_movies_impl(limit=None, delay=None, heartbeat=None):
     delay = (cfg["enrich_delay_ms"] if delay is None else delay) / 1000.0
 
     stats = {"fetched": 0, "got_essentials": 0, "empty": 0, "errors": 0,
-             "skipped": 0, "remaining": 0}
+             "skipped": 0, "remaining": 0, "down": [], "broken": []}
     if not cfg["enrich_movies"]:
         stats["aborted"] = "enrichment is off"
         return stats
@@ -2325,6 +2388,16 @@ def enrich_movies_impl(limit=None, delay=None, heartbeat=None):
         else:
             per_movie.append((rel.movie_id, [rel]))
 
+    # Providers that stopped answering earlier tonight are not asked again.
+    per_movie = without_accounts(per_movie, set(skip_accounts or ()))
+    # And one that is not answering NOW is left out BEFORE the batch is chosen
+    # -- otherwise its copies can fill the batch and the healthy providers get
+    # nothing. Nothing is recorded against its copies; they were not tried,
+    # and the next batch checks again.
+    down_ids = down_account_ids(per_movie)
+    if down_ids:
+        stats["down"] = account_names(per_movie, down_ids)
+    per_movie = without_accounts(per_movie, down_ids)
     by_account = {}
     chosen = take_whole_movies(per_movie, limit)
     stats["movies_this_run"] = len({r.movie_id for r in chosen})
@@ -2332,6 +2405,8 @@ def enrich_movies_impl(limit=None, delay=None, heartbeat=None):
         by_account.setdefault(rel.m3u_account_id, []).append(rel)
 
     per_account = {}
+    consecutive = {}
+    deferred_errors = {}
     for rels in by_account.values():
         if stats.get("stopped"):
             break
@@ -2370,6 +2445,22 @@ def enrich_movies_impl(limit=None, delay=None, heartbeat=None):
                     logger.warning("[VOD-MERGE] enrich fetch failed %r rel=%s: %s",
                                    name, rel.id, exc)
                     payload = None
+                    consecutive[name] = consecutive.get(name, 0) + 1
+                    # Held, not stamped: only once the run is over do we know
+                    # whether this was the stream or the whole provider.
+                    deferred_errors.setdefault(name, []).append(rel)
+                    if consecutive[name] >= LOOKUP_BREAKER:
+                        stats["broken"].append(name)
+                        stats.setdefault("broken_ids", []).append(rel.m3u_account_id)
+                        logger.warning(
+                            "[VOD-MERGE] lookup breaker tripped for %r after %d "
+                            "consecutive failures -- stopping it and recording "
+                            "nothing against its copies", name, consecutive[name])
+                        break
+                    if delay:
+                        time.sleep(delay)
+                    continue
+                consecutive[name] = 0
 
                 if payload is not None:
                     info = (payload or {}).get("info")
@@ -2416,6 +2507,16 @@ def enrich_movies_impl(limit=None, delay=None, heartbeat=None):
                         "[VOD-MERGE] could not store enrichment for rel=%s", rel.id)
                 if delay:
                     time.sleep(delay)
+
+    for rel in errors_to_stamp(deferred_errors, stats["broken"]):
+        props = rel.custom_properties or {}
+        _stamp_own(props, enrich={"at": now_iso, "got": "error"})
+        rel.custom_properties = props
+        try:
+            rel.save(update_fields=["custom_properties"])
+        except Exception:
+            logger.exception(
+                "[VOD-MERGE] could not store enrichment error for rel=%s", rel.id)
 
     remaining = 0
     for rel in enrich_candidates(movie_ids).iterator(chunk_size=500):
@@ -2909,6 +3010,10 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=None
         logger.info("[VOD-MERGE] busy with playback, not probing this run: %s",
                     ", ".join(stats["busy"]))
     per_movie = without_accounts(per_movie, busy_ids)
+    down_ids = down_account_ids(per_movie)
+    if down_ids:
+        stats["down"] = account_names(per_movie, down_ids)
+    per_movie = without_accounts(per_movie, down_ids)
     per_movie = without_accounts(per_movie, set(skip_accounts or ()))
 
     # allow_oversized=False: here the limit is a SAFETY ceiling, not a target.
@@ -3261,7 +3366,7 @@ def enrich_run_impl(probe_enabled, lookup, measure, heartbeat=None,
     lookup declined to run at all (an untrustworthy wanted set must stop BOTH
     steps -- fail closed on scope), and when the lookup was stopped early.
     """
-    out = {"lookup": lookup(heartbeat=heartbeat)}
+    out = {"lookup": lookup(heartbeat=heartbeat, skip_accounts=skip_accounts)}
     if not probe_enabled:
         return out
     if out["lookup"].get("aborted") or out["lookup"].get("stopped"):
@@ -3328,6 +3433,7 @@ def run_batches(batch, time_left, max_batches=MAX_NIGHTLY_BATCHES):
               "measure": {k: 0 for k in _MEASURE_SUMS},
               "batches": 0}
     busy, broken, skip = set(), set(), set()
+    down, look_broken = set(), set()
     measured = False
     ended = "safety limit on batches reached"
     for _ in range(max_batches):
@@ -3340,11 +3446,15 @@ def run_batches(batch, time_left, max_batches=MAX_NIGHTLY_BATCHES):
         meas = res.get("measure")
         for k in _LOOKUP_SUMS:
             totals["lookup"][k] += look.get(k, 0)
+        down.update(look.get("down") or ())
+        look_broken.update(look.get("broken") or ())
+        skip.update(look.get("broken_ids") or ())
         if meas is not None:
             measured = True
             for k in _MEASURE_SUMS:
                 totals["measure"][k] += meas.get(k, 0)
             busy.update(meas.get("busy") or ())
+            down.update(meas.get("down") or ())
             broken.update(meas.get("broken") or ())
             skip.update(meas.get("broken_ids") or ())
         if look.get("aborted"):
@@ -3358,10 +3468,13 @@ def run_batches(batch, time_left, max_batches=MAX_NIGHTLY_BATCHES):
         if not _attempted(res):
             # Judged on THIS batch: a provider busy at 01:00 and free by 02:00
             # must not make a finished backlog read as blocked.
-            blocked = (meas or {}).get("busy") or skip
+            blocked = ((meas or {}).get("busy") or (meas or {}).get("down")
+                       or look.get("down") or skip)
             ended = ("the rest is on providers that are busy or not answering"
                      if blocked else "nothing left to try")
             break
+    totals["lookup"]["down"] = sorted(down)
+    totals["lookup"]["broken"] = sorted(look_broken)
     if not measured:
         totals.pop("measure")
     else:

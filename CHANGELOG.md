@@ -7,6 +7,24 @@ Everything through 0.8.3 landed during initial development against a single
 large live library; the entries below record *why* each change was needed, since
 several were driven by failures that were invisible from the outside.
 
+## 1.5.7 — 2026-10-06
+
+**Added — enrichment skips a provider that is not answering**
+
+- Before each batch, every provider with work waiting gets a quick sign-in
+  check (tried twice). One that does not answer is left out of that batch —
+  before the batch is chosen, so other providers still get a full one — and
+  nothing is recorded against its copies. The next batch checks again.
+
+- Lookups now have the breaker measuring already had: after several failures
+  in a row a provider is left alone for the rest of the night, and those
+  failures are discarded rather than recorded. Previously every failed lookup
+  was recorded with a week-long retry, so a provider outage during a nightly run
+  could park that provider's whole backlog for a week.
+
+- **Enrichment status** names providers skipped for not answering and those
+  stopped part-way.
+
 ## 1.5.6 — 2026-10-05
 
 **Added — preview adding an account to movie merging**

@@ -2235,7 +2235,7 @@ class EnrichRunOrderTests(unittest.TestCase):
     def _run(self, probe_enabled=True, lookup_result=None):
         calls = []
 
-        def lookup(heartbeat=None):
+        def lookup(heartbeat=None, skip_accounts=None):
             calls.append(("lookup", heartbeat))
             return lookup_result if lookup_result is not None else {"fetched": 5}
 
@@ -2259,7 +2259,7 @@ class EnrichRunOrderTests(unittest.TestCase):
             got.append(skip_accounts)
             return {}
 
-        patch.enrich_run_impl(True, lambda heartbeat=None: {}, measure,
+        patch.enrich_run_impl(True, lambda heartbeat=None, skip_accounts=None: {}, measure,
                               skip_accounts={7})
         self.assertEqual(got, [{7}])
 
@@ -3095,6 +3095,161 @@ class MergeWhatIfTests(unittest.TestCase):
         self.assertIn("already in scope",
                       plugin_mod._format_whatif({"accounts": {}, "note":
                           "Every account is already in scope: x"}))
+
+
+class ProviderDownTests(unittest.TestCase):
+    """A provider that is not answering is one fact about the provider. Asking
+    anyway sends a doomed request per copy and, worse, records a week-long
+    retry against every one -- one outage night parks a provider's backlog."""
+
+    class _Client:
+        def __init__(self, fails):
+            self.fails, self.calls = fails, 0
+
+        def authenticate(self):
+            self.calls += 1
+            if self.calls <= self.fails:
+                raise ConnectionError("no answer")
+
+    def test_a_panel_that_answers(self):
+        c = self._Client(0)
+        self.assertEqual(patch.panel_answers(c), (True, None))
+        self.assertEqual(c.calls, 1)
+
+    def test_one_dropped_call_is_not_an_outage(self):
+        self.assertTrue(patch.panel_answers(self._Client(1))[0])
+
+    def test_a_panel_that_never_answers(self):
+        c = self._Client(99)
+        ok, why = patch.panel_answers(c)
+        self.assertFalse(ok)
+        self.assertIsInstance(why, ConnectionError)
+        self.assertEqual(c.calls, patch.PREFLIGHT_ATTEMPTS)
+
+    def test_unable_to_check_counts_as_answering(self):
+        # Fails OPEN, the opposite of the busy check: wrongly skipping a
+        # healthy provider costs it a night; a doomed lookup costs one request.
+        self.assertTrue(patch._account_panel_answers(object()))
+
+    def test_account_names(self):
+        class A:
+            def __init__(self, name): self.name = name
+
+        class Rel:
+            def __init__(self, aid, name):
+                self.m3u_account_id, self.m3u_account = aid, A(name)
+
+        groups = [(1, [Rel(1, "B"), Rel(2, "A")]), (2, [Rel(1, "B")])]
+        self.assertEqual(patch.account_names(groups, {1, 2}), ["A", "B"])
+        self.assertEqual(patch.account_names(groups, {2}), ["A"])
+
+    # --- wiring --------------------------------------------------------------
+    def _fn(self, name):
+        tree = ast.parse(open(patch.__file__, encoding="utf-8").read())
+        return next(n for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef) and n.name == name)
+
+    def _before_batch(self, fn_name):
+        fn = self._fn(fn_name)
+        lines = {}
+        for c in ast.walk(fn):
+            if isinstance(c, ast.Call):
+                lines.setdefault(ast.unparse(c), c.lineno)
+        down = lines.get("without_accounts(per_movie, down_ids)")
+        take = next(v for k, v in lines.items() if k.startswith("take_whole_movies("))
+        self.assertIsNotNone(down, "%s must leave down providers out" % fn_name)
+        self.assertLess(down, take, "...BEFORE the batch is chosen")
+        self.assertIn("down_ids = down_account_ids(per_movie)", ast.unparse(fn))
+
+    def test_lookups_leave_down_providers_out_before_batching(self):
+        self._before_batch("enrich_movies_impl")
+
+    def test_measuring_leaves_down_providers_out_before_batching(self):
+        self._before_batch("probe_movies_impl")
+
+    def test_down_check_finds_exactly_the_providers_not_answering(self):
+        class A:
+            def __init__(self, aid): self.id = aid
+
+        class Rel:
+            def __init__(self, aid): self.m3u_account_id, self.m3u_account = aid, A(aid)
+
+        saved = patch._account_panel_answers
+        asked = []
+        patch._account_panel_answers = lambda acc: asked.append(acc.id) or acc.id != 2
+        try:
+            got = patch.down_account_ids([(1, [Rel(1), Rel(2)]), (2, [Rel(2), Rel(3)])])
+        finally:
+            patch._account_panel_answers = saved
+        self.assertEqual(got, {2})
+        self.assertEqual(sorted(asked), [1, 2, 3])   # each provider asked once
+
+    def test_the_lookup_breaker_trips_quickly(self):
+        # A provider gets a few failures' benefit of the doubt, no more: every
+        # failure past the threshold is a doomed request and a held record.
+        self.assertEqual(patch.LOOKUP_BREAKER, patch.PROBE_BREAKER)
+        self.assertTrue(1 < patch.LOOKUP_BREAKER <= 5)
+
+    def test_lookups_honor_the_nights_skip_list(self):
+        self.assertIn("without_accounts(per_movie, set(skip_accounts or ()))",
+                      ast.unparse(self._fn("enrich_movies_impl")))
+
+    def test_a_failed_lookup_is_held_not_stamped(self):
+        fn = self._fn("enrich_movies_impl")
+        handlers = [h for h in ast.walk(fn) if isinstance(h, ast.ExceptHandler)
+                    and "get_vod_info" in ast.unparse(
+                        next(t for t in ast.walk(fn) if isinstance(t, ast.Try)
+                             and h in t.handlers))]
+        self.assertEqual(len(handlers), 1)
+        body = ast.unparse(ast.Module(body=handlers[0].body, type_ignores=[]))
+        self.assertIn("deferred_errors.setdefault(name, []).append(rel)", body)
+        self.assertNotIn("_stamp_own", body)
+        self.assertIn("consecutive[name] >= LOOKUP_BREAKER", body)
+        self.assertIn("continue", body)
+
+    def test_held_failures_are_stamped_only_for_providers_still_answering(self):
+        self.assertIn("errors_to_stamp(deferred_errors, stats['broken'])",
+                      ast.unparse(self._fn("enrich_movies_impl")))
+
+    def test_a_success_resets_the_breaker(self):
+        self.assertIn("consecutive[name] = 0", ast.unparse(self._fn("enrich_movies_impl")))
+
+    # --- the night ----------------------------------------------------------
+    def test_lookups_get_the_skip_list(self):
+        got = []
+        patch.enrich_run_impl(False, lambda heartbeat=None, skip_accounts=None:
+                              got.append(skip_accounts) or {}, None,
+                              skip_accounts={5})
+        self.assertEqual(got, [{5}])
+
+    def test_a_provider_that_stopped_answering_lookups_is_skipped_all_night(self):
+        calls = []
+        results = iter([
+            {"lookup": {"fetched": 2, "broken": ["P"], "broken_ids": [5]}},
+            {"lookup": {"fetched": 2}},
+            {"lookup": {}}])
+
+        def batch(skip):
+            calls.append(set(skip))
+            return next(results)
+
+        tot = patch.run_batches(batch, lambda: True)
+        self.assertEqual(calls, [set(), {5}, {5}])
+        self.assertEqual(tot["lookup"]["broken"], ["P"])
+
+    def test_ending_on_a_down_provider_is_said(self):
+        tot = patch.run_batches(lambda skip: {"lookup": {"down": ["P"]}}, lambda: True)
+        self.assertIn("not answering", tot["ended"])
+        self.assertEqual(tot["lookup"]["down"], ["P"])
+
+    def test_status_names_down_and_stopped_providers(self):
+        import plugin as plugin_mod
+        out = plugin_mod._format_last_run({
+            "state": "finished", "finished_at": "2030-01-02T03:04:05+00:00",
+            "result": {"lookup": {"fetched": 3, "down": ["P1"], "broken": ["P2"]},
+                       "measure": {"probed": 1, "down": ["P1", "P3"]}}})
+        self.assertIn("skipped P1, P3 (not answering)", out)
+        self.assertIn("stopped looking up P2", out)
 
 
 class ManifestParityTests(unittest.TestCase):

@@ -573,6 +573,21 @@ bounded window — playback that starts during a probe of at most thirty
 seconds — and a measurement cut short in that window is already recorded as a
 retryable error rather than a fact about the stream.
 
+### A provider that is not answering
+
+Measuring had a breaker from the start; lookups did not, and the asymmetry was
+the dangerous kind. A lookup failure is recorded against its copy with a
+week-long retry, so on a nightly run against a large wanted set an outage would
+not merely waste requests: batch after batch would park the provider's backlog
+for a week, and the only symptom would be a stubborn error count.
+
+So lookups now get both defenses. A pre-flight sign-in per provider, before the
+batch is chosen (the busy check taught that a check made after choosing lets a
+skipped provider's copies fill the batch); it fails open, because wrongly
+skipping a healthy provider costs it a night. And a breaker for an outage that
+begins mid-run, whose held failures are discarded rather than stamped, using
+the same function the measuring side uses for exactly that decision.
+
 ### Checking described 4K copies for Dolby Vision
 
 "Essential" was defined as resolution and audio, which a provider can supply.
