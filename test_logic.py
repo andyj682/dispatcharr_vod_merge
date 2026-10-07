@@ -21,6 +21,7 @@ import ast
 import json
 import os
 import tempfile
+import threading
 from datetime import datetime, timedelta, timezone as _tz
 
 import patch
@@ -2215,7 +2216,7 @@ class ProbeCallSiteTests(unittest.TestCase):
 
     def test_the_probe_loop_checks_the_heartbeat(self):
         loops = [n for n in ast.walk(self._fn("probe_movies_impl"))
-                 if isinstance(n, ast.For) and getattr(n.iter, "id", None) == "chosen"]
+                 if isinstance(n, ast.For) and getattr(n.iter, "id", None) == "rels"]
         self.assertEqual(len(loops), 1)
         self.assertIn("heartbeat", self._called_names(loops[0]),
                       "the heartbeat must be checked before each probe")
@@ -2306,10 +2307,10 @@ class LastProbeReportTests(unittest.TestCase):
         out = self._finished({
             "lookup": {"fetched": 25, "got_essentials": 4, "errors": 1},
             "measure": {"probed": 3, "gained": 3, "errors": 2}})
-        self.assertIn("finished 2030-01-02 03:04 UTC", out)
-        self.assertIn("looked up 25 (gained 4)", out)
-        self.assertIn("measured 3 (gained 3)", out)
-        self.assertIn("errors 3", out)          # summed across both steps
+        self.assertIn("last run 01-02 03:04 UTC", out)
+        self.assertIn("+4 lookup", out)
+        self.assertIn("+3 measured", out)
+        self.assertIn("3 errors", out)          # summed across both steps
         self.assertEqual(len(out.splitlines()), 1)
 
     def test_measuring_off_is_said(self):
@@ -2374,10 +2375,36 @@ class EnrichStatusMessageTests(unittest.TestCase):
 
     def test_carries_the_numbers_that_matter(self):
         out = self._fmt(self._st())
-        for needle in ("need measuring 30", "(10 runs)", "need lookup 50",
-                       "have video+audio 20", "finished 2030-01-02 03:04 UTC",
-                       "Provider0 30/20/25"):
+        for needle in ("measure 30", "lookup 50", "done 20",
+                       "last run 01-02 03:04 UTC", "10 movies, 100 copies",
+                       "Provider0 20/25"):
             self.assertIn(needle, out)
+
+    def test_a_full_scale_status_fits_the_popup(self):
+        # The popup shows a fixed number of characters and cuts the rest from
+        # BOTH ends; a full wanted set overflowed it twice. Budget a realistic
+        # worst case: four providers, five-digit counts, a nightly run.
+        import plugin as plugin_mod
+        st = dict(self._st(4), movies=12345, relations=99999, have_essentials=99999,
+                  need_fetch=99999, need_measure=99999, need_dv_check=999, nights=99)
+        st["per_account"] = {"Provider%d" % i: {"need": 99999, "measure": 99999,
+                                                 "not_describing": i % 2 == 0}
+                             for i in range(4)}
+        st["last_enrich_run"] = {
+            "state": "finished", "nightly": True,
+            "finished_at": "2030-01-02T03:04:05+00:00",
+            "result": {"batches": 999, "ended": "time limit reached",
+                       "lookup": {"got_essentials": 9999, "errors": 99},
+                       "measure": {"gained": 9999, "dv_found": 999,
+                                   "dv_no_fallback": 99, "errors": 99}}}
+        out = plugin_mod._format_enrich_status(st)
+        self.assertLessEqual(len(out), 400, out)
+
+    def test_unresolved_is_mentioned_only_when_there_is_some(self):
+        import plugin as plugin_mod
+        self.assertNotIn("unresolved", plugin_mod._format_enrich_status(self._st()))
+        self.assertIn("2 unresolved", plugin_mod._format_enrich_status(
+            dict(self._st(), unid_resolved=2)))
 
     def test_off_is_said_first(self):
         self.assertTrue(self._fmt(self._st(on=False)).startswith("ENRICHMENT IS OFF"))
@@ -2455,7 +2482,7 @@ class BusyProviderTests(unittest.TestCase):
         fn = next(n for n in ast.walk(tree)
                   if isinstance(n, ast.FunctionDef) and n.name == "probe_movies_impl")
         return fn, next(n for n in ast.walk(fn)
-                        if isinstance(n, ast.For) and getattr(n.iter, "id", None) == "chosen")
+                        if isinstance(n, ast.For) and getattr(n.iter, "id", None) == "rels")
 
     def test_busy_is_checked_before_every_probe(self):
         # Per probe, not per run: playback can start at any moment.
@@ -2721,25 +2748,53 @@ class NightlyScheduleTests(unittest.TestCase):
         cfg.update(kw)
         return cfg
 
-    def test_nights_estimate(self):
-        # 3600 lookups at 1s = one hour = one night of 60 minutes.
-        self.assertEqual(patch.estimate_nights(3600, 0, self._cfg()), 1)
-        self.assertEqual(patch.estimate_nights(3601, 0, self._cfg()), 2)
-        self.assertEqual(patch.estimate_nights(0, 600, self._cfg()), 1)
-        self.assertEqual(patch.estimate_nights(0, 0, self._cfg()), 0)
+    def _n(self, per_account, **kw):
+        return patch.estimate_nights(per_account, self._cfg(**kw))
+
+    def test_lookups_add_up(self):
+        # 3600 lookups at 1s, all of them filling their copy: one 60-minute night.
+        full = {"answered": 100, "full": 100}
+        self.assertEqual(self._n({"A": dict(full, need=3600)}), 1)
+        self.assertEqual(self._n({"A": dict(full, need=3601)}), 2)
+        self.assertEqual(self._n({"A": dict(full, need=0)}), 0)
+
+    def test_measuring_runs_side_by_side(self):
+        # Two providers with an hour of measuring each take ONE hour, not two:
+        # the busiest lane sets the pace.
+        one_hour = 3600 // int(patch.PROBE_EST_S)
+        self.assertEqual(self._n({"A": {"measure": one_hour},
+                                  "B": {"measure": one_hour}}), 1)
+        self.assertEqual(self._n({"A": {"measure": one_hour + 1},
+                                  "B": {"measure": 1}}), 2)
+
+    def test_future_measuring_is_projected_from_each_accounts_yield(self):
+        # 100 lookups that will fill nothing also mean 100 measurements later.
+        never = {"need": 100, "answered": 100, "full": 0}
+        always = {"need": 100, "answered": 100, "full": 100}
+        ten_min = dict(enrich_minutes=10)
+        self.assertEqual(self._n({"A": never}, **ten_min), 2)
+        self.assertEqual(self._n({"A": always}, **ten_min), 1)
+        self.assertAlmostEqual(patch.projected_measures(
+            {"need": 100, "answered": 100, "full": 25}), 75)
+
+    def test_a_small_sample_assumes_the_worst(self):
+        lucky = {"need": 100, "answered": patch.YIELD_SAMPLE - 1,
+                 "full": patch.YIELD_SAMPLE - 1}
+        self.assertEqual(patch.projected_measures(lucky), 100)
+
+    def test_waiting_and_4k_checks_count(self):
+        self.assertEqual(patch.projected_measures({"measure": 3, "dv": 4}), 7)
 
     def test_measuring_off_adds_nothing(self):
-        self.assertEqual(patch.estimate_nights(
-            0, 10 ** 6, self._cfg(probe_movies=False)), 0)
+        self.assertEqual(self._n({"A": {"measure": 10 ** 6}}, probe_movies=False), 0)
 
     def test_no_estimate_when_nightly_is_off(self):
-        self.assertIsNone(patch.estimate_nights(10, 10, self._cfg(enrich_nightly=False)))
+        self.assertIsNone(self._n({"A": {"need": 10}}, enrich_nightly=False))
 
     def test_spacing_counts(self):
-        self.assertEqual(patch.estimate_nights(
-            1800, 0, self._cfg(enrich_delay_ms=1000)), 1)
-        self.assertEqual(patch.estimate_nights(
-            1801, 0, self._cfg(enrich_delay_ms=1000)), 2)
+        full = {"answered": 100, "full": 100}
+        self.assertEqual(self._n({"A": dict(full, need=1800)}, enrich_delay_ms=1000), 1)
+        self.assertEqual(self._n({"A": dict(full, need=1801)}, enrich_delay_ms=1000), 2)
 
     def test_time_limit_setting_is_bounded_and_never_unlimited(self):
         f = patch._enrich_minutes
@@ -2808,19 +2863,19 @@ class NightlyScheduleTests(unittest.TestCase):
             "result": {"lookup": {"fetched": 40, "got_essentials": 9},
                        "measure": {"probed": 12, "gained": 11},
                        "batches": 5, "ended": "time limit reached"}})
-        self.assertIn("last nightly run finished 2030-01-02 03:04 UTC "
-                      "(5 batches, time limit reached)", out)
+        self.assertIn("last nightly 01-02 03:04 UTC, 5 batches, "
+                      "time limit reached: +9 lookup, +11 measured", out)
         self.assertEqual(len(out.splitlines()), 1)
 
     def test_status_shows_the_nights_estimate_only_when_there_is_one(self):
         import plugin as plugin_mod
         base = EnrichStatusMessageTests()._st()
-        self.assertIn("nightly: ~4 nights",
+        self.assertIn("| ~4 nights\n",
                       plugin_mod._format_enrich_status(dict(base, nights=4)))
-        self.assertIn("nightly: ~1 night\n",
+        self.assertIn("| ~1 night\n",
                       plugin_mod._format_enrich_status(dict(base, nights=1)))
         for none in (None, 0):
-            self.assertNotIn("nightly:",
+            self.assertNotIn(" night",
                              plugin_mod._format_enrich_status(dict(base, nights=none)))
 
     def test_the_probe_pass_honors_the_skip_list(self):
@@ -2945,21 +3000,22 @@ class DolbyVisionCheckTests(unittest.TestCase):
         src = ast.unparse(self._fn("enrich_status"))
         self.assertRegex(src, r"cfg\['probe_movies'\] and cfg\['probe_4k_dv'\] and "
                               r"decide_dv_check\(props, now_iso\)\[0\]")
-        self.assertIn("estimate_nights(todo, measure + dv_checks, cfg)", src)
+        self.assertIn("slot['dv'] += 1", src)
+        self.assertIn("estimate_nights(per_account, cfg)", src)
 
     def test_status_text(self):
         import plugin as plugin_mod
         base = EnrichStatusMessageTests()._st()
-        self.assertIn("need measuring 30 + 5 4K DV checks (10 runs)",
+        self.assertIn("measure 30 + 5 DV checks",
                       plugin_mod._format_enrich_status(dict(base, need_dv_check=5)))
-        self.assertIn("need measuring 30 (10 runs)",
-                      plugin_mod._format_enrich_status(dict(base, need_dv_check=0)))
+        self.assertNotIn("DV checks",
+                         plugin_mod._format_enrich_status(dict(base, need_dv_check=0)))
         out = plugin_mod._format_last_run({
             "state": "finished", "finished_at": "2030-01-02T03:04:05+00:00",
             "result": {"lookup": {"fetched": 1},
                        "measure": {"probed": 6, "gained": 4, "dv_checked": 2,
                                    "dv_found": 1, "dv_no_fallback": 1}}})
-        self.assertIn("4K DV checks 2, DV found 1 (no fallback 1)", out)
+        self.assertIn("DV 1 (1 no-fallback)", out)
         quiet = plugin_mod._format_last_run({
             "state": "finished", "finished_at": "2030-01-02T03:04:05+00:00",
             "result": {"lookup": {"fetched": 1},
@@ -2990,7 +3046,7 @@ class DolbyVisionCheckTests(unittest.TestCase):
     def test_the_probe_loop_tallies_every_measurement(self):
         fn = self._fn("probe_movies_impl")
         loop = next(n for n in ast.walk(fn)
-                    if isinstance(n, ast.For) and getattr(n.iter, "id", None) == "chosen")
+                    if isinstance(n, ast.For) and getattr(n.iter, "id", None) == "rels")
         self.assertIn("note_dv(stats, parsed, rel.id in dv_ids)", ast.unparse(loop))
 
     def test_nightly_totals_carry_dv_counts(self):
@@ -3248,8 +3304,243 @@ class ProviderDownTests(unittest.TestCase):
             "state": "finished", "finished_at": "2030-01-02T03:04:05+00:00",
             "result": {"lookup": {"fetched": 3, "down": ["P1"], "broken": ["P2"]},
                        "measure": {"probed": 1, "down": ["P1", "P3"]}}})
-        self.assertIn("skipped P1, P3 (not answering)", out)
-        self.assertIn("stopped looking up P2", out)
+        self.assertIn("not answering: P1, P3", out)
+        self.assertIn("stopped looking up: P2", out)
+
+
+class ParallelLaneTests(unittest.TestCase):
+    """Measuring runs one lane per provider LOGIN. Each provider has its own
+    connection limit, so lanes side by side cost no provider more than before;
+    but two accounts on ONE login share its limit and must never overlap."""
+
+    class _Acct:
+        def __init__(self, aid, url, user):
+            self.id, self.server_url, self.username = aid, url, user
+
+    class _Rel:
+        def __init__(self, rid, acct):
+            self.id, self.m3u_account = rid, acct
+
+    def test_accounts_on_one_login_share_a_lane(self):
+        a = self._Acct(1, "http://Panel.example:8080/", "Me")
+        b = self._Acct(2, "https://panel.example", "me")
+        self.assertEqual(patch.provider_login(a), patch.provider_login(b))
+
+    def test_different_logins_get_different_lanes(self):
+        a = self._Acct(1, "http://panel.example", "me")
+        self.assertNotEqual(patch.provider_login(a),
+                            patch.provider_login(self._Acct(2, "http://panel.example", "you")))
+        self.assertNotEqual(patch.provider_login(a),
+                            patch.provider_login(self._Acct(3, "http://other.example", "me")))
+
+    def test_an_unreadable_login_keeps_the_account_alone(self):
+        a, b = self._Acct(1, "", ""), self._Acct(2, None, None)
+        self.assertNotEqual(patch.provider_login(a), patch.provider_login(b))
+
+    def test_lanes_keep_each_providers_order(self):
+        p = self._Acct(1, "http://p.example", "u")
+        q = self._Acct(2, "http://q.example", "u")
+        rels = [self._Rel(i, acct) for i, acct in enumerate([p, q, p, q, p])]
+        lanes = patch.group_by_login(rels)
+        self.assertEqual([[r.id for r in v] for v in lanes.values()], [[0, 2, 4], [1, 3]])
+
+    def test_lanes_really_run_side_by_side(self):
+        # Each lane waits for the other at a barrier: run one after another,
+        # the first would time out and the result would be missing.
+        barrier = threading.Barrier(2, timeout=5)
+        met = []
+
+        def work(key, items):
+            barrier.wait()
+            met.append(key)
+
+        patch.run_lanes({"a": [1], "b": [2]}, work, close_db=False)
+        self.assertEqual(sorted(met), ["a", "b"])
+
+    def test_a_failing_lane_does_not_stop_the_others(self):
+        done = []
+
+        def work(key, items):
+            if key == "bad":
+                raise RuntimeError("lane blew up")
+            done.extend(items)
+
+        # A thread's exception never reaches the others anyway; what the
+        # wrapper must guarantee is that the failure is LOGGED (and the
+        # thread's DB connection closed) rather than lost to stderr.
+        with self.assertLogs(patch.logger, level="ERROR") as logs:
+            patch.run_lanes({"bad": [0], "ok": [1, 2]}, work, close_db=False)
+        self.assertEqual(done, [1, 2])
+        self.assertTrue(any("probe lane 'bad' failed" in m for m in logs.output))
+
+    def _fn(self, name):
+        tree = ast.parse(open(patch.__file__, encoding="utf-8").read())
+        return next(n for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef) and n.name == name)
+
+    def _lane_src(self):
+        return ast.unparse(self._fn("probe_lane"))
+
+    def test_a_failed_probe_is_held_not_stamped(self):
+        # The probe-side twin of the lookup rule: a failure is only recorded
+        # once we know it was the stream and not the whole provider.
+        lane = self._fn("probe_lane")
+        stamps = [n for n in ast.walk(lane) if isinstance(n, ast.If)
+                  and "_stamp_own(props, probe=" in ast.unparse(n)
+                  and isinstance(n.test, ast.Compare)]
+        tests = {ast.unparse(n.test) for n in stamps}
+        self.assertIn("outcome != 'error'", tests,
+                      "the probe record must be written only for answered probes")
+        errs = [n for n in ast.walk(lane) if isinstance(n, ast.If)
+                and ast.unparse(n.test) == "outcome == 'error'"]
+        self.assertEqual(len(errs), 1)
+        body = ast.unparse(ast.Module(body=errs[0].body, type_ignores=[]))
+        self.assertIn("deferred_errors.setdefault(name, []).append(rel)", body)
+        self.assertNotIn("_stamp_own", body)
+
+    def test_the_probe_breaker_trips_and_is_recorded(self):
+        lane = self._fn("probe_lane")
+        trips = [n for n in ast.walk(lane) if isinstance(n, ast.If)
+                 and ast.unparse(n.test) == "consecutive[name] >= PROBE_BREAKER"]
+        self.assertEqual(len(trips), 1)
+        body = ast.unparse(ast.Module(body=trips[0].body, type_ignores=[]))
+        self.assertIn("stats['broken'].append(name)", body)
+        self.assertIn("stats.setdefault('broken_ids', []).append(", body)
+        self.assertTrue(1 < patch.PROBE_BREAKER <= 5)
+
+    def test_one_lane_stopping_stops_them_all(self):
+        # Every lane checks the shared stop flag before each probe, so a time
+        # limit or lost lock seen by one lane halts the others promptly.
+        loop = next(n for n in ast.walk(self._fn("probe_lane"))
+                    if isinstance(n, ast.For))
+        first_with = next(s for s in loop.body if isinstance(s, ast.With))
+        self.assertIn("if stats.get('stopped'):\n    return",
+                      ast.unparse(ast.Module(body=first_with.body, type_ignores=[])))
+
+    def test_measuring_runs_in_login_lanes(self):
+        self.assertIn("run_lanes(group_by_login(chosen), probe_lane)",
+                      ast.unparse(self._fn("probe_movies_impl")))
+
+    def test_every_shared_counter_is_touched_under_the_lock(self):
+        lane = self._fn("probe_lane")
+        parents = {}
+        for node in ast.walk(lane):
+            for child in ast.iter_child_nodes(node):
+                parents[child] = node
+
+        def under_lock(node):
+            while node in parents:
+                node = parents[node]
+                if isinstance(node, ast.With) and any(
+                        ast.unparse(i.context_expr) == "lock" for i in node.items):
+                    return True
+            return False
+
+        shared = ("stats", "slot", "consecutive", "deferred_errors", "per_account")
+        writes = []
+        for node in ast.walk(lane):
+            if isinstance(node, (ast.AugAssign, ast.Assign)):
+                targets = [node.target] if isinstance(node, ast.AugAssign) else node.targets
+                if any(ast.unparse(t).startswith(shared) for t in targets):
+                    writes.append(node)
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                owner = ast.unparse(node.func.value)
+                if owner.startswith(shared) and node.func.attr in (
+                        "append", "setdefault", "update"):
+                    writes.append(node)
+                if ast.unparse(node.func) == "note_dv" or ast.unparse(node) .startswith("note_dv("):
+                    writes.append(node)
+            elif isinstance(node, ast.Call) and getattr(node.func, "id", None) == "note_dv":
+                writes.append(node)
+        self.assertTrue(writes)
+        loose = [ast.unparse(w)[:60] for w in writes if not under_lock(w)]
+        self.assertEqual(loose, [], "shared state touched outside the lock")
+
+
+class LearnedLookupSkipTests(unittest.TestCase):
+    """An account whose lookups have never returned video and audio, over a
+    real sample, stops being looked up: its copies go straight to measuring.
+    Learned from what each account returns, so it names no provider."""
+
+    def _props(self, got):
+        return {patch.OWN_PROPS_KEY: {"enrich": {"at": NOW.isoformat(), "got": got}}}
+
+    def test_only_real_answers_are_counted(self):
+        y = {}
+        for got in ("full", "partial", "none", "error", "skipped"):
+            patch.tally_lookup_yield(y, 1, self._props(got))
+        patch.tally_lookup_yield(y, 1, {})               # never looked up
+        self.assertEqual(y, {1: [3, 1]})
+
+    def test_the_threshold(self):
+        n = patch.LEARN_AFTER
+        self.assertEqual(patch.non_describing({1: [n - 1, 0]}), set())
+        self.assertEqual(patch.non_describing({1: [n, 0]}), {1})
+
+    def test_describing_even_once_disqualifies(self):
+        self.assertEqual(patch.non_describing({1: [10 ** 4, 1]}), set())
+
+    def test_a_skipped_lookup_counts_as_done_and_sends_the_copy_to_measuring(self):
+        props = self._props("skipped")
+        self.assertFalse(patch.decide_enrich(props, NOW.isoformat())[0])
+        self.assertTrue(patch.decide_probe(props, NOW.isoformat())[0])
+
+    def test_marking_nothing_touches_nothing(self):
+        self.assertEqual(patch.mark_lookup_skipped([], NOW.isoformat()), 0)
+
+    def _fn(self, name):
+        tree = ast.parse(open(patch.__file__, encoding="utf-8").read())
+        return next(n for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef) and n.name == name)
+
+    def test_the_mark_is_a_skip_in_the_lookup_key(self):
+        src = ast.unparse(self._fn("mark_lookup_skipped"))
+        self.assertIn("_stamp_own(props, enrich={'at': now_iso, 'got': 'skipped'})", src)
+
+    def test_every_candidate_is_counted_and_silent_accounts_leave_before_batching(self):
+        fn = self._fn("enrich_movies_impl")
+        src = ast.unparse(fn)
+        # Counted BEFORE the fetch decision, so copies that need no lookup
+        # still teach us about their account.
+        self.assertRegex(src, r"tally_lookup_yield\(yields, rel\.m3u_account_id, props\)\s*"
+                              r"should, _why = decide_enrich\(props, now_iso\)")
+        lines = {ast.unparse(c): c.lineno for c in ast.walk(fn) if isinstance(c, ast.Call)}
+        drop = lines["without_accounts(per_movie, silent)"]
+        take = next(v for k, v in lines.items() if k.startswith("take_whole_movies("))
+        self.assertLess(drop, take)
+        self.assertIn("mark_lookup_skipped(marked, now_iso)", src)
+
+    def test_status_moves_silent_lookups_to_measuring(self):
+        src = ast.unparse(self._fn("enrich_status"))
+        self.assertIn("slot['measure'] += slot['need']", src)
+        self.assertIn("slot['need'] = 0", src)
+        self.assertIn("silent = non_describing(yields)", src)
+
+    def test_status_marks_silent_accounts(self):
+        import plugin as plugin_mod
+        st = EnrichStatusMessageTests()._st()
+        st["per_account"]["Provider1"]["not_describing"] = True
+        out = plugin_mod._format_enrich_status(st)
+        self.assertIn("Provider1* 20/25", out)
+        self.assertNotIn("*", plugin_mod._format_enrich_status(
+            EnrichStatusMessageTests()._st()).split("left lookup/measure:")[-1])
+
+    def test_last_run_reports_skipped_lookups(self):
+        import plugin as plugin_mod
+        out = plugin_mod._format_last_run({
+            "state": "finished", "finished_at": "2030-01-02T03:04:05+00:00",
+            "result": {"lookup": {"fetched": 0, "lookup_skipped": 400,
+                                  "not_describing": ["P"]},
+                       "measure": {"probed": 25, "gained": 25}}})
+        self.assertIn("lookups now skipped: P", out)
+
+    def test_nightly_totals_carry_skips(self):
+        it = iter([{"lookup": {"fetched": 1, "lookup_skipped": 400,
+                               "not_describing": ["P"]}},
+                   {"lookup": {}}])
+        tot = patch.run_batches(lambda skip: next(it), lambda: True)
+        self.assertEqual(tot["lookup"]["lookup_skipped"], 400)
+        self.assertEqual(tot["lookup"]["not_describing"], ["P"])
 
 
 class ManifestParityTests(unittest.TestCase):

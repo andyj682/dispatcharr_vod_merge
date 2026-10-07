@@ -7,6 +7,39 @@ Everything through 0.8.3 landed during initial development against a single
 large live library; the entries below record *why* each change was needed, since
 several were driven by failures that were invisible from the outside.
 
+## 1.5.8 — 2026-10-06
+
+**Changed — much faster enrichment on a large wanted set**
+
+- **Providers are measured side by side.** Measuring — most of a night's work —
+  ran one copy at a time across every provider. Each provider now gets its own
+  lane, measured one copy at a time with its own spacing, so no provider sees
+  more than one measurement at once, exactly as before. Lanes follow the
+  provider login, so accounts sharing one login never overlap. Busy,
+  not-answering and breaker checks still apply per provider. **Ffprobe lookups
+  per run** is the total across lanes; raise it to give each lane more per
+  batch.
+
+- **Lookups stop for an account that never answers them.** After 50 answered
+  lookups from an account with none carrying video and audio, its remaining
+  copies are marked as looked up without a request and go straight to
+  measuring. Learned per account from what it returns, so an account that
+  describes some of its copies is unaffected.
+
+- **The nights estimate is realistic.** It projects future measuring from each
+  account's own lookup results and times measuring by the busiest provider.
+  Previously it counted only measurable copies — none, on a fresh wanted set —
+  and reported a few nights for a backlog of weeks.
+
+- **Enrichment status is about half the length.** The popup shows a fixed
+  number of characters and cuts the rest from both ends, and with a full
+  wanted set the status no longer fit. It is now four short lines — totals,
+  what is left (with the nights estimate), the last run, and what is left per
+  provider (`left lookup/measure`, with `*` marking accounts whose lookups are
+  skipped). The resolution breakdown appears only when something did not
+  resolve, and the per-step run counts are gone. The full breakdown is still
+  in the run record and the log.
+
 ## 1.5.7 — 2026-10-06
 
 **Added — enrichment skips a provider that is not answering**

@@ -98,91 +98,93 @@ def _short_time(iso):
     return iso[:16].replace("T", " ") + suffix
 
 
-def _format_enrich_status(st):
-    """Enrichment status in a few dense lines, most important first.
+def _short_day(iso):
+    """'2030-01-02T03:04:05+00:00' -> '01-02 03:04 UTC' -- the year adds nothing
+    to a line about last night, and the popup counts every character."""
+    full = _short_time(iso)
+    return full[5:] if len(full) > 5 and full[4] == "-" else full
 
-    The popup does not scroll, and the first version of this ran well past it.
-    Per-provider detail goes last, on ONE line, because it is what grows with
-    the number of accounts.
+
+def _format_enrich_status(st):
+    """Enrichment status in four short lines, most important first.
+
+    The popup shows a fixed number of characters and cuts the rest -- from the
+    start AND the end -- so length is the constraint, not line count. Totals
+    first, then what is left, the last run, and per-provider detail last
+    because it grows with the number of accounts. The full breakdown is in the
+    run record and the log.
     """
     per = " | ".join(
-        f"{a} {v['relations']}/{v['need']}/{v['measure']}"
+        f"{a}{'*' if v.get('not_describing') else ''} {v['need']}/{v['measure']}"
         for a, v in sorted(st.get("per_account", {}).items()))
+    unresolved = ((st.get("tmdb_total", 0) - st.get("tmdb_resolved", 0))
+                  + (st.get("unid_total", 0) - st.get("unid_resolved", 0)))
+    nights = st.get("nights")
     return (
         ("" if st.get("enrich_movies") else "ENRICHMENT IS OFF\n")
-        + f"wanted: {st['movies']} movies (TMDB {st['tmdb_resolved']}/"
-        f"{st['tmdb_total']}, unidentified {st['unid_resolved']}/"
-        f"{st['unid_total']}), {st['relations']} copies, set from "
-        f"{_short_time(st.get('generated_at'))}\n"
-        f"have video+audio {st['have_essentials']} | need lookup "
-        f"{st['need_fetch']} ({st['runs_at_current_limit']} runs) | need "
-        f"measuring {st['need_measure']}"
-        + (f" + {st['need_dv_check']} 4K DV checks"
-           if st.get("need_dv_check") else "")
-        + f" ({st['measure_runs_at_current_limit']} runs)"
-        + (f" | nightly: ~{st['nights']} night{'' if st['nights'] == 1 else 's'}"
-           if st.get("nights") else "")
+        + f"{st['movies']} movies, {st['relations']} copies"
+        + (f", {unresolved} unresolved" if unresolved else "")
+        + f" (set {_short_time(st.get('generated_at'))})\n"
+        + f"done {st['have_essentials']} | lookup {st['need_fetch']} | "
+        f"measure {st['need_measure']}"
+        + (f" + {st['need_dv_check']} DV checks" if st.get("need_dv_check") else "")
+        + (f" | ~{nights} night{'' if nights == 1 else 's'}" if nights else "")
         + "\n"
         + _format_last_run(st.get("last_enrich_run"))
-        + (f"\ncopies/lookup/measure: {per}" if per else "")
+        + (f"\nleft lookup/measure: {per}" if per else "")
     )
 
 
 def _format_last_run(lp):
-    """One line (two if something stopped early) on the last enrichment run."""
+    """One line on the last enrichment run; anything unusual is appended to it
+    rather than given a line of its own."""
     if not lp:
         return "last run: none yet"
     state = lp.get("state")
-    kind = "nightly run" if lp.get("nightly") else "run"
+    kind = "nightly" if lp.get("nightly") else "run"
     if state == "running":
-        return (f"enrichment {kind} IN PROGRESS, started "
-                f"{_short_time(lp.get('started_at'))}")
-    when = _short_time(lp.get("finished_at") or lp.get("started_at"))
+        return f"{kind} IN PROGRESS since {_short_day(lp.get('started_at'))}"
+    when = _short_day(lp.get("finished_at") or lp.get("started_at"))
     if state != "finished":
-        return f"last {kind} {state} at {when}" + (
-            f" -- {lp['error']}" if lp.get("error") else "")
+        return f"last {kind} {state} {when}" + (
+            f": {lp['error']}" if lp.get("error") else "")
     res = lp.get("result") or {}
     look = res.get("lookup") or {}
     if look.get("aborted"):
-        return f"last {kind} finished {when}: nothing done -- {look['aborted']}"
-    # A nightly run says how far it got and why it ended, on the same line --
-    # "time limit reached" is the normal end of a night with a backlog.
-    how = (f" ({res.get('batches', 0)} batches, {res['ended']})"
+        return f"last {kind} {when}: nothing done -- {look['aborted']}"
+    # A nightly run says how far it got and why it ended -- "time limit" is
+    # the normal end of a night with a backlog.
+    how = (f", {res.get('batches', 0)} batches, {res['ended']}"
            if res.get("ended") else "")
-    line = (f"last {kind} finished {when}{how}: looked up {look.get('fetched', 0)} "
-            f"(gained {look.get('got_essentials', 0)})")
+    parts = [f"+{look.get('got_essentials', 0)} lookup"]
     meas = res.get("measure")
     if meas is None:
-        line += ", measuring off"
+        parts.append("measuring off")
     elif meas.get("aborted"):
-        line += f", measuring skipped -- {meas['aborted']}"
+        parts.append(f"measuring skipped: {meas['aborted']}")
     else:
-        line += (f", measured {meas.get('probed', 0)} "
-                 f"(gained {meas.get('gained', 0)})")
-        if meas.get("dv_checked"):
-            line += f", 4K DV checks {meas['dv_checked']}"
+        parts.append(f"+{meas.get('gained', 0)} measured")
         if meas.get("dv_found"):
-            line += (f", DV found {meas['dv_found']} "
-                     f"(no fallback {meas.get('dv_no_fallback', 0)})")
+            parts.append(f"DV {meas['dv_found']} "
+                         f"({meas.get('dv_no_fallback', 0)} no-fallback)")
     errors = look.get("errors", 0) + ((meas or {}).get("errors", 0))
-    line += f", errors {errors}"
-    notes = []
+    parts.append(f"{errors} errors")
     down = sorted(set(look.get("down") or ()) | set((meas or {}).get("down") or ()))
     if down:
-        notes.append("skipped " + ", ".join(down) + " (not answering)")
+        parts.append("not answering: " + ", ".join(down))
     if look.get("broken"):
-        notes.append("stopped looking up " + ", ".join(look["broken"])
-                     + " (stopped answering; nothing recorded)")
+        parts.append("stopped looking up: " + ", ".join(look["broken"]))
+    if look.get("lookup_skipped"):
+        parts.append("lookups now skipped: "
+                     + ", ".join(look.get("not_describing") or ["?"]))
     if (meas or {}).get("busy"):
-        notes.append("did not measure " + ", ".join(meas["busy"])
-                     + " (busy with playback)")
+        parts.append("busy: " + ", ".join(meas["busy"]))
     if (meas or {}).get("broken"):
-        notes.append("stopped measuring " + ", ".join(meas["broken"])
-                     + " (not answering; nothing recorded)")
+        parts.append("stopped measuring: " + ", ".join(meas["broken"]))
     stopped = look.get("stopped") or (meas or {}).get("stopped")
-    if stopped:
-        notes.append(f"stopped: {stopped}")
-    return line + ("\n   " + "; ".join(notes) if notes else "")
+    if stopped and stopped != res.get("ended"):
+        parts.append(f"stopped: {stopped}")
+    return f"last {kind} {when}{how}: " + ", ".join(parts)
 
 
 def _format_whatif(rep):
@@ -234,7 +236,7 @@ def _format_log(data, limit=60):
 class Plugin:
     # UI title only; "Dispatcharr" is redundant inside the Dispatcharr UI.
     name = "VOD Merge & Enrich"
-    version = "1.5.7"
+    version = "1.5.8"
     description = (
         "Merges duplicate VOD titles from providers that omit TMDB ids, by "
         "matching other details to an existing title. Adds video and audio specs "

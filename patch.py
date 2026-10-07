@@ -2228,35 +2228,55 @@ def enrich_status(cfg=None):
     out["movies"] = len(ids)
 
     now_iso = timezone.now().isoformat()
-    todo = have = attempted = measure = dv_checks = 0
+    have = attempted = 0
     per_account = {}
+    yields = {}
+    ids_by_name = {}
     for rel in enrich_candidates(ids).iterator(chunk_size=500):
         props = rel.custom_properties or {}
         name = rel.m3u_account.name
+        ids_by_name[name] = rel.m3u_account_id
+        tally_lookup_yield(yields, rel.m3u_account_id, props)
         slot = per_account.setdefault(name, {"relations": 0, "need": 0,
-                                             "measure": 0})
+                                             "measure": 0, "dv": 0})
         slot["relations"] += 1
         if relation_has_essentials(props):
             have += 1
             if (cfg["probe_movies"] and cfg["probe_4k_dv"]
                     and decide_dv_check(props, now_iso)[0]):
-                dv_checks += 1
+                slot["dv"] += 1
             continue
-        # The same decision a run makes when measuring, so this is its backlog
-        # exactly rather than an estimate of it.
+        # The same decisions a run makes, so this is its backlog exactly
+        # rather than an estimate of it.
         if decide_probe(props, now_iso)[0]:
-            measure += 1
             slot["measure"] += 1
         should, _ = decide_enrich(props, now_iso)
         if should:
-            todo += 1
             slot["need"] += 1
         else:
             attempted += 1
-    out.update({"relations": have + todo + attempted, "have_essentials": have,
+
+    # The next run will mark lookups as done for accounts that never describe
+    # their copies, sending them straight to measuring -- so say so now rather
+    # than report a lookup backlog that is not going to happen.
+    silent = non_describing(yields)
+    for name, slot in per_account.items():
+        answered, full = yields.get(ids_by_name.get(name), (0, 0))
+        slot["answered"], slot["full"] = answered, full
+        if ids_by_name.get(name) in silent:
+            slot["measure"] += slot["need"]
+            slot["need"] = 0
+            slot["not_describing"] = True
+    todo = sum(v["need"] for v in per_account.values())
+    measure = sum(v["measure"] for v in per_account.values())
+    dv_checks = sum(v["dv"] for v in per_account.values())
+    out.update({"relations": sum(v["relations"] for v in per_account.values()),
+                "have_essentials": have,
                 "need_fetch": todo, "already_attempted": attempted,
                 "need_measure": measure,
                 "per_account": per_account,
+                "not_describing": sorted(n for n, v in per_account.items()
+                                         if v.get("not_describing")),
                 "runs_at_current_limit": (
                     0 if not cfg["enrich_limit"]
                     else -(-todo // cfg["enrich_limit"])),
@@ -2266,7 +2286,7 @@ def enrich_status(cfg=None):
                     else -(-(measure + dv_checks) // cfg["probe_limit"])),
                 # Disclosure, not a guard: a big wanted set is legitimate, but
                 # how many nights it takes should never be a surprise.
-                "nights": estimate_nights(todo, measure + dv_checks, cfg)})
+                "nights": estimate_nights(per_account, cfg)})
     return out
 
 
@@ -2318,6 +2338,52 @@ def _account_panel_answers(account):
         logger.warning("[VOD-MERGE] %r is not answering (%s) -- skipping it "
                        "for this batch", getattr(account, "name", account), why)
     return ok
+
+
+# Lookups to see from an account before concluding it never describes its
+# copies. Big enough that an account describing even a few percent will have
+# shown it; small next to a real wanted set, so the saving arrives early.
+LEARN_AFTER = 50
+
+
+def tally_lookup_yield(yields, account_id, props):
+    """Pure. Count one copy's answered lookup into {account: [answered, full]}.
+    Only real answers count; an error or a skip says nothing about the account."""
+    own = (props or {}).get(OWN_PROPS_KEY)
+    mark = own.get("enrich") if isinstance(own, dict) else None
+    got = mark.get("got") if isinstance(mark, dict) else None
+    if got not in ("full", "partial", "none"):
+        return yields
+    slot = yields.setdefault(account_id, [0, 0])
+    slot[0] += 1
+    if got == "full":
+        slot[1] += 1
+    return yields
+
+
+def non_describing(yields, threshold=LEARN_AFTER):
+    """Pure. Accounts with at least `threshold` answered lookups, none of which
+    returned video and audio."""
+    return {aid for aid, (answered, full) in yields.items()
+            if answered >= threshold and full == 0}
+
+
+def mark_lookup_skipped(rels, now_iso):
+    """Record a lookup as done -- 'skipped' -- without making it. -> count.
+
+    Same key and shape as a real attempt, so every rule downstream treats the
+    copy exactly as if its provider had answered with nothing: never looked up
+    again, and eligible for measuring.
+    """
+    for rel in rels:
+        props = rel.custom_properties or {}
+        _stamp_own(props, enrich={"at": now_iso, "got": "skipped"})
+        rel.custom_properties = props
+    if rels:
+        from apps.vod.models import M3UMovieRelation
+        M3UMovieRelation.objects.bulk_update(rels, ["custom_properties"],
+                                             batch_size=500)
+    return len(rels)
 
 
 def down_account_ids(groups):
@@ -2378,8 +2444,11 @@ def enrich_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=Non
     # Collect first, then take WHOLE movies, so a bounded run never leaves a
     # title half-measured. The scan is cheap next to the provider calls.
     per_movie = []
+    yields = {}
     for rel in enrich_candidates(movie_ids).iterator(chunk_size=500):
-        should, _why = decide_enrich(rel.custom_properties or {}, now_iso)
+        props = rel.custom_properties or {}
+        tally_lookup_yield(yields, rel.m3u_account_id, props)
+        should, _why = decide_enrich(props, now_iso)
         if not should:
             stats["skipped"] += 1
             continue
@@ -2387,6 +2456,20 @@ def enrich_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=Non
             per_movie[-1][1].append(rel)
         else:
             per_movie.append((rel.movie_id, [rel]))
+
+    # An account whose lookups have NEVER returned video and audio, over a
+    # meaningful sample, is not asked again: its remaining copies are marked
+    # as looked up -- without a request -- and go straight to measuring. A
+    # rule learned from what each account actually returns, so it names no
+    # provider and adapts to anyone's mix; an account that describes even some
+    # copies never qualifies.
+    silent = non_describing(yields)
+    if silent:
+        marked = [r for _m, rels in per_movie for r in rels
+                  if r.m3u_account_id in silent]
+        stats["lookup_skipped"] = mark_lookup_skipped(marked, now_iso)
+        stats["not_describing"] = account_names(per_movie, silent)
+        per_movie = without_accounts(per_movie, silent)
 
     # Providers that stopped answering earlier tonight are not asked again.
     per_movie = without_accounts(per_movie, set(skip_accounts or ()))
@@ -2930,6 +3013,59 @@ def _probe_profile(account, has_capacity):
         return None
 
 
+def provider_login(account):
+    """Pure. What a provider's connection limit is attached to: the login, not
+    the Dispatcharr account. Two accounts on one login share one limit."""
+    from urllib.parse import urlparse
+    try:
+        host = (urlparse(str(getattr(account, "server_url", "") or "")).hostname or "")
+    except Exception:
+        host = ""
+    user = str(getattr(account, "username", "") or "").strip().lower()
+    if host and user:
+        return (host.lower(), user)
+    # Cannot tell the login apart -- keep the account on a lane of its own,
+    # which is exactly what the old one-at-a-time behavior gave it.
+    return ("account", getattr(account, "id", id(account)))
+
+
+def group_by_login(rels):
+    """Pure. {login: [relations in their original order]}."""
+    lanes = {}
+    for rel in rels:
+        lanes.setdefault(provider_login(rel.m3u_account), []).append(rel)
+    return lanes
+
+
+def run_lanes(lanes, work, close_db=True):
+    """Run `work(key, items)` for every lane at once and wait for all of them.
+
+    A lane that raises is logged and does not take the others down. Each
+    thread closes its own database connection on the way out -- Django opens
+    one per thread, and a probe run must not leak them.
+    """
+    def runner(key, items):
+        try:
+            work(key, items)
+        except Exception:
+            logger.exception("[VOD-MERGE] probe lane %r failed", key)
+        finally:
+            if close_db:
+                try:
+                    from django.db import connection
+                    connection.close()
+                except Exception:
+                    pass
+
+    threads = [threading.Thread(target=runner, args=(k, v), daemon=True,
+                                name="vod-merge-probe-%d" % i)
+               for i, (k, v) in enumerate(lanes.items())]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+
 def probe_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=None):
     """Measure the wanted copies no provider would describe.
 
@@ -3021,88 +3157,108 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=None
     per_account = {}
     consecutive = {}
     deferred_errors = {}
+    lock = threading.Lock()
 
-    for rel in chosen:
-        account = rel.m3u_account
-        name = account.name
-        if name in stats["broken"] or name in stats["busy"]:
-            continue
-        if heartbeat is not None and not heartbeat():
-            stats["stopped"] = _stop_reason(heartbeat)
-            logger.info("[VOD-MERGE] stream probe stopped early -- %s",
-                        stats["stopped"])
-            break
-        # Checked before EVERY probe, not once per run: playback can start at
-        # any point. A busy account is left alone for the rest of the run and
-        # nothing is recorded against its copies -- they were not attempted.
-        profile = _probe_profile(account, has_capacity)
-        if profile is None:
-            stats["busy"].append(name)
-            logger.info("[VOD-MERGE] %r is busy with playback -- not probing "
-                        "it this run", name)
-            continue
-        slot = per_account.setdefault(
-            name, {"probed": 0, "gained": 0, "nothing": 0, "errors": 0})
+    def probe_lane(_login, rels):
+        """Probe one provider LOGIN's copies, one at a time. Lanes run side by
+        side; every shared counter below is touched only under `lock`."""
+        for rel in rels:
+            account = rel.m3u_account
+            name = account.name
+            with lock:
+                if stats.get("stopped"):
+                    return
+                if name in stats["broken"] or name in stats["busy"]:
+                    continue
+            if heartbeat is not None and not heartbeat():
+                with lock:
+                    stats.setdefault("stopped", _stop_reason(heartbeat))
+                logger.info("[VOD-MERGE] stream probe stopped early -- %s",
+                            stats["stopped"])
+                return
+            # Checked before EVERY probe, not once per run: playback can start
+            # at any point. A busy account is left alone for the rest of the run
+            # and nothing is recorded against its copies -- they were not tried.
+            profile = _probe_profile(account, has_capacity)
+            if profile is None:
+                with lock:
+                    stats["busy"].append(name)
+                logger.info("[VOD-MERGE] %r is busy with playback -- not probing "
+                            "it this run", name)
+                continue
 
-        try:
-            # Through the profile that was checked, so the connection we open
-            # is the one whose slot was free.
-            url = rel.get_stream_url(profile)
-        except Exception:
-            logger.exception("[VOD-MERGE] could not build stream URL rel=%s", rel.id)
-            url = None
-        if not url:
-            stats["no_url"] += 1
-            continue
+            try:
+                # Through the profile that was checked, so the connection we
+                # open is the one whose slot was free.
+                url = rel.get_stream_url(profile)
+            except Exception:
+                logger.exception("[VOD-MERGE] could not build stream URL rel=%s", rel.id)
+                url = None
+            if not url:
+                with lock:
+                    stats["no_url"] += 1
+                continue
 
-        try:
-            ua = account.get_user_agent_string()
-        except Exception:
-            ua = None
+            try:
+                ua = account.get_user_agent_string()
+            except Exception:
+                ua = None
 
-        rc, parsed = run_ffprobe(url, ua)
-        outcome = classify_probe(rc, parsed)
+            rc, parsed = run_ffprobe(url, ua)
+            outcome = classify_probe(rc, parsed)
 
-        if outcome == "error":
-            stats["errors"] += 1
-            slot["errors"] += 1
-            consecutive[name] = consecutive.get(name, 0) + 1
-            # Hold the stamp. Repeated failure against one account is a fact
-            # about the PROVIDER, not about each stream, and recording it per
-            # stream would put every queued copy into a week-long retry window
-            # because the provider had a bad hour.
-            deferred_errors.setdefault(name, []).append(rel)
-            if consecutive[name] >= PROBE_BREAKER:
-                stats["broken"].append(name)
-                stats.setdefault("broken_ids", []).append(rel.m3u_account_id)
-                logger.warning(
-                    "[VOD-MERGE] probe circuit breaker tripped for %r after %d "
-                    "consecutive failures -- abandoning it for this run and "
-                    "recording nothing against its streams", name, consecutive[name])
+            with lock:
+                slot = per_account.setdefault(
+                    name, {"probed": 0, "gained": 0, "nothing": 0, "errors": 0})
+                if outcome == "error":
+                    stats["errors"] += 1
+                    slot["errors"] += 1
+                    consecutive[name] = consecutive.get(name, 0) + 1
+                    # Hold the stamp. Repeated failure against one account is a
+                    # fact about the PROVIDER, not about each stream, and
+                    # recording it per stream would put every queued copy into
+                    # a week-long retry window because the provider had a bad
+                    # hour.
+                    deferred_errors.setdefault(name, []).append(rel)
+                    if consecutive[name] >= PROBE_BREAKER:
+                        stats["broken"].append(name)
+                        stats.setdefault("broken_ids", []).append(rel.m3u_account_id)
+                        logger.warning(
+                            "[VOD-MERGE] probe circuit breaker tripped for %r after "
+                            "%d consecutive failures -- abandoning it for this run "
+                            "and recording nothing against its streams",
+                            name, consecutive[name])
+                else:
+                    consecutive[name] = 0
+                    note_dv(stats, parsed, rel.id in dv_ids)
+                    if outcome == "full":
+                        stats["gained"] += 1
+                        slot["gained"] += 1
+                    else:
+                        stats["nothing"] += 1
+                        slot["nothing"] += 1
+                    stats["probed"] += 1
+                    slot["probed"] += 1
+
+            if outcome != "error":
+                props = rel.custom_properties or {}
+                if outcome == "full":
+                    props = store_probe(props, parsed)
+                _stamp_own(props, probe={"at": now_iso, "got": outcome})
+                rel.custom_properties = props
+                try:
+                    rel.save(update_fields=["custom_properties"])
+                except Exception:
+                    logger.exception("[VOD-MERGE] could not store probe for rel=%s", rel.id)
             if delay:
                 time.sleep(delay)
-            continue
 
-        consecutive[name] = 0
-        note_dv(stats, parsed, rel.id in dv_ids)
-        props = rel.custom_properties or {}
-        if outcome == "full":
-            props = store_probe(props, parsed)
-            stats["gained"] += 1
-            slot["gained"] += 1
-        else:
-            stats["nothing"] += 1
-            slot["nothing"] += 1
-        stats["probed"] += 1
-        slot["probed"] += 1
-        _stamp_own(props, probe={"at": now_iso, "got": outcome})
-        rel.custom_properties = props
-        try:
-            rel.save(update_fields=["custom_properties"])
-        except Exception:
-            logger.exception("[VOD-MERGE] could not store probe for rel=%s", rel.id)
-        if delay:
-            time.sleep(delay)
+    # One lane per provider LOGIN, run side by side. Each provider has its own
+    # connection limit, so probing different providers at once costs each of
+    # them nothing more than probing them in turn -- and measuring, which is
+    # most of a night, goes several times faster. Accounts sharing one login
+    # share its limit too, so they share a lane and never overlap.
+    run_lanes(group_by_login(chosen), probe_lane)
 
     # Only now do we know whether each account's failures were about the
     # streams or about the provider.
@@ -3406,7 +3562,7 @@ def _stop_reason(heartbeat):
     return getattr(heartbeat, "reason", None) or "lost the run lock"
 
 
-_LOOKUP_SUMS = ("fetched", "got_essentials", "empty", "errors")
+_LOOKUP_SUMS = ("fetched", "got_essentials", "empty", "errors", "lookup_skipped")
 _MEASURE_SUMS = ("probed", "gained", "nothing", "errors", "no_url",
                  "dv_checked", "dv_found", "dv_no_fallback")
 
@@ -3433,7 +3589,7 @@ def run_batches(batch, time_left, max_batches=MAX_NIGHTLY_BATCHES):
               "measure": {k: 0 for k in _MEASURE_SUMS},
               "batches": 0}
     busy, broken, skip = set(), set(), set()
-    down, look_broken = set(), set()
+    down, look_broken, silent = set(), set(), set()
     measured = False
     ended = "safety limit on batches reached"
     for _ in range(max_batches):
@@ -3448,6 +3604,7 @@ def run_batches(batch, time_left, max_batches=MAX_NIGHTLY_BATCHES):
             totals["lookup"][k] += look.get(k, 0)
         down.update(look.get("down") or ())
         look_broken.update(look.get("broken") or ())
+        silent.update(look.get("not_describing") or ())
         skip.update(look.get("broken_ids") or ())
         if meas is not None:
             measured = True
@@ -3475,6 +3632,7 @@ def run_batches(batch, time_left, max_batches=MAX_NIGHTLY_BATCHES):
             break
     totals["lookup"]["down"] = sorted(down)
     totals["lookup"]["broken"] = sorted(look_broken)
+    totals["lookup"]["not_describing"] = sorted(silent)
     if not measured:
         totals.pop("measure")
     else:
@@ -3492,14 +3650,41 @@ LOOKUP_EST_S = 1.0
 PROBE_EST_S = 6.0
 
 
-def estimate_nights(need_lookup, need_measure, cfg):
-    """Pure. Nights the current backlog needs at the current settings, or None
-    when nightly enrichment is off. Rounded up; 0 when nothing is left."""
+# Fewest answered lookups before an account's own yield is trusted for the
+# projection. Below it, assume every lookup leads to a measurement -- the
+# pessimistic answer, which is the safe one for a disclosure.
+YIELD_SAMPLE = 20
+
+
+def projected_measures(slot):
+    """Pure. Measurements one account still needs: what is waiting now, the
+    4K checks, and what its pending lookups will leave unfilled at the rate
+    its lookups have actually filled copies so far."""
+    answered, full = slot.get("answered", 0), slot.get("full", 0)
+    fill = (full / float(answered)) if answered >= YIELD_SAMPLE else 0.0
+    future = slot.get("need", 0) * (1.0 - fill)
+    return slot.get("measure", 0) + slot.get("dv", 0) + future
+
+
+def estimate_nights(per_account, cfg):
+    """Pure. Nights the backlog needs at the current settings, or None when
+    nightly enrichment is off. Rounded up; 0 when nothing is left.
+
+    Lookups run one after another, so their time adds up. Measuring runs one
+    lane per provider side by side, so its time is the BUSIEST provider's, not
+    the sum. Future measuring is projected from each account's own lookups --
+    the old estimate counted only what was visible, and on a fresh wanted set
+    nothing is measurable until its lookups have run.
+    """
     if not cfg.get("enrich_nightly"):
         return None
-    secs = need_lookup * (LOOKUP_EST_S + cfg.get("enrich_delay_ms", 0) / 1000.0)
+    per_lookup = LOOKUP_EST_S + cfg.get("enrich_delay_ms", 0) / 1000.0
+    per_probe = PROBE_EST_S + cfg.get("probe_delay_ms", 0) / 1000.0
+    lookups = sum(v.get("need", 0) for v in per_account.values()) * per_lookup
+    probes = 0.0
     if cfg.get("probe_movies"):
-        secs += need_measure * (PROBE_EST_S + cfg.get("probe_delay_ms", 0) / 1000.0)
+        probes = max([projected_measures(v) for v in per_account.values()] or [0])
+    secs = lookups + probes * per_probe
     window = max(1, cfg.get("enrich_minutes") or DEFAULT_ENRICH_MINUTES) * 60
     return int(-(-secs // window))
 

@@ -732,6 +732,33 @@ abandoned for that run and nothing is recorded against those streams — repeate
 failure says the provider is not answering, not that each individual stream is
 bad.
 
+### Faster on a large wanted set
+
+Two things keep a big backlog from taking weeks.
+
+**Providers are measured side by side.** Each provider has its own connection
+limit, so measuring copies from different providers at the same time costs
+none of them anything more than measuring them in turn — and measuring is most
+of a night's work. Each provider login gets its own lane, measured one copy at
+a time with its own spacing; accounts that share one login share a lane, so
+they never overlap. The busy, not-answering and breaker checks all still apply
+per provider. **Ffprobe lookups per run** is the total for a run across all
+lanes, so with several providers it is worth raising it — each lane then gets
+a larger share of every batch.
+
+**Lookups stop for an account that never answers them.** Some providers return
+no video or audio details at all. Once an account has answered 50 lookups
+without a single one carrying video and audio, its remaining copies are marked
+as looked up — no request is made — and go straight to measuring, which is
+where they were always going to end up. The rule learns from what each account
+actually returns, so an account that describes even a few of its copies keeps
+being looked up. **Enrichment status** marks such accounts with `*`.
+
+**Enrichment status** estimates the nights a backlog needs from each account's
+own results so far: how often its lookups fill a copy, and therefore how many
+measurements are still to come, with measuring time set by the busiest
+provider rather than the total.
+
 ### When a provider is down
 
 A provider that is not answering at all is skipped, not hammered. Before each

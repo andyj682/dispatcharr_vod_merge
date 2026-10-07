@@ -573,6 +573,41 @@ bounded window — playback that starts during a probe of at most thirty
 seconds — and a measurement cut short in that window is already recorded as a
 retryable error rather than a fact about the stream.
 
+### One lane per provider login
+
+Measuring ran one copy at a time across every provider, and on a large
+wanted set it is most of a night's time. The serialization protected
+nothing: each provider's connection limit is its own, so one copy per provider
+at once is no more load on any of them than one copy in total. Lanes are keyed
+on the provider LOGIN (host and username), not the Dispatcharr account,
+because Dispatcharr lets several accounts share one login and they share its
+limit too; an account whose login cannot be read gets a lane of its own, which
+is exactly the old behavior.
+
+Everything per provider stays per provider: the busy check before each probe,
+the not-answering check, the breaker and its held failures. Shared counters
+are touched only under one lock (a test walks the lane and fails on any write
+outside it), each lane checks a shared stop flag before every probe so a time
+limit or lost run lock halts them all promptly, and each thread closes its own
+database connection.
+
+### Learning which accounts never describe their copies
+
+On a large wanted set, many lookups go to accounts that have never once
+returned video and audio; every one of those copies goes on to be measured
+anyway. Naming those providers would over-fit one installation, so the
+rule is learned: count each account's answered lookups (errors and skips say
+nothing about it) and, after a sample of 50 with none carrying video and audio,
+mark that account's remaining copies as looked up, with a mark of their own,
+so every downstream rule treats them as a lookup that came back empty. One
+answered lookup with video and audio keeps the account looking up for good.
+
+The status uses the same rule, and its nights estimate stopped counting only
+the work that is visible: a fresh wanted set has nothing measurable until its
+lookups run, so it reported days for weeks of work. It now projects each
+account's future measuring from that account's own fill rate (assuming the
+worst on a small sample) and times measuring by the busiest lane.
+
 ### A provider that is not answering
 
 Measuring had a breaker from the start; lookups did not, and the asymmetry was
