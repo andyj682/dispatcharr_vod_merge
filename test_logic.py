@@ -3392,7 +3392,8 @@ class ParallelLaneTests(unittest.TestCase):
         self.assertIn("outcome != 'error'", tests,
                       "the probe record must be written only for answered probes")
         errs = [n for n in ast.walk(lane) if isinstance(n, ast.If)
-                and ast.unparse(n.test) == "outcome == 'error'"]
+                and ast.unparse(n.test) == "outcome == 'error'"
+                and "deferred_errors" in ast.unparse(n)]
         self.assertEqual(len(errs), 1)
         body = ast.unparse(ast.Module(body=errs[0].body, type_ignores=[]))
         self.assertIn("deferred_errors.setdefault(name, []).append(rel)", body)
@@ -3541,6 +3542,175 @@ class LearnedLookupSkipTests(unittest.TestCase):
         tot = patch.run_batches(lambda skip: next(it), lambda: True)
         self.assertEqual(tot["lookup"]["lookup_skipped"], 400)
         self.assertEqual(tot["lookup"]["not_describing"], ["P"])
+
+
+class ProbeFailureReasonTests(unittest.TestCase):
+    """A failed measurement says WHY, so a breaker trip or a pile of errors can
+    be explained -- and the reason never carries the URL, because an XC stream
+    URL contains the account's username and password."""
+
+    URL = "http://panel.example:8080/movie/someuser/secretpass/12345.mkv"
+
+    def _why(self, msg, rc=1):
+        return patch.ffprobe_failure_reason("%s: %s\n" % (self.URL, msg), rc)
+
+    def test_common_failures_get_short_codes(self):
+        cases = {
+            "Server returned 403 Forbidden (access denied)": "http 403",
+            "Server returned 404 Not Found": "http 404",
+            "Server returned 5XX Server Error reply": "http 5xx",
+            "HTTP error 429 Too Many Requests": "http 429",
+            "Connection refused": "connection refused",
+            "Connection reset by peer": "connection reset",
+            "Connection timed out": "connection timed out",
+            "Invalid data found when processing input": "invalid data",
+            "Stream ends prematurely at 1234": "ended early",
+            "End of file": "ended early",
+            "Input/output error": "i/o error",
+        }
+        for msg, code in cases.items():
+            self.assertEqual(self._why(msg), code, msg)
+
+    def test_unknown_and_empty(self):
+        self.assertEqual(self._why("something nobody has seen"), "other error")
+        self.assertEqual(patch.ffprobe_failure_reason("", 255), "exit 255")
+        self.assertEqual(patch.ffprobe_failure_reason("x", 1, timed_out=True), "timeout")
+
+    def test_no_reason_ever_carries_the_url_or_credentials(self):
+        for msg in ("Server returned 401 Unauthorized", "weird failure",
+                    "Failed to resolve hostname panel.example", "Connection refused"):
+            why = self._why(msg)
+            for secret in ("secretpass", "someuser", "panel.example", "12345"):
+                self.assertNotIn(secret, why, (msg, why))
+
+    def _run(self, result=None, raises=None):
+        from unittest import mock
+        with mock.patch("subprocess.run", side_effect=raises, return_value=result):
+            with self.assertLogs(patch.logger, level="WARNING") as logs:
+                patch.logger.warning("sentinel")
+                out = patch.run_ffprobe(self.URL, "UA")
+        return out, "\n".join(logs.output)
+
+    def test_a_timeout_is_reported_without_the_command(self):
+        import subprocess
+        out, logs = self._run(raises=subprocess.TimeoutExpired(
+            cmd=["ffprobe", self.URL], timeout=30))
+        self.assertEqual(out, (1, None, "timeout"))
+        self.assertNotIn("secretpass", logs)
+
+    def test_a_failure_gets_its_reason(self):
+        import subprocess
+        done = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=b"",
+            stderr=("%s: Server returned 403 Forbidden" % self.URL).encode())
+        out, logs = self._run(result=done)
+        self.assertEqual(out, (1, None, "http 403"))
+        self.assertNotIn("secretpass", logs)
+
+    def test_a_success_has_no_reason(self):
+        import subprocess
+        done = subprocess.CompletedProcess(
+            args=[], returncode=0, stderr=b"",
+            stdout=b'{"streams": [{"codec_type": "video", "width": 1920}]}')
+        rc, parsed, why = self._run(result=done)[0]
+        self.assertEqual((rc, why), (0, None))
+        self.assertEqual(parsed["video"]["width"], 1920)
+
+    def test_a_crash_is_reported_without_its_text(self):
+        out, logs = self._run(raises=OSError("cannot run " + self.URL))
+        self.assertEqual(out, (1, None, "could not run"))
+        self.assertNotIn("secretpass", logs)
+
+    # --- wiring --------------------------------------------------------------
+    def _lane(self):
+        tree = ast.parse(open(patch.__file__, encoding="utf-8").read())
+        return ast.unparse(next(n for n in ast.walk(tree)
+                                if isinstance(n, ast.FunctionDef) and n.name == "probe_lane"))
+
+    def test_the_lane_keeps_and_reports_the_reason(self):
+        src = self._lane()
+        self.assertIn("rc, parsed, why = run_ffprobe(url, ua)", src)
+        self.assertIn("held_why[rel.id] = why", src)
+        self.assertIn("stats.setdefault('broken_why', {})[name] = why", src)
+
+    def test_which_failures_are_about_the_stream(self):
+        for why in ("http 400", "http 404", "http 410"):
+            self.assertTrue(patch.is_stream_level(why), why)
+        # 401/403 usually mean the ACCOUNT; the rest can be the provider.
+        for why in ("http 401", "http 403", "http 5xx", "http 500", "connection refused",
+                    "connection reset", "connection timed out", "timeout", "dns failure",
+                    "ended early", "truncated read", "invalid data", "other error", None):
+            self.assertFalse(patch.is_stream_level(why), why)
+
+    def test_a_bad_stream_never_trips_the_breaker_and_is_recorded_at_once(self):
+        # Regression: three bad streams next to each other tripped the breaker,
+        # which recorded nothing, so they stayed at the head of the queue and
+        # stopped the provider's measuring at the same place every run.
+        tree = ast.parse(open(patch.__file__, encoding="utf-8").read())
+        lane = next(n for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef) and n.name == "probe_lane")
+        branch = [n for n in ast.walk(lane) if isinstance(n, ast.If)
+                  and ast.unparse(n.test) == "outcome == 'error' and is_stream_level(why)"]
+        self.assertEqual(len(branch), 2, "one to count it, one to record it")
+        counted, recorded = sorted(branch, key=lambda n: n.lineno)
+        body = ast.unparse(ast.Module(body=counted.body, type_ignores=[]))
+        self.assertNotIn("consecutive", body)
+        self.assertNotIn("deferred_errors", body)
+        # ... and the provider branch is the ELSE of it, so the two never overlap.
+        self.assertTrue(counted.orelse and isinstance(counted.orelse[0], ast.If))
+        self.assertIn("consecutive[name] = consecutive.get(name, 0) + 1",
+                      ast.unparse(counted.orelse[0]))
+        rec = ast.unparse(ast.Module(body=recorded.body, type_ignores=[]))
+        self.assertIn("_stamp_own(props, probe={'at': now_iso, 'got': 'error', 'why': why})", rec)
+        self.assertIn("rel.save(update_fields=['custom_properties'])", rec)
+
+    def test_a_bad_stream_waits_out_the_normal_retry(self):
+        old = (NOW - timedelta(days=1)).isoformat()
+        props = {patch.OWN_PROPS_KEY: {"enrich": {"at": old, "got": "partial"},
+                                       "probe": {"at": old, "got": "error", "why": "http 400"}}}
+        self.assertFalse(patch.decide_probe(props, NOW.isoformat())[0])
+
+    def test_a_cut_short_read_is_labeled(self):
+        # ffprobe can exit cleanly having seen a video stream with no size --
+        # classify_probe calls that an error; without a label it would be
+        # recorded with no reason at all.
+        tree = ast.parse(open(patch.__file__, encoding="utf-8").read())
+        lane = next(n for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef) and n.name == "probe_lane")
+        labels = [n for n in ast.walk(lane) if isinstance(n, ast.If)
+                  and "outcome == 'error'" in ast.unparse(n.test)
+                  and "not why" in ast.unparse(n.test)]
+        self.assertEqual(len(labels), 1)
+        self.assertEqual(ast.unparse(ast.Module(body=labels[0].body, type_ignores=[])),
+                         "why = 'truncated read'")
+
+    def test_the_stored_error_carries_its_reason(self):
+        tree = ast.parse(open(patch.__file__, encoding="utf-8").read())
+        src = ast.unparse(next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                               and n.name == "probe_movies_impl"))
+        self.assertIn("'why': held_why.get(rel.id)", src)
+
+    def test_status_names_the_reason(self):
+        import plugin as plugin_mod
+        out = plugin_mod._format_last_run({
+            "state": "finished", "finished_at": "2030-01-02T03:04:05+00:00",
+            "result": {"lookup": {"got_essentials": 1},
+                       "measure": {"gained": 5, "errors": 4,
+                                   "why": {"http 404": 3, "connection refused": 1},
+                                   "broken": ["P"], "broken_why": {"P": "connection refused"}}}})
+        self.assertIn("4 errors, mostly http 404", out)
+        self.assertIn("stopped measuring: P (connection refused)", out)
+
+    def test_nightly_totals_add_up_reasons(self):
+        it = iter([{"lookup": {"fetched": 1}, "measure": {"probed": 1, "errors": 2,
+                                                          "why": {"http 404": 2}}},
+                   {"lookup": {"fetched": 1}, "measure": {"probed": 1, "errors": 1,
+                                                          "why": {"http 404": 1},
+                                                          "broken_why": {"P": "http 404"}}},
+                   {"lookup": {}, "measure": {}}])
+        tot = patch.run_batches(lambda skip: next(it), lambda: True)
+        self.assertEqual(tot["measure"]["why"], {"http 404": 3})
+        self.assertEqual(tot["measure"]["broken_why"], {"P": "http 404"})
 
 
 class ManifestParityTests(unittest.TestCase):

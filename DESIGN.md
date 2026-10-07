@@ -481,6 +481,24 @@ function so it can be tested directly, because it is the kind of logic that
 looks like bookkeeping and is actually the difference between an outage costing
 an hour and costing a week.
 
+### A bad stream is not a provider outage
+
+The breaker's subtle half — record nothing when a provider trips it — has a
+failure mode of its own. Unrecorded copies stay queued, and the queue is in a
+fixed order, so if what tripped the breaker was three bad STREAMS next to each
+other rather than an outage, every later run reaches the same three first,
+trips again, and the provider's measuring stops for good. It happened: three
+copies that a provider answered `http 400` for, minutes later and with sensible
+extensions, so not a timing problem and not a malformed URL.
+
+The distinction is whether the provider answered. `400`, `404` and `410` are
+answers about one request from a provider that is up, so they are recorded
+against the copy and never counted toward the breaker. `401`/`403` stay on the
+provider side because they usually mean the account. The cost is bounded: a
+provider that began answering `400` to everything would see its queued copies
+each wait a week instead of being protected — time, not data, and the pre-flight
+sign-in still catches a provider that is actually down.
+
 ### Two destinations for one measurement
 
 Results go to a key of our own and are mirrored into the detail Dispatcharr

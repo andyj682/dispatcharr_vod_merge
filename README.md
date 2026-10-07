@@ -727,6 +727,17 @@ A measurement that gets cut off part-way is recorded as a retryable error
 rather than as "this stream has nothing", so a collision costs you a retry and
 not a permanently unmeasurable copy.
 
+A failed measurement is recorded with a short reason — for example `http 404`,
+`connection refused` or `timeout` — and **Enrichment status** shows the most
+common one. The provider's own error text is never kept, because it includes
+the stream URL, and with it the account's credentials.
+
+A provider that answers `http 400`, `404` or `410` for a stream has said that
+stream is no good; that failure is recorded against the copy and says nothing
+about the provider. Other failures — refused or reset connections, timeouts,
+`401`/`403`, server errors — can mean the provider itself, and those are what
+the breaker counts.
+
 If several measurements against one provider fail in a row, the rest are
 abandoned for that run and nothing is recorded against those streams — repeated
 failure says the provider is not answering, not that each individual stream is

@@ -7,6 +7,36 @@ Everything through 0.8.3 landed during initial development against a single
 large live library; the entries below record *why* each change was needed, since
 several were driven by failures that were invisible from the outside.
 
+## 1.5.9 — 2026-10-06
+
+**Added — a failed measurement says why**
+
+- When a measurement fails, the reason is now recorded as a short code —
+  `http 403`, `http 404`, `connection refused`, `timeout`, `invalid data`,
+  `ended early`, `truncated read` and a few more — logged, kept with the copy's
+  error record, and summarized in **Enrichment status** (`12 errors, mostly
+  http 404`; `stopped measuring: X (connection refused)`). Previously ffprobe's
+  message was discarded, so a provider being stopped for the night could not
+  be told apart from a run of dead streams.
+
+- ffprobe's own text is never stored or logged: it begins with the stream URL,
+  and an Xtream Codes stream URL contains the account's username and password.
+  The reason is reduced to a fixed code first, and the timeout and crash log
+  lines no longer echo the command either.
+
+**Fixed — a few bad streams could stop a provider's measuring for good**
+
+- A provider that answers `http 400`, `404` or `410` for a stream has plainly
+  answered: that stream is no good. Those failures counted toward the
+  provider's breaker, which treats several failures in a row as an outage and
+  records nothing against the copies involved, so they stay queued. With three
+  such streams next to each other at the front of a provider's queue, every run
+  tripped the breaker at the same place and measured nothing more on that
+  provider — permanently. Such a failure is now recorded against its copy at
+  once (normal one-week retry) and does not count toward the breaker. Refused
+  or reset connections, timeouts, `401`/`403`, server errors and cut-short
+  reads still count, since they can mean the provider itself.
+
 ## 1.5.8 — 2026-10-06
 
 **Changed — much faster enrichment on a large wanted set**

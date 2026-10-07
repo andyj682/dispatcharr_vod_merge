@@ -168,7 +168,9 @@ def _format_last_run(lp):
             parts.append(f"DV {meas['dv_found']} "
                          f"({meas.get('dv_no_fallback', 0)} no-fallback)")
     errors = look.get("errors", 0) + ((meas or {}).get("errors", 0))
-    parts.append(f"{errors} errors")
+    reasons = (meas or {}).get("why") or {}
+    top = max(reasons.items(), key=lambda kv: (kv[1], kv[0]))[0] if reasons else None
+    parts.append(f"{errors} errors" + (f", mostly {top}" if errors and top else ""))
     down = sorted(set(look.get("down") or ()) | set((meas or {}).get("down") or ()))
     if down:
         parts.append("not answering: " + ", ".join(down))
@@ -180,7 +182,9 @@ def _format_last_run(lp):
     if (meas or {}).get("busy"):
         parts.append("busy: " + ", ".join(meas["busy"]))
     if (meas or {}).get("broken"):
-        parts.append("stopped measuring: " + ", ".join(meas["broken"]))
+        why = meas.get("broken_why") or {}
+        parts.append("stopped measuring: " + ", ".join(
+            f"{n} ({why[n]})" if why.get(n) else n for n in meas["broken"]))
     stopped = look.get("stopped") or (meas or {}).get("stopped")
     if stopped and stopped != res.get("ended"):
         parts.append(f"stopped: {stopped}")
@@ -236,7 +240,7 @@ def _format_log(data, limit=60):
 class Plugin:
     # UI title only; "Dispatcharr" is redundant inside the Dispatcharr UI.
     name = "VOD Merge & Enrich"
-    version = "1.5.8"
+    version = "1.5.9"
     description = (
         "Merges duplicate VOD titles from providers that omit TMDB ids, by "
         "matching other details to an existing title. Adds video and audio specs "

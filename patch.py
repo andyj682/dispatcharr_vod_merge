@@ -2837,8 +2837,65 @@ def decide_dv_check(props, now_iso, retry_days=PROBE_ERROR_RETRY_DAYS):
     return _probe_mark_decision(mark, now_iso, retry_days)
 
 
+# What a failed measurement is recorded as. ffprobe's own message is never kept
+# or logged: it starts with the stream URL, and an XC stream URL carries the
+# account's username and password. It is reduced to one of these fixed codes
+# (plus an HTTP status number), so nothing secret can leave this function.
+_FFPROBE_REASONS = (
+    ("connection refused", "connection refused"),
+    ("connection reset", "connection reset"),
+    ("timed out", "connection timed out"),
+    ("failed to resolve", "dns failure"),
+    ("name or service not known", "dns failure"),
+    ("temporary failure in name resolution", "dns failure"),
+    ("invalid data found", "invalid data"),
+    ("stream ends prematurely", "ended early"),
+    ("end of file", "ended early"),
+    ("input/output error", "i/o error"),
+)
+_HTTP_STATUS_RE = re.compile(r"(?:server returned|http error)\s+([1-5]\d\d|[45]xx)", re.I)
+
+
+# Failures that are an ANSWER about one stream, from a provider that is plainly
+# up and talking: it understood the request and said this stream is no good.
+# They must not count toward the provider breaker. Learned the hard way: three
+# such streams sitting next to each other in the queue tripped the breaker, the
+# breaker (rightly, for an outage) recorded nothing against them, so they stayed
+# at the front of the queue -- and every later run hit them first and stopped,
+# measuring nothing on that provider ever again.
+# 401/403 are deliberately NOT here: they usually mean the account, not the
+# stream. Everything unlisted -- refused, reset, timeouts, 5xx, cut-short reads --
+# still counts toward the breaker, because it can be the provider.
+STREAM_LEVEL_REASONS = frozenset(("http 400", "http 404", "http 410"))
+
+
+def is_stream_level(why):
+    """Pure. Does this failure describe the stream rather than the provider?"""
+    return why in STREAM_LEVEL_REASONS
+
+
+def ffprobe_failure_reason(stderr_text, returncode, timed_out=False):
+    """Pure. A short, credential-free reason for a failed probe."""
+    if timed_out:
+        return "timeout"
+    text = (stderr_text or "").lower()
+    m = _HTTP_STATUS_RE.search(text)
+    if m:
+        return "http " + m.group(1).lower()
+    for needle, code in _FFPROBE_REASONS:
+        if needle in text:
+            return code
+    if not text.strip():
+        return "exit %s" % (returncode,)
+    return "other error"
+
+
 def run_ffprobe(url, user_agent=None, timeout=PROBE_TIMEOUT_S):
-    """Probe one stream. -> (returncode, parsed_or_None).
+    """Probe one stream. -> (returncode, parsed_or_None, reason_or_None).
+
+    `reason` is a short fixed code (see `ffprobe_failure_reason`) when the
+    probe failed, so a breaker trip or a pile of errors can be explained
+    without ever logging the URL.
 
     Reads are bounded on purpose. Without `-probesize`/`-analyzeduration`
     ffprobe will happily pull far more of the file than it needs to describe
@@ -2857,17 +2914,24 @@ def run_ffprobe(url, user_agent=None, timeout=PROBE_TIMEOUT_S):
     cmd.append(url)
     try:
         done = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # The exception's text embeds the whole command, URL included.
+        logger.warning("[VOD-MERGE] ffprobe could not run: timed out after %ss",
+                       timeout)
+        return 1, None, "timeout"
     except Exception as exc:
-        logger.warning("[VOD-MERGE] ffprobe could not run: %s", exc)
-        return 1, None
+        logger.warning("[VOD-MERGE] ffprobe could not run: %s",
+                       type(exc).__name__)
+        return 1, None, "could not run"
     if done.returncode != 0:
-        return done.returncode, None
+        return done.returncode, None, ffprobe_failure_reason(
+            done.stderr.decode("utf-8", "replace"), done.returncode)
     try:
         import json as _json
-        return 0, parse_ffprobe(_json.loads(done.stdout.decode("utf-8", "replace")))
+        return 0, parse_ffprobe(_json.loads(done.stdout.decode("utf-8", "replace"))), None
     except Exception as exc:
-        logger.warning("[VOD-MERGE] ffprobe output unparseable: %s", exc)
-        return 1, None
+        logger.warning("[VOD-MERGE] ffprobe output unparseable: %s", type(exc).__name__)
+        return 1, None, "unparseable output"
 
 
 def store_probe(props, parsed):
@@ -3157,6 +3221,7 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=None
     per_account = {}
     consecutive = {}
     deferred_errors = {}
+    held_why = {}
     lock = threading.Lock()
 
     def probe_lane(_login, rels):
@@ -3204,8 +3269,12 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=None
             except Exception:
                 ua = None
 
-            rc, parsed = run_ffprobe(url, ua)
+            rc, parsed, why = run_ffprobe(url, ua)
             outcome = classify_probe(rc, parsed)
+            if outcome == "error" and not why:
+                # ffprobe exited cleanly but saw a video stream with no size:
+                # a read cut short (see classify_probe).
+                why = "truncated read"
 
             with lock:
                 slot = per_account.setdefault(
@@ -3213,6 +3282,16 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=None
                 if outcome == "error":
                     stats["errors"] += 1
                     slot["errors"] += 1
+                    slot.setdefault("why", {})
+                    slot["why"][why] = slot["why"].get(why, 0) + 1
+                    stats.setdefault("why", {})
+                    stats["why"][why] = stats["why"].get(why, 0) + 1
+                if outcome == "error" and is_stream_level(why):
+                    # The provider answered: this stream is bad. Recorded
+                    # against the copy right away (below), and it says nothing
+                    # about the provider, so the breaker's count is untouched.
+                    stats["bad_streams"] = stats.get("bad_streams", 0) + 1
+                elif outcome == "error":
                     consecutive[name] = consecutive.get(name, 0) + 1
                     # Hold the stamp. Repeated failure against one account is a
                     # fact about the PROVIDER, not about each stream, and
@@ -3220,14 +3299,16 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=None
                     # a week-long retry window because the provider had a bad
                     # hour.
                     deferred_errors.setdefault(name, []).append(rel)
+                    held_why[rel.id] = why
                     if consecutive[name] >= PROBE_BREAKER:
                         stats["broken"].append(name)
                         stats.setdefault("broken_ids", []).append(rel.m3u_account_id)
+                        stats.setdefault("broken_why", {})[name] = why
                         logger.warning(
                             "[VOD-MERGE] probe circuit breaker tripped for %r after "
-                            "%d consecutive failures -- abandoning it for this run "
-                            "and recording nothing against its streams",
-                            name, consecutive[name])
+                            "%d consecutive failures (last: %s) -- abandoning it for "
+                            "this run and recording nothing against its streams",
+                            name, consecutive[name], why)
                 else:
                     consecutive[name] = 0
                     note_dv(stats, parsed, rel.id in dv_ids)
@@ -3240,6 +3321,18 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=None
                     stats["probed"] += 1
                     slot["probed"] += 1
 
+            if outcome == "error":
+                logger.info("[VOD-MERGE] probe failed on %r rel=%s: %s",
+                            name, rel.id, why)
+
+            if outcome == "error" and is_stream_level(why):
+                props = rel.custom_properties or {}
+                _stamp_own(props, probe={"at": now_iso, "got": "error", "why": why})
+                rel.custom_properties = props
+                try:
+                    rel.save(update_fields=["custom_properties"])
+                except Exception:
+                    logger.exception("[VOD-MERGE] could not store probe error for rel=%s", rel.id)
             if outcome != "error":
                 props = rel.custom_properties or {}
                 if outcome == "full":
@@ -3264,7 +3357,10 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=None
     # streams or about the provider.
     for rel in errors_to_stamp(deferred_errors, stats["broken"]):
         props = rel.custom_properties or {}
-        _stamp_own(props, probe={"at": now_iso, "got": "error"})
+        # The reason travels with the record, so a later retry policy can tell
+        # a stream that is gone from a provider that said no.
+        _stamp_own(props, probe={"at": now_iso, "got": "error",
+                                 "why": held_why.get(rel.id)})
         rel.custom_properties = props
         try:
             rel.save(update_fields=["custom_properties"])
@@ -3564,7 +3660,7 @@ def _stop_reason(heartbeat):
 
 _LOOKUP_SUMS = ("fetched", "got_essentials", "empty", "errors", "lookup_skipped")
 _MEASURE_SUMS = ("probed", "gained", "nothing", "errors", "no_url",
-                 "dv_checked", "dv_found", "dv_no_fallback")
+                 "dv_checked", "dv_found", "dv_no_fallback", "bad_streams")
 
 
 def _attempted(result):
@@ -3590,6 +3686,7 @@ def run_batches(batch, time_left, max_batches=MAX_NIGHTLY_BATCHES):
               "batches": 0}
     busy, broken, skip = set(), set(), set()
     down, look_broken, silent = set(), set(), set()
+    why, broken_why = {}, {}
     measured = False
     ended = "safety limit on batches reached"
     for _ in range(max_batches):
@@ -3611,6 +3708,9 @@ def run_batches(batch, time_left, max_batches=MAX_NIGHTLY_BATCHES):
             for k in _MEASURE_SUMS:
                 totals["measure"][k] += meas.get(k, 0)
             busy.update(meas.get("busy") or ())
+            for k, v in (meas.get("why") or {}).items():
+                why[k] = why.get(k, 0) + v
+            broken_why.update(meas.get("broken_why") or {})
             down.update(meas.get("down") or ())
             broken.update(meas.get("broken") or ())
             skip.update(meas.get("broken_ids") or ())
@@ -3637,6 +3737,8 @@ def run_batches(batch, time_left, max_batches=MAX_NIGHTLY_BATCHES):
         totals.pop("measure")
     else:
         totals["measure"]["busy"] = sorted(busy)
+        totals["measure"]["why"] = why
+        totals["measure"]["broken_why"] = broken_why
         totals["measure"]["broken"] = sorted(broken)
     totals["ended"] = ended
     return totals
