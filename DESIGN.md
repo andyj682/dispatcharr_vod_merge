@@ -436,7 +436,7 @@ arrivals are the ones duplicating titles already in the library.
 Enrichment must not. Providers cluster in id ranges -- overwhelmingly so for one
 that has been wholesale recreated -- so newest-first walks a single provider's
 copies across every movie before reaching the next provider's. Measured on a
-real wanted set, the first thirty fetches were all one provider.
+real wanted set, the first several batches all went to one provider.
 
 The cost is not slowness, it is shape. That ordering leaves every movie
 partially covered for the whole backlog, and partial coverage is the one state
@@ -475,8 +475,9 @@ for a week. A bad hour becomes a week of missing data, invisibly, and the longer
 the outage the more copies it poisons.
 
 So failures are held rather than written. If the breaker trips for an account,
-they are discarded — that account simply was not measured this run. If it does
-not, they are written and the normal retry applies. The rule is one pure
+they are not written as errors — that account simply was not measured this run
+— but they are marked held (see below). If it does not, they are written and
+the normal retry applies. The rule is one pure
 function so it can be tested directly, because it is the kind of logic that
 looks like bookkeeping and is actually the difference between an outage costing
 an hour and costing a week.
@@ -498,6 +499,33 @@ provider side because they usually mean the account. The cost is bounded: a
 provider that began answering `400` to everything would see its queued copies
 each wait a week instead of being protected — time, not data, and the pre-flight
 sign-in still catches a provider that is actually down.
+
+### Held copies go to the back of the queue
+
+Classifying the answer fixed the case where the provider *answered*. It did not
+fix the root of the trap, which is that an unrecorded copy is first again next
+run. A stream that never answers at all — it hangs until the timeout — is
+indistinguishable from an outage one request at a time, so it still counts
+toward the breaker. Three such copies at the front of a queue trip it at the
+start of every run, and that provider's measuring stops for good. It happened,
+with timeouts this time.
+
+So a failure the breaker discards is no longer left unmarked. It is marked
+**held**: still due, with no retry wait, but every held copy goes after every
+other copy when the queue is built, for lookups and measuring alike. The two
+cases the breaker exists to tell apart now both come out right:
+
+- **An outage** costs nothing. The held copies are retried on the next run,
+  just later in it.
+- **A few bad streams** cannot block the queue. The next run reaches the
+  copies behind them first.
+
+A held copy that is held again counts up; on the third consecutive hold it is
+written as an ordinary error with the normal retry window. A copy that only ever
+fails is therefore tried a bounded number of times rather than every night, and
+one that failed during an outage needs three trips in a row — each of which
+reached it only after everything else — before it waits a week. Any other mark
+resets the count, so only *consecutive* holds add up.
 
 ### Two destinations for one measurement
 
@@ -638,8 +666,8 @@ So lookups now get both defenses. A pre-flight sign-in per provider, before the
 batch is chosen (the busy check taught that a check made after choosing lets a
 skipped provider's copies fill the batch); it fails open, because wrongly
 skipping a healthy provider costs it a night. And a breaker for an outage that
-begins mid-run, whose held failures are discarded rather than stamped, using
-the same function the measuring side uses for exactly that decision.
+begins mid-run, whose failures are held rather than stamped as errors, using
+the same functions the measuring side uses for exactly that decision.
 
 ### Checking described 4K copies for Dolby Vision
 

@@ -185,6 +185,9 @@ def _format_last_run(lp):
         why = meas.get("broken_why") or {}
         parts.append("stopped measuring: " + ", ".join(
             f"{n} ({why[n]})" if why.get(n) else n for n in meas["broken"]))
+    held = look.get("held", 0) + (meas or {}).get("held", 0)
+    if held:
+        parts.append(f"{held} held for later")
     stopped = look.get("stopped") or (meas or {}).get("stopped")
     if stopped and stopped != res.get("ended"):
         parts.append(f"stopped: {stopped}")
@@ -240,7 +243,7 @@ def _format_log(data, limit=60):
 class Plugin:
     # UI title only; "Dispatcharr" is redundant inside the Dispatcharr UI.
     name = "VOD Merge & Enrich"
-    version = "1.5.9"
+    version = "1.5.10"
     description = (
         "Merges duplicate VOD titles from providers that omit TMDB ids, by "
         "matching other details to an existing title. Adds video and audio specs "
@@ -686,7 +689,7 @@ class Plugin:
             return {
                 "status": "ok" if ok else "error",
                 "message": (
-                    "VOD merge enabled (series batch wrapped). Still "
+                    "VOD Merge & Enrich enabled. Still "
                     "DRY RUN unless you turned that off."
                 ) if ok else "Failed to enable (see logs)",
             }
@@ -695,7 +698,7 @@ class Plugin:
             _patch.uninstall()
             _patch.remove_schedule()
             return {"status": "ok",
-                    "message": "VOD merge disabled (patches reverted, schedule removed)"}
+                    "message": "VOD Merge & Enrich disabled (patches reverted, schedule removed)"}
 
         if action == "status":
             import os
@@ -878,4 +881,4 @@ class Plugin:
     def stop(self, context=None):
         """Called by Dispatcharr on disable / delete / reload."""
         _patch.uninstall()
-        return {"status": "ok", "message": "VOD merge reverted"}
+        return {"status": "ok", "message": "VOD Merge & Enrich reverted"}

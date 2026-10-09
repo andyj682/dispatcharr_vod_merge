@@ -7,6 +7,38 @@ Everything through 0.8.3 landed during initial development against a single
 large live library; the entries below record *why* each change was needed, since
 several were driven by failures that were invisible from the outside.
 
+## 1.5.10 — 2026-10-07
+
+**Fixed — copies that keep failing could stop a provider's enrichment for good**
+
+- When the breaker stops a provider for the night, its failures are
+  deliberately not recorded as errors, so an outage does not put every queued
+  copy into a week-long retry wait. But that left those copies unmarked, and
+  the queue is walked in a fixed order, so they were first again on the next
+  run. If they failed again — for example, streams that hang until the timeout
+  rather than answering — the breaker tripped at the same place every run, and
+  that provider's measuring stopped for good. 1.5.9 fixed the case where the
+  provider answers with `400`, `404` or `410`; a stream that never answers at
+  all still counts toward the breaker.
+
+- Those copies are now **held**: still due, with no retry wait, but tried after
+  every other copy, for both lookups and measuring. An outage still costs
+  nothing, since held copies are retried next run, and a few bad streams can no
+  longer block the copies behind them. A copy held three runs in a row is
+  recorded as an ordinary error with the normal one-week retry.
+
+- **Enrichment status** reports how many copies the last run held
+  (`3 held for later`), and the breaker's log line says it is holding them.
+
+- Copies already stuck at the front of a queue are unmarked from before this
+  fix, so the first run after upgrading may still trip on them once; that run
+  holds them, and the next one moves past them.
+
+**Changed**
+
+- The Enable, Disable and stop messages use the new display name,
+  **VOD Merge & Enrich**.
+
 ## 1.5.9 — 2026-10-06
 
 **Added — a failed measurement says why**
@@ -340,11 +372,11 @@ time**
   each other, so it needs measured video and audio for *every* copy, not one.
   Nothing produces that today. The XC detail endpoint refreshes a single copy
   per movie — the highest-priority account's — and that is a structural limit,
-  not a setting. On one library the copy it picks happens to be the one
-  provider that supplies technical detail for roughly 0.7% of movies.
+  not a setting. On one library the copy it picks happens to be from the one
+  provider that almost never supplies technical detail.
 
-  Fetching detail for all 37,000 movies is not the answer either. The useful
-  set is the few thousand titles actually synced to a media library, and only
+  Fetching detail for every movie in the catalog is not the answer either. The
+  useful set is the titles actually synced to a media library, and only
   the tool doing the syncing knows which those are. So it publishes them as a
   file, and this reads it: **Wanted-set file (enrichment)**. Demand is the one
   thing that tool holds which cannot be queried from here.

@@ -1913,7 +1913,7 @@ def patched_process_movie_batch(account, batch, categories, relations,
 # relation per movie (the highest-priority account's), which is a structural cap
 # rather than a configuration one.
 #
-# Enriching all 37k movies is not the goal and never was -- the useful set is
+# Enriching every movie in the catalog is not the goal and never was -- the useful set is
 # the few thousand titles actually synced to a library, and only the generator
 # knows which those are. It publishes them as a file; we read it. Demand is the
 # one thing it holds that we cannot query.
@@ -2092,7 +2092,7 @@ def wanted_movie_ids(doc):
 # is not subject to the one-relation-per-movie cap the XC endpoint imposes. That
 # asymmetry is the whole reason this belongs here rather than in the generator.
 #
-# Cheap -- a light API call, measured around 0.65s median -- and its real job is
+# Cheap -- a light API call, typically well under a second -- and its real job is
 # to SHRINK the expensive ffprobe pass precisely rather than leaving it guessed.
 #
 # We stamp an ATTEMPT, not a success. Skipping on "has usable data" would
@@ -2110,6 +2110,65 @@ def relation_has_essentials(props):
     return bool(isinstance(v, dict) and v.get("width") and d.get("audio"))
 
 
+# A failure a tripped breaker discarded is not recorded as an error -- the
+# provider, not the stream, was the likely problem -- but it cannot be left
+# unmarked either. Candidates are walked in a fixed order, so an unmarked copy
+# is first again next run; if it fails again (a stream that hangs, say), the
+# breaker trips again at the same place and that provider's backlog never
+# moves. Learned the hard way: a few copies that timed out at the front of one
+# provider's queue stopped its measuring on every run.
+#
+# So it is marked HELD: still due, but tried after everything else. An outage
+# still costs nothing -- a held copy is retried next run -- and a few bad
+# streams can no longer block the copies behind them. A copy held HOLD_LIMIT
+# runs in a row is a stream problem after all and gets an ordinary error mark,
+# with the normal retry window. Shared by lookups and measuring.
+HELD = "held"
+HOLD_LIMIT = 3
+
+
+def is_held(mark):
+    """Pure. Is this lookup/probe mark a held failure?"""
+    return isinstance(mark, dict) and mark.get("got") == HELD
+
+
+def held_mark(previous, now_iso, why=None):
+    """Pure. The mark for a failure a tripped breaker discarded, given the
+    copy's previous mark of the same kind."""
+    holds = 1
+    if is_held(previous):
+        try:
+            holds = int(previous.get("holds") or 0) + 1
+        except (TypeError, ValueError):
+            holds = 1
+    mark = {"at": now_iso, "got": "error" if holds >= HOLD_LIMIT else HELD,
+            "holds": holds}
+    if why:
+        mark["why"] = why
+    return mark
+
+
+def own_mark(rel, kind):
+    """A relation's own `kind` mark ("enrich" or "probe"), or None."""
+    own = (getattr(rel, "custom_properties", None) or {}).get(OWN_PROPS_KEY)
+    return own.get(kind) if isinstance(own, dict) else None
+
+
+def held_last(groups, held):
+    """Pure. `(movie_id, [relations])` groups with every held relation moved
+    behind all the others; order is kept within each part. `held(rel)` -> bool.
+    """
+    first, last = [], []
+    for mid, rels in groups:
+        fresh = [r for r in rels if not held(r)]
+        stuck = [r for r in rels if held(r)]
+        if fresh:
+            first.append((mid, fresh))
+        if stuck:
+            last.append((mid, stuck))
+    return first + last
+
+
 def decide_enrich(props, now_iso, retry_days=ENRICH_ERROR_RETRY_DAYS):
     """Pure. -> (should_fetch, reason)."""
     if relation_has_essentials(props):
@@ -2118,6 +2177,8 @@ def decide_enrich(props, now_iso, retry_days=ENRICH_ERROR_RETRY_DAYS):
     mark = own.get("enrich") if isinstance(own, dict) else None
     if not isinstance(mark, dict):
         return True, "never attempted"
+    if is_held(mark):
+        return True, "held after a breaker trip -- tried after the rest"
     got = mark.get("got")
     if got != "error":
         # The provider answered and this is what it has. Asking again is how a
@@ -2141,7 +2202,7 @@ def enrich_candidates(movie_ids):
     cluster in id ranges -- overwhelmingly so for one that has been wholesale
     recreated -- so `-id` walks a single provider's copies across every movie
     before reaching the next provider's. Measured on a real wanted set: the
-    first thirty fetches were all one provider.
+    first several batches all went to one provider.
 
     That ordering leaves EVERY movie partially covered for as long as the
     backlog lasts, which is the worst possible state for ranking. A candidate
@@ -2471,6 +2532,8 @@ def enrich_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=Non
         stats["not_describing"] = account_names(per_movie, silent)
         per_movie = without_accounts(per_movie, silent)
 
+    # Copies a tripped breaker held go last, so they cannot block the rest.
+    per_movie = held_last(per_movie, lambda r: is_held(own_mark(r, "enrich")))
     # Providers that stopped answering earlier tonight are not asked again.
     per_movie = without_accounts(per_movie, set(skip_accounts or ()))
     # And one that is not answering NOW is left out BEFORE the batch is chosen
@@ -2537,8 +2600,9 @@ def enrich_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=Non
                         stats.setdefault("broken_ids", []).append(rel.m3u_account_id)
                         logger.warning(
                             "[VOD-MERGE] lookup breaker tripped for %r after %d "
-                            "consecutive failures -- stopping it and recording "
-                            "nothing against its copies", name, consecutive[name])
+                            "consecutive failures -- stopping it and holding its "
+                            "failed copies for the back of the queue",
+                            name, consecutive[name])
                         break
                     if delay:
                         time.sleep(delay)
@@ -2600,6 +2664,16 @@ def enrich_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=Non
         except Exception:
             logger.exception(
                 "[VOD-MERGE] could not store enrichment error for rel=%s", rel.id)
+    for rel in held_after_trip(deferred_errors, stats["broken"]):
+        props = rel.custom_properties or {}
+        _stamp_own(props, enrich=held_mark(own_mark(rel, "enrich"), now_iso))
+        rel.custom_properties = props
+        stats["held"] = stats.get("held", 0) + 1
+        try:
+            rel.save(update_fields=["custom_properties"])
+        except Exception:
+            logger.exception(
+                "[VOD-MERGE] could not store held lookup for rel=%s", rel.id)
 
     remaining = 0
     for rel in enrich_candidates(movie_ids).iterator(chunk_size=500):
@@ -2728,6 +2802,8 @@ def _probe_mark_decision(mark, now_iso, retry_days):
     probed and answered -> never again; errored -> after the retry window."""
     if not isinstance(mark, dict):
         return True, "never probed"
+    if is_held(mark):
+        return True, "held after a breaker trip -- tried after the rest"
     got = mark.get("got")
     if got != "error":
         return False, "probed, stream had nothing more (%s)" % got
@@ -2985,6 +3061,17 @@ def errors_to_stamp(deferred, broken):
     return out
 
 
+def held_after_trip(deferred, broken):
+    """Pure. The other half of `errors_to_stamp`: failures a tripped breaker
+    discarded. Not errors, but marked held so they go to the back of the queue
+    (see `held_mark`)."""
+    out = []
+    for name in sorted(deferred):
+        if name in broken:
+            out.extend(deferred[name])
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Do not probe a provider that is busy with real playback
 # --------------------------------------------------------------------------- #
@@ -3134,9 +3221,9 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=None
     """Measure the wanted copies no provider would describe.
 
     `skip_accounts`: account ids to leave out entirely -- a nightly run passes
-    the ones whose breaker tripped in an earlier batch. Their failures are not
-    stamped, so without this every later batch would pick the same copies and
-    probe a provider that has already shown it is not answering.
+    the ones whose breaker tripped in an earlier batch. Without this every later
+    batch would go back to a provider that has already shown it is not
+    answering tonight.
 
     Scope comes from the same wanted-set file as step 2 and fails closed the
     same way. Candidates are what step 2 could not fill.
@@ -3195,7 +3282,8 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=None
             target.append((rel.movie_id, [rel]))
     # Gaps first, DV checks with whatever budget is left: a copy with no
     # resolution or audio at all costs ranking more than an unknown DV status.
-    per_movie = fill + dv
+    # Copies a tripped breaker held go after both, so they cannot block the rest.
+    per_movie = held_last(fill + dv, lambda r: is_held(own_mark(r, "probe")))
 
     # Leave accounts that are busy RIGHT NOW out of the batch before choosing
     # it. Otherwise the budget can land entirely on a busy provider -- the next
@@ -3307,7 +3395,8 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=None
                         logger.warning(
                             "[VOD-MERGE] probe circuit breaker tripped for %r after "
                             "%d consecutive failures (last: %s) -- abandoning it for "
-                            "this run and recording nothing against its streams",
+                            "this run and holding its failed copies for the back "
+                            "of the queue",
                             name, consecutive[name], why)
                 else:
                     consecutive[name] = 0
@@ -3367,6 +3456,17 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=None
         except Exception:
             logger.exception(
                 "[VOD-MERGE] could not store probe error for rel=%s", rel.id)
+    for rel in held_after_trip(deferred_errors, stats["broken"]):
+        props = rel.custom_properties or {}
+        _stamp_own(props, probe=held_mark(own_mark(rel, "probe"), now_iso,
+                                          held_why.get(rel.id)))
+        rel.custom_properties = props
+        stats["held"] = stats.get("held", 0) + 1
+        try:
+            rel.save(update_fields=["custom_properties"])
+        except Exception:
+            logger.exception(
+                "[VOD-MERGE] could not store held probe for rel=%s", rel.id)
 
     stats["per_account"] = per_account
     logger.info("[VOD-MERGE] stream probe: %s", stats)
@@ -3658,9 +3758,11 @@ def _stop_reason(heartbeat):
     return getattr(heartbeat, "reason", None) or "lost the run lock"
 
 
-_LOOKUP_SUMS = ("fetched", "got_essentials", "empty", "errors", "lookup_skipped")
+_LOOKUP_SUMS = ("fetched", "got_essentials", "empty", "errors", "lookup_skipped",
+                "held")
 _MEASURE_SUMS = ("probed", "gained", "nothing", "errors", "no_url",
-                 "dv_checked", "dv_found", "dv_no_fallback", "bad_streams")
+                 "dv_checked", "dv_found", "dv_no_fallback", "bad_streams",
+                 "held")
 
 
 def _attempted(result):

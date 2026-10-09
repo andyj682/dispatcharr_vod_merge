@@ -2991,7 +2991,7 @@ class DolbyVisionCheckTests(unittest.TestCase):
 
     def test_gaps_go_before_dv_checks_and_the_switch_is_honored(self):
         src = ast.unparse(self._fn("probe_movies_impl"))
-        self.assertIn("per_movie = fill + dv", src)
+        self.assertIn("per_movie = held_last(fill + dv,", src)
         # elif: a copy needing gap-filling is never ALSO queued as a DV check
         self.assertRegex(src, r"if decide_probe\(props, now_iso\)\[0\]:\s*target = fill\s*"
                               r"elif cfg\['probe_4k_dv'\] and decide_dv_check\(props, now_iso\)\[0\]:")
@@ -3711,6 +3711,153 @@ class ProbeFailureReasonTests(unittest.TestCase):
         tot = patch.run_batches(lambda skip: next(it), lambda: True)
         self.assertEqual(tot["measure"]["why"], {"http 404": 3})
         self.assertEqual(tot["measure"]["broken_why"], {"P": "http 404"})
+
+
+class HeldAfterTripTests(unittest.TestCase):
+    """A failure a tripped breaker discarded must not leave its copy at the
+    front of the queue. Regression: a few copies that always timed out sat at
+    the front of one provider's queue, tripped the breaker at the start of
+    every run, and stopped that provider's measuring for good."""
+
+    class _Copy:
+        def __init__(self, rid):
+            self.id = rid
+            self.movie_id = rid
+            self.m3u_account_id = 1
+            self.custom_properties = {}
+
+    def _mark(self, c):
+        return patch.own_mark(c, "probe")
+
+    def _run(self, copies, bad, limit, now):
+        """One measuring run, built from the plugin's own queue and breaker
+        pieces: due copies in order, held ones last, stop after PROBE_BREAKER
+        failures in a row, then stamp errors or holds. -> copies measured."""
+        due = [c for c in copies
+               if patch._probe_mark_decision(self._mark(c), now, 7)[0]]
+        groups = patch.held_last([(c.movie_id, [c]) for c in due],
+                                 lambda r: patch.is_held(self._mark(r)))
+        chosen = patch.take_whole_movies(groups, limit, allow_oversized=False)
+        consecutive, deferred, broken, measured = 0, {"P": []}, [], 0
+        for c in chosen:
+            if c.id in bad:
+                consecutive += 1
+                deferred["P"].append(c)
+                if consecutive >= patch.PROBE_BREAKER:
+                    broken = ["P"]
+                    break
+                continue
+            consecutive = 0
+            patch._stamp_own(c.custom_properties, probe={"at": now, "got": "full"})
+            measured += 1
+        for c in patch.errors_to_stamp(deferred, broken):
+            patch._stamp_own(c.custom_properties, probe={"at": now, "got": "error"})
+        for c in patch.held_after_trip(deferred, broken):
+            patch._stamp_own(c.custom_properties,
+                             probe=patch.held_mark(self._mark(c), now, "timeout"))
+        return measured
+
+    def test_failing_copies_at_the_front_no_longer_stall_the_queue(self):
+        copies = [self._Copy(i) for i in range(1, 11)]
+        bad = {1, 2, 3}
+        now = NOW.isoformat()
+        per_run = [self._run(copies, bad, 5, now) for _ in range(6)]
+        self.assertEqual(per_run[0], 0)          # trips on the three, as before
+        self.assertGreater(per_run[1], 0)        # ...but the next run moves on
+        good = [c for c in copies if c.id not in bad]
+        self.assertTrue(all(self._mark(c)["got"] == "full" for c in good))
+        # The bad three end as ordinary errors, out of the queue for the window.
+        for c in copies:
+            if c.id in bad:
+                self.assertEqual(self._mark(c)["got"], "error")
+                self.assertEqual(self._mark(c)["holds"], patch.HOLD_LIMIT)
+                self.assertFalse(patch._probe_mark_decision(self._mark(c), now, 7)[0])
+        self.assertEqual(per_run[-1], 0)         # and then nothing is left to do
+
+    def test_after_an_outage_held_copies_are_retried_at_once(self):
+        copies = [self._Copy(i) for i in range(1, 4)]
+        now = NOW.isoformat()
+        self.assertEqual(self._run(copies, {1, 2, 3}, 5, now), 0)   # provider down
+        self.assertTrue(all(patch.is_held(self._mark(c)) for c in copies))
+        self.assertEqual(self._run(copies, set(), 5, now), 3)       # back up: no wait
+        self.assertTrue(all(self._mark(c)["got"] == "full" for c in copies))
+
+    def test_hold_counts_up_then_becomes_an_error(self):
+        now = NOW.isoformat()
+        m1 = patch.held_mark(None, now, "timeout")
+        self.assertEqual((m1["got"], m1["holds"], m1["why"]), ("held", 1, "timeout"))
+        m2 = patch.held_mark(m1, now)
+        self.assertEqual((m2["got"], m2["holds"]), ("held", 2))
+        self.assertNotIn("why", m2)
+        m3 = patch.held_mark(m2, now, "http 5xx")
+        self.assertEqual((m3["got"], m3["holds"], m3["why"]),
+                         ("error", patch.HOLD_LIMIT, "http 5xx"))
+
+    def test_only_consecutive_holds_count(self):
+        now = NOW.isoformat()
+        for prev in (None, {"at": now, "got": "error", "holds": 2},
+                     {"at": now, "got": "full"}, {"got": "held", "holds": "junk"}):
+            self.assertEqual(patch.held_mark(prev, now)["holds"], 1, prev)
+
+    def test_a_held_copy_is_due_without_waiting(self):
+        now = NOW.isoformat()
+        held = {"at": now, "got": "held", "holds": 1}
+        self.assertTrue(patch._probe_mark_decision(held, now, 7)[0])
+        enrich = {patch.OWN_PROPS_KEY: {"enrich": held}, "detailed_info": {}}
+        self.assertTrue(patch.decide_enrich(enrich, now)[0])
+        probe = {patch.OWN_PROPS_KEY: {"enrich": {"at": now, "got": "none"},
+                                       "probe": held}, "detailed_info": {}}
+        self.assertTrue(patch.decide_probe(probe, now)[0])
+
+    def test_held_go_last_and_keep_their_order(self):
+        H = {"h1", "h2"}
+        groups = [(1, ["a", "h1"]), (2, ["h2"]), (3, ["b"])]
+        self.assertEqual(patch.held_last(groups, lambda r: r in H),
+                         [(1, ["a"]), (3, ["b"]), (1, ["h1"]), (2, ["h2"])])
+        self.assertEqual(patch.held_last(groups, lambda r: False), groups)
+
+    def test_trip_splits_failures_into_errors_and_holds(self):
+        deferred = {"good": ["r1"], "down": ["r2", "r3"]}
+        self.assertEqual(patch.held_after_trip(deferred, ["down"]), ["r2", "r3"])
+        self.assertEqual(patch.errors_to_stamp(deferred, ["down"]), ["r1"])
+        self.assertEqual(patch.held_after_trip(deferred, []), [])
+
+    # --- call sites: the policy lives where the queue is built --------------
+    def _src(self, name):
+        tree = ast.parse(open(patch.__file__, encoding="utf-8").read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return ast.unparse(node)
+        self.fail("%s not found" % name)
+
+    def test_measuring_puts_held_last_before_choosing_the_batch(self):
+        src = self._src("probe_movies_impl")
+        call = "held_last(fill + dv, lambda r: is_held(own_mark(r, 'probe')))"
+        self.assertIn(call, src)
+        self.assertLess(src.index(call), src.index("take_whole_movies("))
+        self.assertIn("held_after_trip(deferred_errors, stats['broken'])", src)
+        self.assertIn("_stamp_own(props, probe=held_mark(own_mark(rel, 'probe'), now_iso, "
+                      "held_why.get(rel.id)))", src)
+
+    def test_lookups_put_held_last_before_choosing_the_batch(self):
+        src = self._src("enrich_movies_impl")
+        call = "held_last(per_movie, lambda r: is_held(own_mark(r, 'enrich')))"
+        self.assertIn(call, src)
+        self.assertLess(src.index(call), src.index("take_whole_movies("))
+        self.assertIn("held_after_trip(deferred_errors, stats['broken'])", src)
+        self.assertIn("_stamp_own(props, enrich=held_mark(own_mark(rel, 'enrich'), now_iso))",
+                      src)
+
+    def test_nightly_totals_and_status_report_holds(self):
+        self.assertIn("held", patch._LOOKUP_SUMS)
+        self.assertIn("held", patch._MEASURE_SUMS)
+        import plugin as plugin_mod
+        out = plugin_mod._format_last_run({
+            "state": "finished", "finished_at": "2030-01-02T03:04:05+00:00",
+            "result": {"lookup": {"held": 1},
+                       "measure": {"probed": 0, "errors": 3, "held": 3,
+                                   "broken": ["P"], "broken_why": {"P": "timeout"}}}})
+        self.assertIn("4 held for later", out)
 
 
 class ManifestParityTests(unittest.TestCase):

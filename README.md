@@ -20,7 +20,7 @@ whose type is not XC, because the signals are read from the XC listing payload
 and no other provider type exposes an equivalent. On an install with no XC
 accounts the plugin loads, reports cleanly, and does nothing.
 
-Validated against Dispatcharr 0.30.0 and 0.31.0.
+Validated against Dispatcharr 0.31.0 and 0.32.0 (merging also against 0.30.0).
 
 ## The problem
 
@@ -739,9 +739,12 @@ about the provider. Other failures — refused or reset connections, timeouts,
 the breaker counts.
 
 If several measurements against one provider fail in a row, the rest are
-abandoned for that run and nothing is recorded against those streams — repeated
-failure says the provider is not answering, not that each individual stream is
-bad.
+abandoned for that run, and those failures are not recorded as errors —
+repeated failure says the provider is not answering, not that each individual
+stream is bad. The copies involved are **held**: moved to the back of the queue,
+so a few streams that keep failing cannot block everything behind them. A copy
+held three runs in a row is treated as a bad stream after all and waits the
+normal week. **Enrichment status** reports how many copies the last run held.
 
 ### Faster on a large wanted set
 
@@ -781,9 +784,10 @@ comes back during the night is picked up.
 
 A provider that stops answering *part-way* through is caught by a breaker:
 after several failed lookups in a row it is left alone for the rest of the
-night, and those failures are not recorded either. Recording them would put
-every copy that happened to be queued during the outage into a week-long retry
-wait. An isolated failure on a provider that is otherwise answering is still
+night, and those failures are not recorded as errors either; the copies are
+held for the back of the queue, as on the measuring side. Recording them would
+put every copy that happened to be queued during the outage into a week-long
+retry wait. An isolated failure on a provider that is otherwise answering is still
 recorded and retried after a week, as before. **Enrichment status** names any
 provider skipped or stopped this way.
 
