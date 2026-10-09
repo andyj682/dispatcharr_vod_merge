@@ -655,6 +655,53 @@ run it again to continue.
 many titles resolve, how many copies they have between them, and how many still
 need a lookup — so you know the size of the job before starting one.
 
+### Wanted set file format
+
+A small JSON file, written by whatever syncs your library and readable by
+Dispatcharr at the path you give in **Movie wanted set file**. Rewrite it after
+every sync.
+
+```json
+{
+  "schema": 1,
+  "generated_at": "2030-01-01T06:00:00Z",
+  "generator": "my-sync-tool",
+  "count": 2,
+  "tmdb_ids": [12345, 67890],
+  "unidentified": [
+    {"stream_id": 111, "name": "Example Film (2020)", "resolved_tmdb_id": 24680}
+  ]
+}
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `schema` | yes | Must be `1`. |
+| `generated_at` | yes | When the file was written, ISO 8601 in UTC. |
+| `generator` | no | Free text naming the tool. Informational only. |
+| `count` | yes | Must equal the number of entries in `tmdb_ids`. A cheap check against a file written by a sync that stopped part-way. |
+| `tmdb_ids` | yes | TMDB ids of the movies you sync. Each is matched to the Dispatcharr movie carrying that id. May be empty if `unidentified` is not. |
+| `unidentified` | no | Movies you sync that have no TMDB id in Dispatcharr — often the ones most in need of enrichment, since a provider that ships no id usually ships no details either. |
+
+Each `unidentified` entry has:
+
+- `stream_id` (required) — the movie's Dispatcharr id, which is the stream id
+  Dispatcharr's Xtream Codes output gives for it.
+- `name` (optional) — the movie's name exactly as Dispatcharr shows it.
+- `resolved_tmdb_id` (optional) — a TMDB id your tool found by its own lookup.
+
+Leave an optional key out rather than sending it as `null`.
+
+**Why ids alone are not enough.** Dispatcharr's movie ids change whenever a
+provider re-creates its catalog, so a `stream_id` from your last sync may
+already be gone. An entry is matched by `stream_id` while that movie exists;
+failing that, by `name`, but only when exactly one movie has that name. A
+`resolved_tmdb_id` is never used on its own — it came from a lookup nobody
+verified — so it can only confirm a match the other two made, and if it
+disagrees, the entry is skipped. Entries that cannot be matched are skipped and
+counted in **Enrichment status**; they are expected after a catalog change and
+come back with your tool's next sync.
+
 ### What it refuses to do
 
 If the file is missing, unreadable, malformed, of an unknown schema, internally
