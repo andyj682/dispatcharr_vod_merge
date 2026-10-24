@@ -527,6 +527,43 @@ one that failed during an outage needs three trips in a row — each of which
 reached it only after everything else — before it waits a week. Any other mark
 resets the count, so only *consecutive* holds add up.
 
+### Once a bad stream, treated as a bad stream
+
+Holding fixed the copies that hang. It left one more way for dead copies to
+stall a provider. A copy the provider answered `400` for is recorded against
+the copy and retried a week later — and providers keep listing files they can
+no longer serve, so on that retry the same dead file may answer with a 5xx
+instead. A 5xx counts toward the breaker. Many such copies came due
+together on one provider, and every run stopped it after a handful of them,
+with new copies queued behind them waiting for weeks.
+
+The fix uses evidence the plugin already holds. If a copy's last record says
+the provider called the *stream* bad, a new failure of any kind is blamed on
+the stream as well: recorded at once, never counted toward the breaker. The
+record keeps an explicit bad-stream flag, because the reason it stores is the
+latest one — a 5xx — which on its own would not read as a bad stream, and the
+chain would break on the third attempt.
+
+Each repeat is a strike, and from the second on the copy is **dead**: retried
+every 30 days rather than every week. Not abandoned — providers do sometimes
+fix a stream — but a copy that has failed twice after its provider disowned it
+should cost one probe a month, not one a week.
+
+A stream that hangs never produces a bad-stream answer, so it needs a second
+way in. Holding supplies it: a copy held three runs in a row kept failing
+while it sat at the front of its provider's queue, run after run, which in
+practice means a stream that hangs while the provider serves everything else.
+Its third hold therefore ends in an error that is also a first strike, and its
+next failure makes it dead. Without this, such copies cycled — three holds, a
+week's wait, three holds — and tripped the provider's breaker each time they
+came due, ahead of any new copies. Lookups share the hold mechanism but never
+strike: there is no "dead" for a detail request.
+
+The outage case is untouched by construction. Only copies with a bad-stream
+record are affected; a copy with no history, or one that worked last time, is
+judged exactly as before. An outage reaches those first, in the normal order,
+and trips the breaker as it always did.
+
 ### Two destinations for one measurement
 
 Results go to a key of our own and are mirrored into the detail Dispatcharr

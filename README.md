@@ -785,6 +785,16 @@ about the provider. Other failures — refused or reset connections, timeouts,
 `401`/`403`, server errors — can mean the provider itself, and those are what
 the breaker counts.
 
+Once a provider has said a stream is no good, that copy stays a suspect: if it
+fails again on its retry, with any error, the failure is blamed on the stream
+too, not counted against the provider. Providers often keep listing files they
+can no longer serve, and the same dead file may answer `400` one week and a
+server error the next. A copy that fails like this twice in a row is **dead**:
+it is retried every 30 days instead of every week, in case the provider fixes
+it. A stream that never answers at all gets there too: once it has been held
+three runs in a row (above), its next failure makes it dead. **Enrichment status** shows dead copies per provider as a third number,
+`left lookup/measure/dead`, once there are any.
+
 If several measurements against one provider fail in a row, the rest are
 abandoned for that run, and those failures are not recorded as errors —
 repeated failure says the provider is not answering, not that each individual

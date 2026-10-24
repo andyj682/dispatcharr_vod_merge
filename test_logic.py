@@ -2388,7 +2388,8 @@ class EnrichStatusMessageTests(unittest.TestCase):
         st = dict(self._st(4), movies=12345, relations=99999, have_essentials=99999,
                   need_fetch=99999, need_measure=99999, need_dv_check=999, nights=99)
         st["per_account"] = {"Provider%d" % i: {"need": 99999, "measure": 99999,
-                                                 "not_describing": i % 2 == 0}
+                                                 "not_describing": i % 2 == 0,
+                                                 "dead": 9999}
                              for i in range(4)}
         st["last_enrich_run"] = {
             "state": "finished", "nightly": True,
@@ -3649,8 +3650,15 @@ class ProbeFailureReasonTests(unittest.TestCase):
         tree = ast.parse(open(patch.__file__, encoding="utf-8").read())
         lane = next(n for n in ast.walk(tree)
                     if isinstance(n, ast.FunctionDef) and n.name == "probe_lane")
+        src = ast.unparse(lane)
+        # Blamed on the stream when the provider says so now, OR said so last
+        # time and the copy failed again (1.5.11).
+        self.assertIn("bad_mark = bad_stream_mark(prior, now_iso, why) if outcome == "
+                      "'error' and blames_stream(why, prior) else None", src)
+        self.assertLess(src.index("prior = own_mark(rel, 'probe')"),
+                        src.index("run_ffprobe(url, ua)"))
         branch = [n for n in ast.walk(lane) if isinstance(n, ast.If)
-                  and ast.unparse(n.test) == "outcome == 'error' and is_stream_level(why)"]
+                  and ast.unparse(n.test) == "bad_mark is not None"]
         self.assertEqual(len(branch), 2, "one to count it, one to record it")
         counted, recorded = sorted(branch, key=lambda n: n.lineno)
         body = ast.unparse(ast.Module(body=counted.body, type_ignores=[]))
@@ -3661,7 +3669,7 @@ class ProbeFailureReasonTests(unittest.TestCase):
         self.assertIn("consecutive[name] = consecutive.get(name, 0) + 1",
                       ast.unparse(counted.orelse[0]))
         rec = ast.unparse(ast.Module(body=recorded.body, type_ignores=[]))
-        self.assertIn("_stamp_own(props, probe={'at': now_iso, 'got': 'error', 'why': why})", rec)
+        self.assertIn("_stamp_own(props, probe=bad_mark)", rec)
         self.assertIn("rel.save(update_fields=['custom_properties'])", rec)
 
     def test_a_bad_stream_waits_out_the_normal_retry(self):
@@ -3837,7 +3845,7 @@ class HeldAfterTripTests(unittest.TestCase):
         self.assertLess(src.index(call), src.index("take_whole_movies("))
         self.assertIn("held_after_trip(deferred_errors, stats['broken'])", src)
         self.assertIn("_stamp_own(props, probe=held_mark(own_mark(rel, 'probe'), now_iso, "
-                      "held_why.get(rel.id)))", src)
+                      "held_why.get(rel.id), strike=True))", src)
 
     def test_lookups_put_held_last_before_choosing_the_batch(self):
         src = self._src("enrich_movies_impl")
@@ -3858,6 +3866,162 @@ class HeldAfterTripTests(unittest.TestCase):
                        "measure": {"probed": 0, "errors": 3, "held": 3,
                                    "broken": ["P"], "broken_why": {"P": "timeout"}}}})
         self.assertIn("4 held for later", out)
+
+
+class DeadStreamTests(unittest.TestCase):
+    """Once a bad stream, treated as a bad stream. Regression: many copies a
+    provider still listed but could not serve answered 400, then 5xx
+    on their weekly retry; the 5xx counted toward the breaker, so every run
+    stopped that provider after a handful and new copies waited for weeks."""
+
+    OLD = (NOW - timedelta(days=8)).isoformat()
+
+    def _bad(self, why="http 400", **extra):
+        return dict({"at": self.OLD, "got": "error", "why": why}, **extra)
+
+    def test_a_bad_stream_answer_is_remembered(self):
+        self.assertTrue(patch.was_bad_stream(self._bad()))              # pre-1.5.11 mark
+        self.assertTrue(patch.was_bad_stream(self._bad("http 5xx", bad_stream=True)))
+        for mark in (self._bad("http 5xx"), self._bad("timeout"),
+                     {"at": self.OLD, "got": "held", "holds": 1},
+                     {"at": self.OLD, "got": "full"}, None):
+            self.assertFalse(patch.was_bad_stream(mark), mark)
+
+    def test_a_repeat_failure_is_blamed_on_the_stream(self):
+        self.assertTrue(patch.blames_stream("http 5xx", self._bad()))
+        self.assertTrue(patch.blames_stream("timeout", self._bad()))
+        self.assertTrue(patch.blames_stream("http 404", None))
+        # No such history: judged as before, so an outage still counts.
+        for prev in (None, {"at": self.OLD, "got": "full"}, self._bad("timeout"),
+                     {"at": self.OLD, "got": "held", "holds": 2}):
+            self.assertFalse(patch.blames_stream("http 5xx", prev), prev)
+
+    def test_strikes_count_up_and_keep_the_chain(self):
+        now = NOW.isoformat()
+        m1 = patch.bad_stream_mark(None, now, "http 400")
+        self.assertEqual((m1["strikes"], m1["bad_stream"]), (1, True))
+        self.assertFalse(patch.is_dead(m1))
+        m2 = patch.bad_stream_mark(self._bad(), now, "http 5xx")   # legacy 400 -> 5xx
+        self.assertEqual((m2["strikes"], m2["why"]), (2, "http 5xx"))
+        self.assertTrue(patch.is_dead(m2))
+        # The 5xx mark must still read as a bad stream, or the chain breaks.
+        self.assertTrue(patch.was_bad_stream(m2))
+        self.assertEqual(patch.bad_stream_mark(m2, now, "timeout")["strikes"], 3)
+        self.assertEqual(patch.bad_stream_mark(self._bad(strikes="x"), now, "x")["strikes"], 2)
+
+    def test_dead_copies_wait_a_month_others_a_week(self):
+        now = NOW.isoformat()
+        ten = (NOW - timedelta(days=10)).isoformat()
+        month = (NOW - timedelta(days=patch.DEAD_RETRY_DAYS + 1)).isoformat()
+        dead = {"at": ten, "got": "error", "why": "http 5xx", "bad_stream": True,
+                "strikes": patch.DEAD_STRIKES}
+        self.assertFalse(patch._probe_mark_decision(dead, now, 7)[0])
+        self.assertTrue(patch._probe_mark_decision(dict(dead, at=month), now, 7)[0])
+        once = dict(dead, strikes=1)
+        self.assertTrue(patch._probe_mark_decision(once, now, 7)[0])
+        self.assertGreater(patch.DEAD_RETRY_DAYS, patch.PROBE_ERROR_RETRY_DAYS)
+
+    # --- a run, built from the plugin's own pieces --------------------------
+    class _Copy:
+        def __init__(self, rid, mark=None):
+            self.id = self.movie_id = rid
+            self.m3u_account_id = 1
+            self.custom_properties = {}
+            if mark is not None:
+                patch._stamp_own(self.custom_properties, probe=mark)
+
+    def _run(self, copies, fails, now):
+        """Mirror of the measuring lane's decisions. `fails`: id -> reason.
+        -> (measured, breaker tripped)."""
+        due = [c for c in copies
+               if patch._probe_mark_decision(patch.own_mark(c, "probe"), now, 7)[0]]
+        consecutive, measured = 0, 0
+        for c in due:
+            prior, why = patch.own_mark(c, "probe"), fails.get(c.id)
+            if why is None:
+                consecutive = 0
+                patch._stamp_own(c.custom_properties, probe={"at": now, "got": "full"})
+                measured += 1
+            elif patch.blames_stream(why, prior):
+                patch._stamp_own(c.custom_properties,
+                                 probe=patch.bad_stream_mark(prior, now, why))
+            else:
+                consecutive += 1
+                if consecutive >= patch.PROBE_BREAKER:
+                    return measured, True
+        return measured, False
+
+    def test_a_copy_held_to_the_limit_is_a_first_strike(self):
+        # A stream that hangs while its provider serves everything else: held
+        # run after run, then one more failure makes it dead (seen live: a copy
+        # that timed out on every attempt and does not play).
+        now = NOW.isoformat()
+        m = None
+        for _ in range(patch.HOLD_LIMIT):
+            m = patch.held_mark(m, now, "timeout", strike=True)
+        self.assertEqual((m["got"], m["strikes"]), ("error", 1))
+        self.assertTrue(patch.was_bad_stream(m))
+        self.assertFalse(patch.is_dead(m))
+        self.assertTrue(patch.blames_stream("timeout", m))
+        self.assertTrue(patch.is_dead(patch.bad_stream_mark(m, now, "timeout")))
+
+    def test_holds_short_of_the_limit_strike_nothing(self):
+        now = NOW.isoformat()
+        m = patch.held_mark(None, now, "timeout", strike=True)
+        self.assertNotIn("strikes", m)
+        self.assertFalse(patch.blames_stream("timeout", m))
+
+    def test_lookups_never_strike(self):
+        now = NOW.isoformat()
+        m = None
+        for _ in range(patch.HOLD_LIMIT):
+            m = patch.held_mark(m, now)
+        self.assertEqual(m["got"], "error")
+        self.assertNotIn("bad_stream", m)
+        self.assertNotIn("strikes", m)
+        src = self._src("enrich_movies_impl")
+        self.assertNotIn("strike=True", src)
+
+    def test_dead_copies_at_the_front_no_longer_trip_the_breaker(self):
+        now = NOW.isoformat()
+        dead = [self._Copy(i, self._bad()) for i in range(1, 11)]   # 400 last week
+        fresh = [self._Copy(i) for i in range(11, 16)]
+        measured, tripped = self._run(dead + fresh, {i: "http 5xx" for i in range(1, 11)}, now)
+        self.assertFalse(tripped)
+        self.assertEqual(measured, 5)                  # the new copies got through
+        self.assertTrue(all(patch.is_dead(patch.own_mark(c, "probe")) for c in dead))
+        # ...and next week they are not even tried.
+        week = (NOW + timedelta(days=8)).isoformat()
+        self.assertEqual(self._run(dead, {}, week), (0, False))
+        self.assertTrue(all(patch.is_dead(patch.own_mark(c, "probe")) for c in dead))
+
+    def test_an_outage_still_trips_the_breaker(self):
+        now = NOW.isoformat()
+        copies = [self._Copy(i) for i in range(1, 6)]                # no history
+        self.assertEqual(self._run(copies, {i: "http 5xx" for i in range(1, 6)}, now),
+                         (0, True))
+
+    # --- call sites ----------------------------------------------------------
+    def _src(self, name):
+        tree = ast.parse(open(patch.__file__, encoding="utf-8").read())
+        return ast.unparse(next(n for n in ast.walk(tree)
+                                if isinstance(n, ast.FunctionDef) and n.name == name))
+
+    def test_status_counts_dead_copies_apart_from_the_backlog(self):
+        self.assertIn("elif is_dead(own_mark(rel, 'probe')):", self._src("enrich_status"))
+        self.assertIn("dead", patch._MEASURE_SUMS)
+        lane = self._src("probe_lane")
+        self.assertIn("if is_dead(bad_mark):", lane)
+
+    def test_status_shows_a_dead_column_only_when_there_are_dead(self):
+        import plugin as plugin_mod
+        st = EnrichStatusMessageTests()._st(2)
+        self.assertNotIn("/dead", plugin_mod._format_enrich_status(st))
+        st["per_account"]["Provider1"]["dead"] = 7
+        out = plugin_mod._format_enrich_status(st)
+        self.assertIn("left lookup/measure/dead:", out)
+        self.assertIn("Provider0 20/25/0", out)
+        self.assertIn("Provider1 20/25/7", out)
 
 
 class ManifestParityTests(unittest.TestCase):

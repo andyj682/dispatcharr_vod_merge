@@ -2132,9 +2132,18 @@ def is_held(mark):
     return isinstance(mark, dict) and mark.get("got") == HELD
 
 
-def held_mark(previous, now_iso, why=None):
+def held_mark(previous, now_iso, why=None, strike=False):
     """Pure. The mark for a failure a tripped breaker discarded, given the
-    copy's previous mark of the same kind."""
+    copy's previous mark of the same kind.
+
+    `strike` (measuring only): a copy held HOLD_LIMIT runs in a row kept
+    failing while it sat at the front of the queue, run after run -- in
+    practice a stream that hangs while its provider serves everything else.
+    So the error it ends with is also a first strike against the stream: its
+    next failure of any kind makes it dead (see `blames_stream`). An outage
+    rarely gets one copy that far, since the front of the queue changes every
+    run, and a copy that works on its retry is simply measured.
+    """
     holds = 1
     if is_held(previous):
         try:
@@ -2145,6 +2154,8 @@ def held_mark(previous, now_iso, why=None):
             "holds": holds}
     if why:
         mark["why"] = why
+    if strike and holds >= HOLD_LIMIT:
+        mark.update(bad_stream=True, strikes=1)
     return mark
 
 
@@ -2311,6 +2322,9 @@ def enrich_status(cfg=None):
         # rather than an estimate of it.
         if decide_probe(props, now_iso)[0]:
             slot["measure"] += 1
+        elif is_dead(own_mark(rel, "probe")):
+            # Listed by the provider, but it cannot serve it: not backlog.
+            slot["dead"] = slot.get("dead", 0) + 1
         should, _ = decide_enrich(props, now_iso)
         if should:
             slot["need"] += 1
@@ -2811,6 +2825,8 @@ def _probe_mark_decision(mark, now_iso, retry_days):
     if when is None:
         return True, "previous error, unreadable timestamp"
     from datetime import timedelta
+    if is_dead(mark):
+        retry_days = max(retry_days, DEAD_RETRY_DAYS)
     now = _parse_iso_z(now_iso)
     if now is not None and (now - when) < timedelta(days=retry_days):
         return False, "previous error, still inside retry window"
@@ -2948,6 +2964,59 @@ STREAM_LEVEL_REASONS = frozenset(("http 400", "http 404", "http 410"))
 def is_stream_level(why):
     """Pure. Does this failure describe the stream rather than the provider?"""
     return why in STREAM_LEVEL_REASONS
+
+
+# Once a bad stream, treated as a bad stream. A copy the provider already said
+# was bad (400/404/410) that fails AGAIN -- with any error -- is not evidence of
+# an outage: the likeliest story by far is the same dead file, now answered
+# with a 5xx or a hang instead. Learned the hard way: many copies that
+# one provider still listed but could not serve answered 400, then 5xx on their
+# weekly retry, and those 5xx counted toward the breaker -- so every run
+# stopped that provider after a handful of them, and new copies queued behind
+# waited for weeks. A copy with no such history, or that worked last time, is
+# judged exactly as before, so a real outage still trips the breaker.
+#
+# Each repeat is a strike; from DEAD_STRIKES on, the copy is "dead" and waits
+# DEAD_RETRY_DAYS rather than the usual week. Never given up on for good --
+# providers do occasionally fix a stream -- but a dead copy costs one probe a
+# month, not one a week.
+DEAD_STRIKES = 2
+DEAD_RETRY_DAYS = 30
+
+
+def was_bad_stream(mark):
+    """Pure. Did this copy's last probe end with the provider saying the stream
+    itself is bad? Marks before 1.5.11 carry only the reason."""
+    return (isinstance(mark, dict) and mark.get("got") == "error"
+            and bool(mark.get("bad_stream") or is_stream_level(mark.get("why"))))
+
+
+def blames_stream(why, previous):
+    """Pure. Is this failure the stream's fault: the provider says so now, or
+    said so last time and the copy has failed again?"""
+    return is_stream_level(why) or was_bad_stream(previous)
+
+
+def bad_stream_mark(previous, now_iso, why):
+    """Pure. The probe mark for a failure blamed on the stream."""
+    strikes = 1
+    if was_bad_stream(previous):
+        try:
+            strikes = int(previous.get("strikes") or 1) + 1
+        except (TypeError, ValueError):
+            strikes = 2
+    return {"at": now_iso, "got": "error", "why": why, "bad_stream": True,
+            "strikes": strikes}
+
+
+def is_dead(mark):
+    """Pure. A copy that kept failing after its provider said it was bad."""
+    if not isinstance(mark, dict) or mark.get("got") != "error":
+        return False
+    try:
+        return int(mark.get("strikes") or 0) >= DEAD_STRIKES
+    except (TypeError, ValueError):
+        return False
 
 
 def ffprobe_failure_reason(stderr_text, returncode, timed_out=False):
@@ -3357,12 +3426,17 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=None
             except Exception:
                 ua = None
 
+            prior = own_mark(rel, "probe")
             rc, parsed, why = run_ffprobe(url, ua)
             outcome = classify_probe(rc, parsed)
             if outcome == "error" and not why:
                 # ffprobe exited cleanly but saw a video stream with no size:
                 # a read cut short (see classify_probe).
                 why = "truncated read"
+            # The stream's fault, not the provider's: said so now, or said so
+            # last time and failing again (see `blames_stream`).
+            bad_mark = (bad_stream_mark(prior, now_iso, why)
+                        if outcome == "error" and blames_stream(why, prior) else None)
 
             with lock:
                 slot = per_account.setdefault(
@@ -3374,11 +3448,14 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=None
                     slot["why"][why] = slot["why"].get(why, 0) + 1
                     stats.setdefault("why", {})
                     stats["why"][why] = stats["why"].get(why, 0) + 1
-                if outcome == "error" and is_stream_level(why):
+                if bad_mark is not None:
                     # The provider answered: this stream is bad. Recorded
                     # against the copy right away (below), and it says nothing
                     # about the provider, so the breaker's count is untouched.
                     stats["bad_streams"] = stats.get("bad_streams", 0) + 1
+                    if is_dead(bad_mark):
+                        stats["dead"] = stats.get("dead", 0) + 1
+                        slot["dead"] = slot.get("dead", 0) + 1
                 elif outcome == "error":
                     consecutive[name] = consecutive.get(name, 0) + 1
                     # Hold the stamp. Repeated failure against one account is a
@@ -3414,9 +3491,9 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=None
                 logger.info("[VOD-MERGE] probe failed on %r rel=%s: %s",
                             name, rel.id, why)
 
-            if outcome == "error" and is_stream_level(why):
+            if bad_mark is not None:
                 props = rel.custom_properties or {}
-                _stamp_own(props, probe={"at": now_iso, "got": "error", "why": why})
+                _stamp_own(props, probe=bad_mark)
                 rel.custom_properties = props
                 try:
                     rel.save(update_fields=["custom_properties"])
@@ -3459,7 +3536,7 @@ def probe_movies_impl(limit=None, delay=None, heartbeat=None, skip_accounts=None
     for rel in held_after_trip(deferred_errors, stats["broken"]):
         props = rel.custom_properties or {}
         _stamp_own(props, probe=held_mark(own_mark(rel, "probe"), now_iso,
-                                          held_why.get(rel.id)))
+                                          held_why.get(rel.id), strike=True))
         rel.custom_properties = props
         stats["held"] = stats.get("held", 0) + 1
         try:
@@ -3762,7 +3839,7 @@ _LOOKUP_SUMS = ("fetched", "got_essentials", "empty", "errors", "lookup_skipped"
                 "held")
 _MEASURE_SUMS = ("probed", "gained", "nothing", "errors", "no_url",
                  "dv_checked", "dv_found", "dv_no_fallback", "bad_streams",
-                 "held")
+                 "held", "dead")
 
 
 def _attempted(result):

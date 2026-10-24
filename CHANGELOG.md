@@ -7,6 +7,37 @@ Everything through 0.8.3 landed during initial development against a single
 large live library; the entries below record *why* each change was needed, since
 several were driven by failures that were invisible from the outside.
 
+## 1.5.11 — 2026-10-16
+
+**Fixed — dead copies could hold up a provider's measuring for weeks**
+
+- Providers often keep listing files they can no longer serve. Such a copy
+  answers `http 400` and is recorded with a one-week retry, as intended. But on
+  that retry the same dead file may answer with a server error instead, and a
+  server error counts toward the provider's breaker. When many of these came due
+  together, every run stopped that provider after a handful of them, and copies
+  queued behind them waited for weeks.
+
+- A copy whose last record says the provider called the stream bad is now
+  blamed again if it fails again, whatever the error: recorded at once and
+  never counted toward the breaker. A copy with no such history, or that worked
+  last time, is judged exactly as before, so a real outage still stops the
+  provider for the night.
+
+- A copy that fails like this twice in a row is **dead** and is retried every
+  30 days instead of every week. Records written by earlier versions count, so
+  copies that already answered `400` become dead on their next failure.
+
+- Streams that never answer at all reach the same place. A copy held three
+  runs in a row (see 1.5.10) kept failing at the front of its provider's queue
+  while the provider served everything else, so its third hold also counts as
+  a first strike: its next failure makes it dead. Copies that only ever time
+  out no longer trip the provider's breaker once a week.
+
+- **Enrichment status** shows dead copies per provider as a third number —
+  `left lookup/measure/dead` — once there are any. They are not part of the
+  backlog or the nights estimate.
+
 ## 1.5.10 — 2026-10-07
 
 **Fixed — copies that keep failing could stop a provider's enrichment for good**

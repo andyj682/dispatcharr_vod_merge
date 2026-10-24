@@ -114,9 +114,14 @@ def _format_enrich_status(st):
     because it grows with the number of accounts. The full breakdown is in the
     run record and the log.
     """
+    accounts = sorted(st.get("per_account", {}).items())
+    # A third number only once something is dead: copies a provider lists but
+    # cannot serve, waiting out a 30-day retry. Not backlog, so kept apart.
+    dead = any(v.get("dead") for _a, v in accounts)
     per = " | ".join(
         f"{a}{'*' if v.get('not_describing') else ''} {v['need']}/{v['measure']}"
-        for a, v in sorted(st.get("per_account", {}).items()))
+        + (f"/{v.get('dead', 0)}" if dead else "")
+        for a, v in accounts)
     unresolved = ((st.get("tmdb_total", 0) - st.get("tmdb_resolved", 0))
                   + (st.get("unid_total", 0) - st.get("unid_resolved", 0)))
     nights = st.get("nights")
@@ -131,7 +136,7 @@ def _format_enrich_status(st):
         + (f" | ~{nights} night{'' if nights == 1 else 's'}" if nights else "")
         + "\n"
         + _format_last_run(st.get("last_enrich_run"))
-        + (f"\nleft lookup/measure: {per}" if per else "")
+        + (f"\nleft lookup/measure{'/dead' if dead else ''}: {per}" if per else "")
     )
 
 
@@ -243,7 +248,7 @@ def _format_log(data, limit=60):
 class Plugin:
     # UI title only; "Dispatcharr" is redundant inside the Dispatcharr UI.
     name = "VOD Merge & Enrich"
-    version = "1.5.10"
+    version = "1.5.11"
     description = (
         "Merges duplicate VOD titles from providers that omit TMDB ids, by "
         "matching other details to an existing title. Adds video and audio specs "
