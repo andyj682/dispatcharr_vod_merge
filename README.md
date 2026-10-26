@@ -20,7 +20,17 @@ whose type is not XC, because the signals are read from the XC listing payload
 and no other provider type exposes an equivalent. On an install with no XC
 accounts the plugin loads, reports cleanly, and does nothing.
 
-Validated against Dispatcharr 0.31.0 and 0.32.0 (merging also against 0.30.0).
+Validated against Dispatcharr 0.31.0 and 0.32.0 (merging also against 0.30.0),
+and checked against the 0.33.0 source.
+
+> **Dispatcharr 0.33.0: do not set a language on VOD categories yet.** 0.33.0
+> lets you tag a VOD category with a language, and from then on treats the same
+> film or show in two languages as two separate entries. This plugin does not
+> account for languages yet: once any category is tagged, it can merge a copy
+> into the other language's entry, create entries it should not, or leave one
+> language's copies unenriched. With no category tagged — the default —
+> nothing changes and everything here works as described. A language-aware
+> release will lift this.
 
 ## The problem
 

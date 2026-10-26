@@ -9,6 +9,11 @@ several were driven by failures that were invisible from the outside.
 
 ## 1.5.11 — 2026-10-16
 
+**Dispatcharr 0.33.0:** checked against the 0.33.0 source and compatible, as
+long as no VOD category has a language set. 0.33.0 can tag categories with a
+language and then keeps one entry per language; this release does not handle
+that yet, so leave category languages unset for now (see the README).
+
 **Fixed — dead copies could hold up a provider's measuring for weeks**
 
 - Providers often keep listing files they can no longer serve. Such a copy
