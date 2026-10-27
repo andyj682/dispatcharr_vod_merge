@@ -20,8 +20,8 @@ whose type is not XC, because the signals are read from the XC listing payload
 and no other provider type exposes an equivalent. On an install with no XC
 accounts the plugin loads, reports cleanly, and does nothing.
 
-Validated against Dispatcharr 0.31.0 and 0.32.0 (merging also against 0.30.0),
-and checked against the 0.33.0 source.
+Validated against Dispatcharr 0.31.0, 0.32.0 and 0.33.0 (merging also against
+0.30.0).
 
 > **Dispatcharr 0.33.0 category languages:** merging covers untagged
 > categories only. Anything in a category you tag with a language is left to
