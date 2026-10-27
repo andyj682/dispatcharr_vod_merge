@@ -112,6 +112,30 @@ therefore mirrors core's `category_enabled()` check. Without that mirror the
 audit log fills with phantom merges for content that is never synced — measured
 at ~5,000 logged against 438 real.
 
+### Language-tagged content is left alone
+
+Dispatcharr 0.33.0 keys identity by `(tmdb, language)`. A category can be tagged
+with a language, and its entries then get one row per language. Untagged is
+`''`, and that is the default.
+
+The signals here say nothing about language: a poster is the same for a film's
+English and French entries. So the plugin stays out of tagged content rather
+than guessing. It skips an entry whose category is tagged *or* whose current row
+is. Both are needed because core pins an existing relation to its row's language
+for the batch and only a later reconcile moves it. Checking one side alone leaves
+a window in which an injected id is carried into a tagged row.
+
+The indexes, the canonical lookups, and the id-less rows that preview, the sweep
+and the what-if act on are all limited to untagged rows. That keeps the
+direction guard below true: a poster seen only on an English row cannot send an
+untagged entry to `('tmdb', X, '')` and mint a row there. Merge protection
+scopes its holder lookup to the refreshed row's language, as core's own handler
+now does.
+
+On an untagged library every one of these filters is `language=''`, which every
+row satisfies, so behavior is unchanged; a test pins that. Before 0.33.0 the
+field does not exist and the filters are left out.
+
 ### Durability
 
 Once injected, every subsequent scan re-derives the same `tmdb_<id>` key, finds
@@ -558,6 +582,10 @@ next failure makes it dead. Without this, such copies cycled — three holds, a
 week's wait, three holds — and tripped the provider's breaker each time they
 came due, ahead of any new copies. Lookups share the hold mechanism but never
 strike: there is no "dead" for a detail request.
+
+One failure is never blamed on the stream: a `401` or `403`. Those refuse the
+account or the address, not the file, and a provider that blocks a login
+answers every stream that way, so they count toward the breaker instead.
 
 The outage case is untouched by construction. Only copies with a bad-stream
 record are affected; a copy with no history, or one that worked last time, is

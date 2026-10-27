@@ -7,6 +7,30 @@ Everything through 0.8.3 landed during initial development against a single
 large live library; the entries below record *why* each change was needed, since
 several were driven by failures that were invisible from the outside.
 
+## 1.5.12 — 2026-10-26
+
+**Dispatcharr 0.33.0 category languages are now handled.** 0.33.0 can tag a
+VOD category with a language and then keeps one entry per language for the same
+title. Merging now covers untagged content only:
+
+- An entry in a language-tagged category, or one sitting on a tagged entry, is
+  never merged; Dispatcharr handles it on its own.
+- Artwork, plot and detail matches are checked against untagged entries only,
+  so a match can no longer land on another language's entry or create one.
+- Merge protection only moves a copy onto an entry of the same language, the
+  way Dispatcharr's own handler now looks it up.
+- Enrichment measures every language's entries of a wanted title. Before, only
+  one of them was measured.
+
+With no category tagged, nothing changes. Before 0.33.0 the language checks are
+skipped entirely.
+
+**Fixed: an account refusal no longer counts against a stream.** Since 1.5.11 a
+copy the provider had already called bad was blamed for any later failure. A
+`401` or `403` refuses the login, though, not the file: a blocked account or a
+rate-limited address answers every stream that way. Those now count toward the
+provider's breaker like any other 401/403 and never add a dead-stream strike.
+
 ## 1.5.11 — 2026-10-16
 
 **Dispatcharr 0.33.0:** checked against the 0.33.0 source and compatible, as

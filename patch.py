@@ -258,6 +258,7 @@ NO_CANONICAL = "no_canonical"    # movies: id known, but no existing row holds i
 AMBIGUOUS = "ambiguous"          # signal hit a key claimed by >1 show
 VARIANT = "variant"
 DENIED = "denied"
+TAGGED_LANGUAGE = "tagged_language"  # 0.33.0+: in a language-tagged category or row
 PROTECTED = "protected"          # a destructive core merge was prevented
 PRESERVED = "preserved"          # detail a core refresh dropped was put back
 PRUNE_BLOCKED = "prune_blocked"  # a catalog-wide delete after an empty listing
@@ -632,10 +633,11 @@ def build_indexes_from_rows(rows, poster_fields=POSTER_FIELDS,
 
 
 def _build_indexes():
-    from apps.vod.models import M3USeriesRelation
+    from apps.vod.models import M3USeriesRelation, Series
 
     qs = (
         M3USeriesRelation.objects
+        .filter(**untagged(Series, "series__"))
         .exclude(series__tmdb_id=None)
         .exclude(series__tmdb_id="")
         .values_list("custom_properties", "series__tmdb_id", "series__description")
@@ -676,10 +678,11 @@ def _get_indexes(force: bool = False):
 
 
 def _build_movie_indexes():
-    from apps.vod.models import M3UMovieRelation
+    from apps.vod.models import M3UMovieRelation, Movie
 
     qs = (
         M3UMovieRelation.objects
+        .filter(**untagged(Movie, "movie__"))
         .exclude(movie__tmdb_id=None)
         .exclude(movie__tmdb_id="")
         .values_list("custom_properties", "movie__tmdb_id", "movie__description")
@@ -790,6 +793,88 @@ def is_denied(denylist, account_name, external_id, tmdb_id):
     if external_id is not None and f"{account_name}:{external_id}" in denylist:
         return True
     return False
+
+
+# --------------------------------------------------------------------------- #
+# Language (Dispatcharr 0.33.0+)
+# --------------------------------------------------------------------------- #
+# 0.33.0 makes VOD identity per language. A category can be tagged with a
+# language, and core then keys its entries by (tmdb, language) rather than by
+# tmdb alone, keeping one Movie/Series row per language. Untagged is '' and is
+# the default; nothing infers a language.
+#
+# The matching here knows nothing about languages, so the plugin stays out of
+# tagged content entirely: it never injects into an entry that resolves to a
+# tagged language, and it only matches against, and lands on, UNTAGGED rows.
+# Otherwise a poster match against an English row could inject into a French
+# entry, core would key it ('tmdb', X, 'fr'), find nothing there and MINT a
+# row -- breaking the rule that poster and plot matches can only merge.
+#
+# On an untagged library every filter below is `language=''`, which every row
+# satisfies, so behavior is exactly what it was before 0.33.0. On older
+# versions the field does not exist and the filters are left out.
+#
+# Why the category AND the row. Core pins a stream that already has a relation
+# to its current row's language for the batch and uses the category's language
+# only for a new one; a reconcile pass after the refresh then moves relations
+# whose category language no longer matches their row. Checking either side
+# alone leaves a window in which an id we injected is carried into a tagged row
+# by that reconcile, so either one being tagged is enough to stay out.
+
+
+def category_language_of(entry, categories, relations):
+    """Pure. The language core would take from this entry's category, '' when
+    untagged. Resolves the category the way the scan does; anything we cannot
+    resolve counts as untagged, as core counts a missing tag."""
+    try:
+        raw = (entry or {}).get("category_id")
+        provider_cat_id = str(raw) if raw not in (None, "") else None
+        if provider_cat_id is not None and provider_cat_id in (categories or {}):
+            category = categories[provider_cat_id]
+        else:
+            category = (categories or {}).get("__uncategorized__")
+        if category is None:
+            return ""
+        relation = (relations or {}).get(getattr(category, "id", None))
+        props = getattr(relation, "custom_properties", None)
+        language = props.get("language") if isinstance(props, dict) else None
+        return language.lower() if isinstance(language, str) else ""
+    except Exception:
+        return ""
+
+
+def language_blocks(category_language, on_tagged_row):
+    """Pure. Should injection stay out of this entry? Yes if the category it
+    arrives in is tagged, or the row it sits on now is."""
+    return bool(category_language) or bool(on_tagged_row)
+
+
+def has_language(model):
+    """Does this Dispatcharr key VOD identity by language (0.33.0+)?"""
+    try:
+        model._meta.get_field("language")
+        return True
+    except Exception:
+        return False
+
+
+def untagged(model, prefix=""):
+    """Filter kwargs limiting a queryset to UNTAGGED rows of `model`, reached
+    through `prefix` (e.g. "movie__"). Empty before 0.33.0."""
+    return {prefix + "language": ""} if has_language(model) else {}
+
+
+def _tagged_relation_ids(relation_model, row_model, fk, account, id_field, ids):
+    """Of these batch ids, the ones whose relation sits on a language-tagged
+    row now. One query per batch; none before 0.33.0."""
+    if not ids or not has_language(row_model):
+        return set()
+    return {
+        str(x) for x in relation_model.objects
+        .filter(m3u_account=account, **{id_field + "__in": [str(i) for i in ids]})
+        .exclude(**{fk + "__language": ""})
+        .values_list(id_field, flat=True)
+    }
 
 
 def decide(entry, account_name, external_id, idx, cfg):
@@ -948,6 +1033,13 @@ def inject_batch(account, batch, categories=None, relations=None) -> dict:
     if not idx["poster"] and not idx["plot"]:
         return tally
 
+    from apps.vod.models import M3USeriesRelation, Series
+    tagged = _tagged_relation_ids(
+        M3USeriesRelation, Series, "series", account, "external_series_id",
+        [e.get("series_id") or e.get("external_series_id")
+         for e in batch if isinstance(e, dict)
+         and (e.get("series_id") or e.get("external_series_id")) is not None])
+
     decisions = []
     for entry in batch:
         if not isinstance(entry, dict):
@@ -956,6 +1048,10 @@ def inject_batch(account, batch, categories=None, relations=None) -> dict:
             tally["disabled_category"] = tally.get("disabled_category", 0) + 1
             continue
         external_id = entry.get("series_id") or entry.get("external_series_id")
+        if language_blocks(category_language_of(entry, categories, relations),
+                           str(external_id) in tagged):
+            tally[TAGGED_LANGUAGE] = tally.get(TAGGED_LANGUAGE, 0) + 1
+            continue
         action, tmdb_id, tier, key = decide(entry, account_name, external_id, idx, cfg)
         tally[action] = tally.get(action, 0) + 1
 
@@ -1056,7 +1152,8 @@ def preview_impl(limit: int = 0) -> dict:
     tiers = {}
     matches = []
     qs = (
-        Series.objects.filter(tmdb_id__isnull=True, imdb_id__isnull=True)
+        Series.objects.filter(tmdb_id__isnull=True, imdb_id__isnull=True,
+                              **untagged(Series))
         .prefetch_related("m3u_relations__m3u_account")
     )
     # chunk_size is REQUIRED (Django >=4.1) when iterator() follows
@@ -1223,12 +1320,13 @@ def free_signal_match(basic, idx):
 
 def movie_sweep_candidates(cfg=None):
     """Id-less movie relations that have no stored detail yet."""
-    from apps.vod.models import M3UMovieRelation
+    from apps.vod.models import M3UMovieRelation, Movie
 
     cfg = cfg or _load_config()
     qs = (
         M3UMovieRelation.objects
-        .filter(movie__tmdb_id=None, movie__imdb_id=None)
+        .filter(movie__tmdb_id=None, movie__imdb_id=None,
+                **untagged(Movie, "movie__"))
         .select_related("m3u_account", "movie")
     )
     if cfg["movie_accounts"]:
@@ -1395,7 +1493,7 @@ def merge_whatif(cfg=None) -> dict:
     from django.db.models import Count
     from django.utils import timezone
     from apps.m3u.models import M3UAccount
-    from apps.vod.models import M3UMovieRelation
+    from apps.vod.models import M3UMovieRelation, Movie
 
     cfg = cfg or _load_config(force=True)
     scoped = cfg["movie_accounts"]
@@ -1428,7 +1526,8 @@ def merge_whatif(cfg=None) -> dict:
     for acct in accounts:
         rows = list(
             M3UMovieRelation.objects
-            .filter(m3u_account=acct, movie__tmdb_id=None, movie__imdb_id=None)
+            .filter(m3u_account=acct, movie__tmdb_id=None, movie__imdb_id=None,
+                    **untagged(Movie, "movie__"))
             .values_list("movie_id", "stream_id", "custom_properties", "movie__name"))
         rows_by[acct.name] = rows
         for _mid, _sid, props, _name in rows:
@@ -1750,7 +1849,8 @@ def _canonical_series_map(tmdb_ids):
     from apps.vod.models import Series
     return {
         row["tmdb_id"]: row
-        for row in Series.objects.filter(tmdb_id__in=list(tmdb_ids))
+        for row in Series.objects.filter(tmdb_id__in=list(tmdb_ids),
+                                         **untagged(Series))
         .values("id", "uuid", "tmdb_id", "name")
     }
 
@@ -1782,13 +1882,16 @@ def _movie_relation_current(account, stream_ids):
 
 
 def _canonical_map(tmdb_ids):
-    """{tmdb: {id, uuid, name}} so the audit trail can name where a title landed."""
+    """{tmdb: {id, uuid, name}} of UNTAGGED rows: where an injected id lands,
+    so the audit trail can name it and the detail tier can tell a merge from a
+    new row. A tagged row with the same tmdb is another language's title."""
     if not tmdb_ids:
         return {}
     from apps.vod.models import Movie
     return {
         row["tmdb_id"]: row
-        for row in Movie.objects.filter(tmdb_id__in=list(tmdb_ids))
+        for row in Movie.objects.filter(tmdb_id__in=list(tmdb_ids),
+                                        **untagged(Movie))
         .values("id", "uuid", "tmdb_id", "name")
     }
 
@@ -1817,6 +1920,12 @@ def inject_movie_batch(account, batch, categories=None, relations=None) -> dict:
     idx = _get_movie_indexes()
     canon = _canonical_map({t for t, _ in detail_map.values()})
 
+    from apps.vod.models import M3UMovieRelation, Movie
+    tagged = _tagged_relation_ids(
+        M3UMovieRelation, Movie, "movie", account, "stream_id",
+        [e.get("stream_id") for e in batch
+         if isinstance(e, dict) and e.get("stream_id") is not None])
+
     decisions = []
     for entry in batch:
         if not isinstance(entry, dict):
@@ -1825,6 +1934,10 @@ def inject_movie_batch(account, batch, categories=None, relations=None) -> dict:
             tally["disabled_category"] = tally.get("disabled_category", 0) + 1
             continue
         stream_id = entry.get("stream_id")
+        if language_blocks(category_language_of(entry, categories, relations),
+                           str(stream_id) in tagged):
+            tally[TAGGED_LANGUAGE] = tally.get(TAGGED_LANGUAGE, 0) + 1
+            continue
         action, tmdb_id, tier, _ = decide_movie(
             entry, account_name, stream_id, detail_map, canon, idx, cfg
         )
@@ -2058,11 +2171,13 @@ def wanted_movie_ids(doc):
     unid = doc.get("unidentified") or []
 
     found = {}
-    by_tmdb = dict(
-        Movie.objects.filter(tmdb_id__in=ids).values_list("tmdb_id", "id"))
+    # Every row per tmdb, not one: from 0.33.0 a title can have a row per
+    # language, and each holds its own copies, all of which need measuring.
+    by_tmdb = {}
+    for tmdb, mid in Movie.objects.filter(tmdb_id__in=ids).values_list("tmdb_id", "id"):
+        by_tmdb.setdefault(str(tmdb), []).append(mid)
     for t in ids:
-        mid = by_tmdb.get(t)
-        if mid:
+        for mid in by_tmdb.get(t, ()):
             found[mid] = "tmdb_id"
 
     def lookup_by_id(sid):
@@ -2976,12 +3091,18 @@ def is_stream_level(why):
 # waited for weeks. A copy with no such history, or that worked last time, is
 # judged exactly as before, so a real outage still trips the breaker.
 #
+# The one exception is a refusal of the ACCOUNT: 401/403. A provider that
+# blocks a login, or rate-limits an address, answers every stream that way,
+# dead or alive, so it says nothing about the file and must not add a strike.
+# It counts toward the breaker instead, as any 401/403 does.
+#
 # Each repeat is a strike; from DEAD_STRIKES on, the copy is "dead" and waits
 # DEAD_RETRY_DAYS rather than the usual week. Never given up on for good --
 # providers do occasionally fix a stream -- but a dead copy costs one probe a
 # month, not one a week.
 DEAD_STRIKES = 2
 DEAD_RETRY_DAYS = 30
+ACCOUNT_LEVEL_REASONS = frozenset(("http 401", "http 403"))
 
 
 def was_bad_stream(mark):
@@ -2993,7 +3114,10 @@ def was_bad_stream(mark):
 
 def blames_stream(why, previous):
     """Pure. Is this failure the stream's fault: the provider says so now, or
-    said so last time and the copy has failed again?"""
+    said so last time and the copy has failed again (other than by refusing
+    the account)?"""
+    if why in ACCOUNT_LEVEL_REASONS:
+        return False
     return is_stream_level(why) or was_bad_stream(previous)
 
 
@@ -4112,7 +4236,7 @@ def trim_matches(report, cap: int = RESPONSE_MATCH_CAP):
 # reasons. The canonical is by construction the better-populated row, so there is
 # little to copy up. The orphan's listing-derived content is already stored on
 # the relation itself. And `merge_movie_data` writes ids: `tmdb_id`/`imdb_id` are
-# BOTH `unique=True`, and its
+# BOTH unique (per language from 0.33.0), and its
 # `elif source_movie.imdb_id: target_movie.imdb_id = source_movie.imdb_id`
 # branch saves the target while the source still holds that same unique imdb --
 # a collision of its own, separate from the two defects above. A single FK update
@@ -4183,10 +4307,18 @@ def patched_handle_movie_id_conflicts(current_movie, relation,
         from django.db import transaction
         from apps.vod.models import Movie
 
+        # From 0.33.0 a tmdb can be held once per language; core scopes its
+        # own lookup to the refreshed row's language, and so do we, or a
+        # relation could be repointed onto another language's row.
+        language = getattr(current_movie, "language", None)
+        scope = ({"language": language}
+                 if isinstance(language, str) and has_language(Movie) else {})
+
         def holder(field, value):
             if not value:
                 return None
-            row = Movie.objects.filter(**{field: value}).values("id").first()
+            row = (Movie.objects.filter(**{field: value}, **scope)
+                   .values("id").first())
             return row["id"] if row else None
 
         action, target_id = decide_conflict(

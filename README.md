@@ -23,14 +23,11 @@ accounts the plugin loads, reports cleanly, and does nothing.
 Validated against Dispatcharr 0.31.0 and 0.32.0 (merging also against 0.30.0),
 and checked against the 0.33.0 source.
 
-> **Dispatcharr 0.33.0: do not set a language on VOD categories yet.** 0.33.0
-> lets you tag a VOD category with a language, and from then on treats the same
-> film or show in two languages as two separate entries. This plugin does not
-> account for languages yet: once any category is tagged, it can merge a copy
-> into the other language's entry, create entries it should not, or leave one
-> language's copies unenriched. With no category tagged — the default —
-> nothing changes and everything here works as described. A language-aware
-> release will lift this.
+> **Dispatcharr 0.33.0 category languages:** merging covers untagged
+> categories only. Anything in a category you tag with a language is left to
+> Dispatcharr, and is still enriched. With no category tagged (the default),
+> everything works exactly as described. See
+> [Language-tagged categories](#language-tagged-categories).
 
 ## The problem
 
@@ -150,6 +147,33 @@ categories — core discards the disabled ones *after* the batch processor sees
 them. The plugin mirrors core's `category_enabled()` check, so it only acts on
 entries that will actually be kept. Without that mirror the audit log fills with
 phantom merges for content you never sync.
+
+### Language-tagged categories
+
+Dispatcharr 0.33.0 lets you tag a VOD category with a language. From then on,
+the same film or show in two languages is two separate entries, one per
+language. Untagged is the default, and nothing sets a language for you.
+
+This plugin's matching does not know about languages, so it stays out of tagged
+content altogether:
+
+- **No merging into tagged content.** An entry in a tagged category, or one
+  already sitting on a tagged entry, is passed to Dispatcharr untouched.
+- **Merges land only on untagged entries.** Artwork, plot and detail matches are
+  checked against untagged entries only, so a match can never fold a copy into
+  another language's entry or create a new entry for one.
+- **Merge protection stays within a language.** It only moves a copy onto an
+  entry of the same language, as Dispatcharr itself does.
+- **Enrichment covers every language.** A wanted title is measured on all of
+  its entries, tagged or not.
+
+With no category tagged, every one of these is a no-op.
+
+Tagging a category makes Dispatcharr reorganize the affected titles on the next
+scan, which gives them new ids. Copies the plugin had merged out of a tagged
+category go back to Dispatcharr's own handling at the same time. If you tag,
+tag each provider's categories consistently (all of one provider's English
+categories, say) and all at once.
 
 ## Install
 

@@ -4122,5 +4122,376 @@ class ManifestParityTests(unittest.TestCase):
                 self.assertEqual(f["default"], patch.DEFAULT_VARIANT_PATTERN)
 
 
+# --------------------------------------------------------------------------- #
+# Dispatcharr 0.33.0: per-language identity
+# --------------------------------------------------------------------------- #
+# No Django on a laptop, so the DB-facing pieces run against tiny stand-ins:
+# rows are flat dicts, and a lookup through a relation ("movie__language") is
+# just a key on the row.
+
+import contextlib
+import sys
+import types
+
+
+def _match(row, key, want):
+    if key.endswith("__in"):
+        return row.get(key[:-4]) in want
+    return row.get(key) == want
+
+
+class _FakeQS:
+    def __init__(self, rows, shape=None, flat=False):
+        self.rows, self.shape, self.flat = list(rows), shape, flat
+
+    def filter(self, **kw):
+        return _FakeQS([r for r in self.rows
+                        if all(_match(r, k, v) for k, v in kw.items())])
+
+    def exclude(self, **kw):
+        return _FakeQS([r for r in self.rows
+                        if not all(_match(r, k, v) for k, v in kw.items())])
+
+    def values(self, *fields):
+        return _FakeQS(self.rows, shape=("dict", fields))
+
+    def values_list(self, *fields, flat=False):
+        return _FakeQS(self.rows, shape=("list", fields), flat=flat)
+
+    def _out(self, row):
+        if self.shape is None:
+            return types.SimpleNamespace(**row)
+        kind, fields = self.shape
+        if kind == "dict":
+            return {f: row.get(f) for f in fields}
+        if self.flat:
+            return row.get(fields[0])
+        return tuple(row.get(f) for f in fields)
+
+    def __iter__(self):
+        return iter([self._out(r) for r in self.rows])
+
+    def first(self):
+        return self._out(self.rows[0]) if self.rows else None
+
+    def iterator(self, chunk_size=None):
+        return iter(self)
+
+
+def _fake_model(rows=(), with_language=True):
+    class Meta:
+        @staticmethod
+        def get_field(name):
+            if name == "language" and with_language:
+                return object()
+            raise LookupError(name)
+
+    class Manager:
+        def filter(self, **kw):
+            return _FakeQS(rows).filter(**kw)
+
+    return type("FakeModel", (), {"_meta": Meta, "objects": Manager()})
+
+
+class _FakeDjango:
+    """Installs stand-in `apps.vod.models` and `django.db` for one test."""
+
+    def __init__(self, test, **models):
+        names = ("apps", "apps.vod", "apps.vod.models", "django", "django.db")
+        saved = {n: sys.modules.get(n) for n in names}
+
+        def restore():
+            for n, mod in saved.items():
+                if mod is None:
+                    sys.modules.pop(n, None)
+                else:
+                    sys.modules[n] = mod
+        test.addCleanup(restore)
+
+        vod_models = types.ModuleType("apps.vod.models")
+        for name in ("Movie", "Series", "M3UMovieRelation", "M3USeriesRelation"):
+            setattr(vod_models, name, models.get(name) or _fake_model())
+        db = types.ModuleType("django.db")
+        db.transaction = types.SimpleNamespace(atomic=contextlib.nullcontext)
+        sys.modules.update({
+            "apps": types.ModuleType("apps"),
+            "apps.vod": types.ModuleType("apps.vod"),
+            "apps.vod.models": vod_models,
+            "django": types.ModuleType("django"),
+            "django.db": db,
+        })
+
+
+class _Cat:
+    def __init__(self, cid):
+        self.id = cid
+
+
+class _CatRel:
+    def __init__(self, language=None, enabled=True, props=True):
+        self.enabled = enabled
+        if props:
+            self.custom_properties = {} if language is None else {"language": language}
+
+
+class CategoryLanguageTests(unittest.TestCase):
+    """The language core takes from an entry's category, resolved the same
+    way the scan resolves the category itself."""
+
+    def setUp(self):
+        self.cats = {"7": _Cat(70), "8": _Cat(80), "__uncategorized__": _Cat(99)}
+        self.rels = {70: _CatRel("EN"), 80: _CatRel(), 99: _CatRel("fr")}
+
+    def test_tagged_category_lowercased_like_core(self):
+        self.assertEqual(patch.category_language_of(
+            {"category_id": 7}, self.cats, self.rels), "en")
+
+    def test_untagged_category_is_empty(self):
+        self.assertEqual(patch.category_language_of(
+            {"category_id": "8"}, self.cats, self.rels), "")
+
+    def test_no_or_unknown_category_falls_back_to_uncategorized(self):
+        for entry in ({}, {"category_id": ""}, {"category_id": "404"}):
+            self.assertEqual(patch.category_language_of(
+                entry, self.cats, self.rels), "fr")
+
+    def test_before_033_relations_have_no_language(self):
+        # 0.32.0 relations carry no tag: same as untagged.
+        rels = {70: _CatRel(props=False), 99: _CatRel(props=False)}
+        self.assertEqual(patch.category_language_of(
+            {"category_id": "7"}, self.cats, rels), "")
+
+    def test_unresolvable_counts_as_untagged(self):
+        for cats, rels in ((None, None), ({}, {}), ("junk", "junk")):
+            self.assertEqual(patch.category_language_of(
+                {"category_id": "7"}, cats, rels), "")
+        self.assertEqual(patch.category_language_of(None, self.cats, {}), "")
+        bad = {70: types.SimpleNamespace(custom_properties={"language": 5})}
+        self.assertEqual(patch.category_language_of(
+            {"category_id": "7"}, self.cats, bad), "")
+
+
+class LanguageBlocksTests(unittest.TestCase):
+    def test_truth_table(self):
+        self.assertFalse(patch.language_blocks("", False))
+        self.assertTrue(patch.language_blocks("en", False))
+        self.assertTrue(patch.language_blocks("", True))
+        self.assertTrue(patch.language_blocks("en", True))
+
+
+class UntaggedFilterTests(unittest.TestCase):
+    def test_033_filters_on_empty_language(self):
+        model = _fake_model(with_language=True)
+        self.assertTrue(patch.has_language(model))
+        self.assertEqual(patch.untagged(model), {"language": ""})
+        self.assertEqual(patch.untagged(model, "movie__"), {"movie__language": ""})
+
+    def test_before_033_no_filter_at_all(self):
+        model = _fake_model(with_language=False)
+        self.assertFalse(patch.has_language(model))
+        self.assertEqual(patch.untagged(model, "movie__"), {})
+
+    def test_tagged_relation_ids(self):
+        rel = _fake_model([
+            {"m3u_account": "A", "stream_id": "1", "movie__language": ""},
+            {"m3u_account": "A", "stream_id": "2", "movie__language": "en"},
+            {"m3u_account": "B", "stream_id": "3", "movie__language": "en"},
+        ])
+        self.assertEqual(patch._tagged_relation_ids(
+            rel, _fake_model(), "movie", "A", "stream_id", [1, 2, 3]), {"2"})
+        # Before 0.33.0: no query, nothing tagged.
+        self.assertEqual(patch._tagged_relation_ids(
+            rel, _fake_model(with_language=False), "movie", "A", "stream_id",
+            [1, 2, 3]), set())
+        self.assertEqual(patch._tagged_relation_ids(
+            rel, _fake_model(), "movie", "A", "stream_id", []), set())
+
+
+class LanguageGuardInjectionTests(unittest.TestCase):
+    """The scan wrappers stay out of language-tagged content and, on an
+    untagged library, do exactly what they did before 0.33.0."""
+
+    POSTER = "https://image.tmdb.org/t/p/w500/samplekey.jpg"
+
+    def setUp(self):
+        _FakeDjango(self)
+        self.tagged = set()
+        self.logged = []
+        names = ("_load_config", "_get_movie_indexes", "_movie_detail_map",
+                 "_canonical_map", "_movie_relation_current", "_append_log",
+                 "_tagged_relation_ids", "_get_indexes", "_canonical_series_map",
+                 "_series_relation_map")
+        saved = {n: getattr(patch, n) for n in names}
+        self.addCleanup(lambda: [setattr(patch, n, v) for n, v in saved.items()])
+        idx = {"poster": {"samplekey.jpg": "603"}, "poster_amb": set(),
+               "plot": {}, "plot_amb": set()}
+        canon = {"603": {"id": 10, "uuid": None, "tmdb_id": "603", "name": "x"}}
+        patch._load_config = lambda force=False: _cfg()
+        patch._get_movie_indexes = lambda force=False: idx
+        patch._get_indexes = lambda force=False: idx
+        patch._movie_detail_map = lambda account, batch: {}
+        patch._canonical_map = lambda ids: dict(canon)
+        patch._canonical_series_map = lambda ids: dict(canon)
+        patch._movie_relation_current = lambda account, ids: {}
+        patch._series_relation_map = lambda account, ids: {}
+        patch._append_log = lambda entries: self.logged.extend(entries)
+        patch._tagged_relation_ids = lambda *a: set(self.tagged)
+        self.cats = {"7": _Cat(70), "8": _Cat(80)}
+        self.acct = types.SimpleNamespace(name="Provider1", account_type="XC")
+
+    def _movies(self, rels):
+        batch = [{"name": "Sample Movie %d" % i, "stream_id": i, "category_id": c,
+                  "stream_icon": self.POSTER}
+                 for i, c in ((1, "7"), (2, "8"))]
+        tally = patch.inject_movie_batch(self.acct, batch, self.cats, rels)
+        return tally, [e.get("tmdb_id") for e in batch]
+
+    def _series(self, rels):
+        batch = [{"name": "Sample Show %d" % i, "series_id": i, "category_id": c,
+                  "cover": self.POSTER}
+                 for i, c in ((1, "7"), (2, "8"))]
+        tally = patch.inject_batch(self.acct, batch, self.cats, rels)
+        return tally, [e.get("tmdb") for e in batch]
+
+    def test_untagged_matches_pre_033_exactly(self):
+        # PINNED: the compatibility guarantee for untagged libraries. A 0.33.0
+        # library with no tag must inject, tally and log exactly as 0.32.0 did.
+        for run in (self._movies, self._series):
+            self.logged.clear()
+            before = run({70: _CatRel(props=False), 80: _CatRel(props=False)})
+            log_before = [dict(e, ts=0) for e in self.logged]
+            self.logged.clear()
+            after = run({70: _CatRel(), 80: _CatRel()})
+            log_after = [dict(e, ts=0) for e in self.logged]
+            self.assertEqual(before, after)
+            self.assertEqual(log_before, log_after)
+            self.assertEqual(after[1], ["603", "603"])
+            self.assertNotIn(patch.TAGGED_LANGUAGE, after[0])
+
+    def test_tagged_category_is_left_alone(self):
+        for run, key in ((self._movies, "tmdb_id"), (self._series, "tmdb")):
+            tally, got = run({70: _CatRel("en"), 80: _CatRel()})
+            self.assertEqual(got, [None, "603"])
+            self.assertEqual(tally[patch.TAGGED_LANGUAGE], 1)
+            self.assertEqual(tally[patch.INJECT], 1)
+
+    def test_entry_on_a_tagged_row_is_left_alone(self):
+        # Category untagged now, but the relation still sits on a tagged row:
+        # core keys it by the row's language, so injecting would land there.
+        self.tagged = {"2"}
+        for run in (self._movies, self._series):
+            tally, got = run({70: _CatRel(), 80: _CatRel()})
+            self.assertEqual(got, ["603", None])
+            self.assertEqual(tally[patch.TAGGED_LANGUAGE], 1)
+
+
+class LanguageScopedQueryTests(unittest.TestCase):
+    """The DB lookups that pick a row by tmdb only ever pick an untagged one,
+    or the same language's."""
+
+    ROWS = [{"id": 1, "tmdb_id": "603", "imdb_id": None, "language": "en",
+             "uuid": None, "name": "Sample [EN]"},
+            {"id": 2, "tmdb_id": "603", "imdb_id": None, "language": "",
+             "uuid": None, "name": "Sample"},
+            {"id": 3, "tmdb_id": None, "imdb_id": None, "language": "",
+             "uuid": None, "name": "Sample orphan"}]
+
+    def setUp(self):
+        _FakeDjango(self, Movie=_fake_model(self.ROWS), Series=_fake_model(self.ROWS))
+
+    def test_canonical_maps_skip_tagged_rows(self):
+        self.assertEqual(patch._canonical_map({"603"})["603"]["id"], 2)
+        self.assertEqual(patch._canonical_series_map({"603"})["603"]["id"], 2)
+
+    def test_canonical_map_with_only_a_tagged_row_is_empty(self):
+        _FakeDjango(self, Movie=_fake_model(self.ROWS[:1]),
+                    Series=_fake_model(self.ROWS[:1]))
+        # So the detail tier treats it as no canonical: no row would be minted.
+        self.assertEqual(patch._canonical_map({"603"}), {})
+        self.assertEqual(patch._canonical_series_map({"603"}), {})
+
+    def test_indexes_only_learn_from_untagged_rows(self):
+        # A poster seen only on another language's row must not match: the
+        # injected id would land on (tmdb, '') and mint a row there.
+        def rel_rows(fk):
+            return [
+                {fk + "__tmdb_id": "603", fk + "__language": "en",
+                 fk + "__description": None,
+                 "custom_properties": {"basic_data": {
+                     "cover": "https://image.tmdb.org/t/p/w500/tagonly.jpg",
+                     "stream_icon": "https://image.tmdb.org/t/p/w500/tagonly.jpg"}}},
+                {fk + "__tmdb_id": "604", fk + "__language": "",
+                 fk + "__description": None,
+                 "custom_properties": {"basic_data": {
+                     "cover": "https://image.tmdb.org/t/p/w500/plain.jpg",
+                     "stream_icon": "https://image.tmdb.org/t/p/w500/plain.jpg"}}},
+            ]
+        _FakeDjango(self, M3USeriesRelation=_fake_model(rel_rows("series")),
+                    M3UMovieRelation=_fake_model(rel_rows("movie")))
+        for idx in (patch._build_indexes(), patch._build_movie_indexes()):
+            self.assertEqual(idx["poster"], {"plain.jpg": "604"})
+
+    def test_every_id_less_query_is_scoped_to_untagged(self):
+        # Preview, the detail sweep and the what-if all pick id-less rows to
+        # act on; each must leave tagged ones out, as the scan wrapper does.
+        tree = ast.parse(open(patch.__file__, encoding="utf-8").read())
+        fns = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        for name in ("preview_impl", "movie_sweep_candidates", "merge_whatif",
+                     "_build_indexes", "_build_movie_indexes",
+                     "_canonical_map", "_canonical_series_map"):
+            called = {c.func.id for c in ast.walk(fns[name])
+                      if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+            self.assertIn("untagged", called, name)
+
+    def test_wanted_set_takes_every_language_row(self):
+        ids, stats = patch.wanted_movie_ids({"tmdb_ids": ["603"]})
+        self.assertEqual(ids, {1, 2})
+        self.assertEqual(stats["tmdb_resolved"], 1)
+
+    def _conflict(self, current_language):
+        saved = (patch._load_config, patch._append_log)
+        self.addCleanup(lambda: (setattr(patch, "_load_config", saved[0]),
+                                 setattr(patch, "_append_log", saved[1])))
+        patch._load_config = lambda force=False: {"protect_merges": True}
+        patch._append_log = lambda entries: None
+        current = types.SimpleNamespace(id=3, name="orphan", language=current_language)
+        saves = []
+        relation = types.SimpleNamespace(
+            id=50, stream_id="9", m3u_account=None, movie=current,
+            save=lambda **kw: saves.append(kw))
+        result = patch.patched_handle_movie_id_conflicts(current, relation, "603", None)
+        return result, relation
+
+    def test_conflict_repoints_onto_the_same_language_row(self):
+        (target, updated), relation = self._conflict("")
+        self.assertTrue(updated)
+        self.assertEqual((target.id, relation.movie.id), (2, 2))
+        (target, updated), relation = self._conflict("en")
+        self.assertEqual((target.id, relation.movie.id), (1, 1))
+
+    def test_conflict_with_no_same_language_holder_does_nothing(self):
+        (target, updated), relation = self._conflict("fr")
+        self.assertEqual((target.id, updated), (3, False))
+        self.assertEqual(relation.movie.id, 3)
+
+
+class AccountRefusalStrikeTests(unittest.TestCase):
+    """A 401/403 refuses the login, not the file: a blocked account or address
+    answers every stream that way, so it never adds a dead-stream strike."""
+
+    BAD = {"got": "error", "why": "http 400", "bad_stream": True, "strikes": 1}
+
+    def test_refusal_after_a_bad_stream_is_not_blamed(self):
+        for why in ("http 401", "http 403"):
+            self.assertFalse(patch.blames_stream(why, self.BAD))
+
+    def test_other_repeats_still_blamed(self):
+        for why in ("http 5xx", "timeout", "http 404", "connection refused"):
+            self.assertTrue(patch.blames_stream(why, self.BAD))
+
+    def test_fresh_refusal_unchanged(self):
+        self.assertFalse(patch.blames_stream("http 403", None))
+        self.assertTrue(patch.blames_stream("http 410", None))
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
